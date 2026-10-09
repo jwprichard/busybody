@@ -7,7 +7,7 @@ description: The dev team recipe for a project room. The room lead (a role) take
 
 A team is a skill plus a config (`docs/room-lifecycle.md`). This skill is the judgement half; the
 harness-enforced half is `team.json` (models, caps, spawn depth, worktree, draft PR) and
-`engine/templates/room-settings.json` (permissions). This skill cannot loosen them. Opening the room is the
+the engine's `templates/room-settings.json` (permissions). This skill cannot loosen them. Opening the room is the
 controller's job (`busybody:workstream-lead` skill); this is what the room lead does inside it.
 
 The generic stages (Open, Kickoff, Close, Resolve, Review) are the same for every team. Below is
@@ -34,7 +34,7 @@ design from the `design` team), post a `PROGRESS` note saying so and carry on.
    don't deploy to nonprod, so rooms don't collide. For a stack, open every PR as a draft up front
    (`decisions/2026-10-07-stacked-prs.md`). Then post a `DECISION`: "draft #N is green; promote when ready."
    The owner promotes and merges. Never run `gh pr merge`.
-3. **Watch.** Start `engine/bin/pr-watch #N` as a **background shell**: no model turns while waiting.
+3. **Watch.** Start `busybody pr-watch #N` as a **background shell**: no model turns while waiting.
    - It wakes you only on an event: promotion to ready, a CI result, a new review or comment, the merge.
    - A CI failure or a review goes to a worker to fix (the same worker that wrote it); the push re-arms the watcher.
    - **Answer every review on the PR itself**, after the push: one PR comment that takes each point in turn, with the commit that fixed it or the reason it was left as is. A minute on the issue is not a reply (owner, 2026-10-08).
@@ -46,9 +46,9 @@ design from the `design` team), post a `PROGRESS` note saying so and carry on.
 A **merged PR** (or the merged stack), with evidence links: PR, CI run, review.
 
 ## Done condition
-**Merged.** Prod deploy evidence is tracked separately by `engine/bin/status` and is not a close gate for
+**Merged.** Prod deploy evidence is tracked separately by `busybody status` and is not a close gate for
 now; list what is still outstanding in the `DONE`. Close stage: remove your worktrees, post `DONE`
-(output, evidence links, `engine/bin/room-cost` line, retro), then end your session. The controller resolves.
+(output, evidence links, `busybody room-cost` line, retro), then end your session. The controller resolves.
 
 **UI rework line.** If the brief has a `Design:` link, the `DONE` must include a line `UI rework: none | minor | major`
 (how much of the built UI had to change after the owner saw it). `roles/designer/metric` counts it.
