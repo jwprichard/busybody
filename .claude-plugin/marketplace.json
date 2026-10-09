@@ -1,0 +1,8 @@
+{
+  "name": "busybody",
+  "owner": { "name": "jwprichard" },
+  "description": "Busybody: an office engine for Claude Code.",
+  "plugins": [
+    { "name": "busybody", "source": "./", "description": "Busybody: the office engine. Rooms, roles, teams, minutes and a band above the prompt." }
+  ]
+}
