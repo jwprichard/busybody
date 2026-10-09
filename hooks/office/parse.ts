@@ -502,7 +502,7 @@ export function workspaceCandidates(cwd: string, pluginRoot: string): string[] {
     add(dir)
     dir = dir.slice(0, dir.lastIndexOf('/')) || '/'
   }
-  add(`${pluginRoot}/..`)   // the plugin is engine/ inside the workspace
+  add(`${pluginRoot}/..`)   // the plugin is the engine clone (busybody/) inside the workspace
   return out
 }
 

@@ -402,11 +402,11 @@ describe('button to command mapping', () => {
     const form = { repo: 'acme-web', slug: 'demo-room', model: 'opus' as const, ref: '#12', liaison: 'orchestrator' }
     const p = planStart('/home/u/ws', form, false, WORKSPACE)
     expect(p.errors).toEqual([])
-    expect(p.argv).toEqual(['/home/u/ws/engine/bin/lead-start', 'acme-web', 'demo-room', '--liaison', 'orchestrator', '--model', 'opus', '--issue', '12'])
+    expect(p.argv).toEqual(['/home/u/ws/busybody/bin/lead-start', 'acme-web', 'demo-room', '--liaison', 'orchestrator', '--model', 'opus', '--issue', '12'])
     expect(planStart('/home/u/ws', form, true, WORKSPACE).argv?.at(-1)).toBe('--dry-run')
     expect(planStart('/home/u/ws', form, false, WORKSPACE, '/opt/busybody').argv?.[0]).toBe('/opt/busybody/bin/lead-start')
     const card = planStart('/home/u/ws', { ...form, ref: 'https://tasks.acme.test/t/732' }, false, CARDS)
-    expect(card.argv).toEqual(['/home/u/ws/engine/bin/lead-start', 'acme-web', 'demo-room', '--liaison', 'orchestrator', '--model', 'opus'])
+    expect(card.argv).toEqual(['/home/u/ws/busybody/bin/lead-start', 'acme-web', 'demo-room', '--liaison', 'orchestrator', '--model', 'opus'])
     expect(card.cardUrl).toBe('https://tasks.acme.test/t/732')
     expect(card.notes.length).toBe(1)
     // tracker none: a card URL is not accepted, only an issue number

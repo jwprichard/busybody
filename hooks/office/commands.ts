@@ -153,7 +153,7 @@ export function trackerCardRegex(workspace: OfficeWorkspace | null | undefined):
 }
 
 /** Builds the room launcher's argv from the Start room form. `workspace` is the folder; `engineRoot` is the engine's own folder (the launcher lives in its bin/); `config` is office.json as the engine printed it. */
-export function planStart(workspace: string, form: OfficeStartForm, isDryRun: boolean, config: OfficeWorkspace | null | undefined = null, engineRoot: string = `${workspace}/engine`): StartPlan {
+export function planStart(workspace: string, form: OfficeStartForm, isDryRun: boolean, config: OfficeWorkspace | null | undefined = null, engineRoot: string = `${workspace}/busybody`): StartPlan {
   const errors: string[] = []
   const notes: string[] = []
   const repo = form.repo.trim()
