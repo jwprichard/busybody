@@ -10,7 +10,8 @@ workspace's `office.json`.
 ## Layout
 
 ```
-.claude-plugin/plugin.json   the plugin manifest
+.claude-plugin/              plugin.json (the manifest) and marketplace.json (so the repo itself installs: /plugin install busybody --marketplace jwprichard/busybody)
+.land-checks                 what bin/land runs at every commit: the self-tests, the default recipes, the plugin checks
 bin/                         the tools, each executable and each with a --self-test; `busybody <cmd>` runs bin/<cmd>
   busybody                   the dispatcher (lists every executable in bin/)
   init                       sets up a workspace folder
@@ -57,7 +58,7 @@ A worktree of the workspace repo holds its own `office.json` and so counts as a 
 Each tool tests itself offline with stub `gh` and scratch repos; none of them reads the real workspace's `office.json`.
 
 ```sh
-for s in init rooms role room-cost pr-watch land status; do bin/$s --self-test; done   # per-tool self-tests (land's check list omits status: run it by hand)
+for s in init rooms role room-cost pr-watch land status; do bin/$s --self-test; done   # per-tool self-tests (.land-checks runs them all)
 bin/team check                          # every team recipe (team.json) is sound
 python3 -I bin/lib/officeconfig.py --self-test
 claude plugin validate .                # the manifest
@@ -66,12 +67,12 @@ claude plugin test .                    # bun tests in tests/ (the band's logic)
 
 - Self-tests run against `fixtures/office.json` (acme) with `BUSYBODY_CONFIG`/`BUSYBODY_WORKSPACE` pointed at scratch dirs. A new config field means updating that fixture and `officeconfig.py --self-test`.
 - A workspace's own rules (its evidence executables, its real config) are tested by the workspace, e.g. a `tests/*-selftest` there, not here.
-- A new tool: executable, a header comment that `--help` prints (init, land and lead-start print their own lines 2-5), a `--self-test` that is offline and cleans its temp dir, an entry in `bin/land`'s check list, and a line in `README.md`.
+- A new tool: executable, a header comment that `--help` prints (init, land and lead-start print their own lines 2-5), a `--self-test` that is offline and cleans its temp dir, the tool added to the loop in `.land-checks`, and a line in `README.md`.
 - Do not mock what a scratch git repo can do for real (land, init and the hook tests use real repos and a bare remote).
 
 ## Landing a change
 
-The engine repo has no PRs: a branch lands with `bin/land <branch>`. It needs the branch directly on `main` (no merge commits), runs the
+The engine repo has no PRs: a branch lands with `bin/land <branch>`, which runs `.land-checks`. It needs the branch directly on `main` (no merge commits), runs the
 checks at every commit oldest first in a temporary worktree, stops at the first failure, then fast-forwards `main` and pushes. `--dry-run` runs the checks only.
 Never force-push, and never push `main` by hand from a room (the pre-push seatbelt refuses). Edits hot-reload in a workspace that loads the plugin in place (`/reload-plugins`).
 When a change touches how a workspace is set up (`office.json` fields, `init`, `templates/workspace-CLAUDE.md`), say so in the commit body: existing workspaces do not update themselves.

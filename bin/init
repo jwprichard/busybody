@@ -201,9 +201,9 @@ m = json.load(open(w + "/.claude-plugin/marketplace.json"))
 assert m["name"] == "acme-office" and m["plugins"][0]["name"] == "busybody" and m["plugins"][0]["source"] == "./busybody"
 PY
   [[ "$(head -1 "$W/CLAUDE.md")" == "# $NAME_Q workspace (control room)" ]] && ! grep -q '{{' "$W/CLAUDE.md" || bad+=("CLAUDE.md: display name not substituted")
-  # the generic files carry nothing from any one organisation (the SCH_* alias names in engine/CLAUDE.md are the exception)
+  # the generic files carry nothing from any one organisation (the SCH_* alias names in CLAUDE.md are the exception)
   leak=0; grep -nE 'SCH([^_]|$)|sch-|Trello' "$ENGINE_ROOT/templates/workspace-CLAUDE.md" "$ENGINE_ROOT/CLAUDE.md" >/dev/null 2>&1 || leak=$?
-  [[ $leak == 1 ]] || bad+=("workspace template or engine/CLAUDE.md names SCH or Trello, or is missing (grep rc=$leak)")
+  [[ $leak == 1 ]] || bad+=("workspace template or CLAUDE.md names SCH or Trello, or is missing (grep rc=$leak)")
   grep -qxF "/.cache/" "$W/.gitignore" && grep -qxF ".claude/settings.local.json" "$W/.gitignore" || bad+=(".gitignore")
   [[ -x "$W/.git/hooks/pre-push" && "$(grep -c '^MERGE="land"' "$W/.git/hooks/pre-push")" == 1 ]] || bad+=("hook not installed")
   # the install really loads: the manifest validates and the plugin installs and shows enabled (needs the claude CLI)

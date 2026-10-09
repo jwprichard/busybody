@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start a room lead in its own project room (worktree). Steps are SKILL.md §1, in order.
 #
-#   engine/bin/lead-start <repo> <slug> --controller NAME [--model sonnet|opus] [--issue N] [--base REF] [--prod-read] [--team NAME] [--land] [--dry-run]
+#   bin/lead-start <repo> <slug> --controller NAME [--model sonnet|opus] [--issue N] [--base REF] [--prod-read] [--team NAME] [--land] [--dry-run]
 #
 # --controller (alias --liaison) names the control room session; defaults to $BUSYBODY_CONTROLLER (the old $SCH_LIAISON_SESSION is read too).
 # Per-repo rules come from office.json: branchPrefix (required), noPush (main is always protected), merge (pr | land), doneNote.

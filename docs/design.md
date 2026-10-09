@@ -8,7 +8,7 @@ as a Claude Code plugin and use for any set of repos.
 
 ## Two repos per user
 - **The engine** (plugin repo): **Busybody**. Skills, hooks, templates, the office band, `bin/`, `init`. **Its issues are the
-  engine's backlog**; room minutes stay in the workspace repo's issues. It ships no teams and never reads anything
+  engine's backlog**; room minutes stay in the workspace repo's issues. It ships the default team recipes (`templates/teams`: dev-team, mad), which `init` seeds, and never reads anything
   workspace-specific except through `office.json`.
 - **The workspace repo**, one per user or organisation. **A setup requirement** : `init` creates it
   or adopts an existing one, and refuses if its issues are off.
@@ -31,8 +31,9 @@ as a Claude Code plugin and use for any set of repos.
    default when none is named is "PR merged". A workspace's own deploy rules (release tags, apply runs) live in its `evidence/`.
 6. **Safety at the top level:** plugin settings can't carry deny rules, so `init` writes the project-scope deny rules,
    env, hooks, `enabledPlugins` and the pre-push hook. Per-room seatbelts stay in `lead-start`.
-7. **Generic `CLAUDE.md`:** a plugin's own `CLAUDE.md` isn't loaded, so the generic rules ship through SessionStart
-   `additionalContext` (10k-character cap) with any overflow in a skill. The workspace keeps its own `CLAUDE.md`.
+7. **Two `CLAUDE.md` files:** a plugin's own `CLAUDE.md` is not loaded in a workspace, and nothing is injected at SessionStart. `CLAUDE.md` in this
+   repo is the developer guide for working on the engine. `templates/workspace-CLAUDE.md` is the generic "using the tool" guide: `init` writes it into a
+   new workspace (display name substituted, only when there is none) and the workspace then owns it.
 8. **State layer:** issues stay
    the record. Every reader goes through one `minutes` client in the engine. Writes are `gh issue comment`, with no
    mirror. Reads are REST from a shared `.cache/`: the open `initiative` issue list (dropping items with a

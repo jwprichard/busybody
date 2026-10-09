@@ -4,7 +4,7 @@ The office engine as a Claude Code plugin: the tools in `bin/` (`busybody <cmd>`
 
 Commands (`busybody <cmd>`): `init` (set up a workspace), `status`, `rooms`, `role`, `room-cost`, `room-cost-timer`, `team`, `land`, `pr-watch`, `gh-usage`
 (who spent the GitHub quota; `--install-help` shows how to enable the opt-in logging shim), `end-session <room>` (end a room's
-session by its process). See `docs/design.md`.
+session by its process). See `docs/design.md`; `CLAUDE.md` is the developer guide.
 
 ## The office band
 
@@ -16,60 +16,80 @@ see `docs/room-lifecycle.md`.
 
 ## Install
 
-A workspace is one git repo whose GitHub issues are the minutes, with the engine cloned inside it (a Claude Code plugin can only
-load from inside its marketplace folder). Create the repo's folder, clone the engine into it, then run `init`:
+Busybody runs a **workspace**: one git repo, with its own GitHub repo, whose issues are the minutes. The engine is cloned inside the
+workspace folder as `busybody/` (a Claude Code plugin can only load from inside its marketplace folder).
 
-```sh
-mkdir ~/work/acme-office && cd ~/work/acme-office
-git clone <engine repo url> busybody
-busybody/bin/init --minutes-repo acme-co/acme-office --name Acme --engine busybody
-```
+Needs: Claude Code, `git`, `python3`, `jq`, and `gh` logged in (`gh auth status`) with access to the workspace's GitHub repo.
 
-Flags: `--minutes-repo OWNER/NAME` (required the first time), `--name` (display name), `--engine PATH` (the checkout the shim runs;
-it must be inside the workspace folder, else init refuses and says to clone it there), `--tracker none` (the only value for now),
-`--create` (make the GitHub repo, private, only when it does not exist yet; without it init only checks that the repo exists and has issues on, and refuses
-otherwise), `--dry-run`. Nothing is pushed. It writes, skipping whatever is already as wanted (a second run changes nothing and says so):
+1. **The GitHub repo.** Create `owner/name` with **Issues on** (a private repo is fine), or let `init` create it with `--create` (step 3).
+2. **The folder, with the engine inside:**
+   ```sh
+   mkdir ~/work/acme-office && cd ~/work/acme-office
+   git clone https://github.com/jwprichard/busybody.git busybody
+   ```
+3. **Init:**
+   ```sh
+   busybody/bin/init . --minutes-repo acme-co/acme-office --name Acme --engine busybody
+   ```
+   `--name` is the display name; `--create` makes the GitHub repo (private) when it does not exist; `--dry-run` prints what would be written. Nothing is pushed.
+4. **Start Claude in the workspace and enable the plugin:**
+   ```sh
+   claude
+   ```
+   The plugin is enabled by the committed settings. If it does not load, run `/reload-plugins`. To install it from the published repo instead of the clone, use
+   `/plugin install busybody --marketplace jwprichard/busybody`.
+5. **Your first room.** Ask the controller (this session) for a piece of work: it opens an initiative issue and starts a room lead
+   (`bin/busybody lead-start <repo> <slug> --controller <session name>`, or the band's Start room button). Add repos to `office.json`
+   (`repos`, each with `branchPrefix` and `merge`) first; `docs/design.md` lists the fields. The shim is `bin/busybody` and is not on your PATH: run
+   `bin/busybody help`, or add the workspace's `bin/` to your PATH.
 
+### What init writes
+
+Each item is skipped when it is already as wanted; a second run changes nothing and says so.
 - `office.json` (never overwritten): the minutes repo, the workspace repo as the only repo (branches `feat/`, merged with `bin/land`), tracker `none`
-- `bin/busybody`: a shim that runs the engine at its recorded absolute path (a plugin's root is not in Bash). It is not on your PATH:
-  run `bin/busybody help`, or add the workspace's `bin/` to your PATH to type `busybody`
+- `bin/busybody`: a shim that runs the engine at its recorded absolute path (a plugin's root is not in Bash)
 - `.claude-plugin/marketplace.json` (plugin source `./busybody`) and `.claude/settings.json` (committed, portable): `busybody@<folder>` enabled
   and a small `permissions.deny` (force pushes, `--no-verify`, setting `core.hooksPath`, `gh pr merge|ready`). Existing keys are kept.
   This machine's marketplace path goes into the gitignored `.claude/settings.local.json`.
 - `.git/hooks/pre-push`: the seatbelt that stops a room worktree pushing the protected branches `office.json` lists for the workspace repo (`main`). Skipped
   with a note when `core.hooksPath` is set; an existing hook is chained
-- `.gitignore` entries for the per-machine files (and the engine clone), and `CLAUDE.md` from `templates/workspace-CLAUDE.md` when there is none
+- `.gitignore` entries for the per-machine files and the `busybody/` clone, and `CLAUDE.md` from `templates/workspace-CLAUDE.md` when there is none
 - `teams/dev-team` and `teams/mad` from `templates/teams`, each only when absent
-- on GitHub, the `initiative` label on the minutes repo when it is missing
+- on GitHub, the `initiative` label on the minutes repo when it is missing (the one GitHub write besides `--create`)
 
-Then `cd` into the workspace and start `claude`. `bin/init --self-test` runs a fresh install in a scratch directory against a stub `gh`
-and checks the result installs as a plugin.
+### Update
 
-## Load it
+`git -C busybody pull`, then `/reload-plugins` in the session. Re-run `init` after moving the clone (it rewrites the shim); it never overwrites your `office.json`, `CLAUDE.md` or teams.
+On another machine, clone the workspace, clone the engine into `busybody/`, then re-run `init` (it adds this machine's `settings.local.json`).
 
-A workspace uses it as a local marketplace (`.claude-plugin/marketplace.json` with `"source": "./engine"`, or the path of an
-engine clone) and enables `busybody@<marketplace>` at project scope in `.claude/settings.json`; the plugin is read in place, so edits hot-reload.
-The marketplace path in settings is absolute, so on another machine re-run `claude plugin marketplace add ./ --scope project`
-from the workspace root.
+### Troubleshooting
 
-To load it by hand instead, for one session only:
+- **"issues are disabled on owner/name"**: init refuses until the repo's Settings, Features, Issues is on; the minutes are its issues.
+- **"cannot reach owner/name"**: check the name and `gh auth status`, or pass `--create`.
+- **"the engine ... is outside the workspace"**: clone it into the workspace folder (step 2) and pass `--engine busybody`; a link out of the folder fails at load.
+- **"is inside another git repo"**: init never nests a workspace in another repo; pick a folder outside it.
+- **"core.hooksPath is set"**: init leaves the hook out; copy `bin/lib/pre-push-seatbelt` into that hooks directory by hand.
+- **Plugin not listed**: `claude plugin validate .` in the workspace, then `/reload-plugins`.
 
-From the workspace root (the folder holding `office.json`):
+## Load it by hand
+
+To load the engine for one session only (no workspace settings), from a folder holding `office.json`:
 
 ```sh
-claude --plugin-dir engine
+claude --plugin-dir busybody
 ```
 
 Then type `/office`. The band finds the workspace by walking up from the
-session's directory to the first folder with `office.json` (or $BUSYBODY_WORKSPACE), falling back to the
-folder above the engine. With none found it shows a warning and runs nothing.
+session's directory to the first folder with `office.json` (or `$BUSYBODY_WORKSPACE`), falling back to the
+folder above the plugin. With none found it shows a warning and runs nothing.
 
-Checks:
+Checks, from a clone of this repo (they are what `bin/land` runs; see `.land-checks`):
 
 ```sh
-claude plugin validate engine
-claude plugin test engine
-tsc -p engine   # needs .claude-plugin/types/, which the engine lays at load (gitignored)
+./.land-checks
+claude plugin validate .
+claude plugin test .
+tsc -p .   # needs .claude-plugin/types/, which the engine lays at load (gitignored)
 ```
 
 ## What it shows
