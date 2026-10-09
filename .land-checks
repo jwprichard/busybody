@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Busybody's checks, run by bin/land at every commit (in a temporary worktree of this repo).
+set -euo pipefail
+cd "$(dirname "$0")"
+# The self-tests need a workspace to look in for teams/ and office.json: this repo has none, and a checkout under some other
+# workspace would be picked up by walking up. So they run against a scratch workspace holding the default recipes `init` seeds.
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+mkdir "$T/teams"; cp -r templates/teams/. "$T/teams/"; echo '{"minutesRepo": "acme-co/acme-office"}' > "$T/office.json"
+export BUSYBODY_WORKSPACE="$T"
+for s in rooms role room-cost pr-watch land team init status; do
+  [[ -x "bin/$s" ]] || continue
+  echo "  check: bin/$s --self-test"; "bin/$s" --self-test
+done
+echo "  check: officeconfig --self-test"; python3 -I bin/lib/officeconfig.py --self-test
+echo "  check: team check (the default recipes)"; bin/team check
+if command -v claude >/dev/null; then
+  echo "  check: claude plugin validate ."; claude plugin validate .
+  echo "  check: claude plugin test ."; claude plugin test .
+else echo "  NOTE: claude CLI not found, skipping the plugin checks"; fi
