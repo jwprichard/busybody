@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Derive the state of every open cross-repo initiative from ground truth (GitHub + git).
+# Never reads state from hand-written text: issue bodies supply only the ordered PR links.
+#
+#   bin/status                      open `initiative` issues in the minutes repo (office.json minutesRepo)
+#   bin/status --fresh              ignore the cache (results are cached STATUS_TTL=300s for the hook)
+#   bin/status --from-file F [F…]   treat each file as an issue body (testing / pre-repo)
+#   bin/status --self-test          the evidence rules against a stub gh and throwaway clones (fixtures/status/)
+#
+# Always exits 0 — it runs from a SessionStart hook, and a failing hook is worse than none.
+
+set -uo pipefail
+
+ENGINE_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+. "$ENGINE_ROOT/bin/lib/officeroot.sh"
+. "$ENGINE_ROOT/bin/lib/officeconfig.sh"
+WS="$DATA_ROOT"   # clones and .cache are workspace-owned (one per workspace, shared by its worktrees); nothing here is engine-owned
+REPO="$(office_minutes_repo 2>&1)" || { printf 'status: %s\n' "$REPO"; exit 0; }   # no minutesRepo: say so and stop (this runs from a hook, so exit 0)
+WSREPO="$(office_workspace_repo)"   # the workspace repo's own name in step links
+REPO_RX="$(office_repos 2>/dev/null | sed 's/[.]/[.]/g' | paste -sd'|' || true)"   # the repo names office.json lists: a step line names one
+MAX_BYTES="${STATUS_MAX_BYTES:-8000}"
+
+say() { printf '%s\n' "$*"; }
+
+[[ "${1:-}" == --self-test ]] && exec "$ENGINE_ROOT/bin/lib/status-selftest"
+
+command -v gh >/dev/null && command -v jq >/dev/null || { say "status: gh/jq not installed — skipped"; exit 0; }
+gh auth status >/dev/null 2>&1 || { say "status: gh not authenticated — skipped"; exit 0; }
+
+declare -A FETCHED
+fetch_once() { # $1 = child repo dir name
+  [[ -n "${FETCHED[$1]:-}" ]] && return
+  FETCHED[$1]=1
+  [[ -d "$WS/$1/.git" ]] && timeout 15 git -C "$WS/$1" fetch -q --tags origin 2>/dev/null
+}
+
+# Runs the repo's evidence executable (contract: docs/office-engine-split.md, "Deploy evidence") for a merged PR and sets
+# `evidence` and `missing` from its verdict. $1 repo  $2 owner/repo  $3 merge sha  $4 head sha  $5 changed paths, one per line
+EVIDENCE_TIMEOUT="$(bb_env EVIDENCE_TIMEOUT)"; EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-90}"   # BUSYBODY_EVIDENCE_TIMEOUT, or the old OFFICE_ name
+run_evidence() {
+  local repo="$1" name exe out rc line1 verdict reason
+  name="$(office_evidence "$repo")"
+  if [[ -z "$name" ]]; then
+    if [[ "$repo" == "$WSREPO" ]]; then name=default
+    elif [[ -x "$WORKSPACE_ROOT/evidence/$repo" ]]; then name="$repo"
+    else missing="no evidence rule for $repo"; return; fi
+  fi
+  if [[ "$name" == default ]]; then evidence="merged"; return; fi   # no deploy hop named: a merged PR is done
+  exe="$WORKSPACE_ROOT/evidence/$name"
+  [[ -x "$exe" ]] || { missing="evidence executable evidence/$name not found"; return; }
+  # Both name sets are exported: BUSYBODY_* is the contract, OFFICE_* keeps older evidence executables working.
+  out="$(BUSYBODY_ENGINE="$ENGINE_ROOT" BUSYBODY_WORKSPACE="$WORKSPACE_ROOT" BUSYBODY_REPO="$repo" BUSYBODY_GITHUB="$2" \
+         BUSYBODY_REPO_DIR="$WS/$repo" BUSYBODY_HEAD_SHA="$4" BUSYBODY_PR_FILES="$5" \
+         OFFICE_ENGINE="$ENGINE_ROOT" OFFICE_WORKSPACE="$WORKSPACE_ROOT" OFFICE_REPO="$repo" OFFICE_GITHUB="$2" \
+         OFFICE_REPO_DIR="$WS/$repo" OFFICE_HEAD_SHA="$4" OFFICE_PR_FILES="$5" timeout -k 5 "$EVIDENCE_TIMEOUT" "$exe" "$3" 2>/dev/null)"
+  rc=$?
+  line1="$(head -n1 <<<"$out")"; verdict="${line1%% *}"
+  reason="${line1#"$verdict"}"; reason="${reason# }"; reason="${reason:-no reason given}"   # a bare verdict still reads
+  case "$rc:$verdict" in
+    0:PASS) evidence="$reason" ;;
+    1:WAIT|2:FAIL) missing="$reason"; evidence="$(sed -n 's/^has: //p' <<<"$out" | head -n1)" ;;
+    *) missing="evidence/$name gave no verdict (exit $rc)" ;;
+  esac
+}
+
+# Prints one line describing a PR step's deploy evidence; sets STEP_STATE to
+# deployed | merged | open | closed | missing | unknown (child clone absent)
+STEP_STATE=""
+eval_step() { # $1 = PR url
+  local url="$1" owner_repo num repo pr state merge head title ci
+  owner_repo="$(sed -E 's#https://github.com/([^/]+/[^/]+)/pull/[0-9]+.*#\1#' <<<"$url")"
+  num="$(sed -E 's#.*/pull/([0-9]+).*#\1#' <<<"$url")"
+  repo="${owner_repo#*/}"
+  pr="$(gh pr view "$num" -R "$owner_repo" --json state,isDraft,title,mergeCommit,headRefOid,files,statusCheckRollup 2>/dev/null)" \
+    || { STEP_STATE=missing; say "  ? $repo#$num — cannot read PR"; return; }
+  state="$(jq -r .state <<<"$pr")"; title="$(jq -r .title <<<"$pr" | cut -c1-70)"
+  merge="$(jq -r '.mergeCommit.oid // empty' <<<"$pr")"; head="$(jq -r .headRefOid <<<"$pr")"
+  ci="$(jq -r '[.statusCheckRollup[]? | (.conclusion // .state // "PENDING")] |
+        if length==0 then "no CI" elif any(.=="FAILURE" or .=="ERROR" or .=="TIMED_OUT") then "CI FAILING"
+        elif any(.=="PENDING" or .=="" or .=="IN_PROGRESS" or .=="QUEUED") then "CI pending" else "CI green" end' <<<"$pr")"
+
+  case "$state" in
+    OPEN)   STEP_STATE=open
+            say "  … $repo#$num $( [[ $(jq -r .isDraft <<<"$pr") == true ]] && echo 'DRAFT' || echo 'open'), $ci — $title"
+            return ;;
+    CLOSED) STEP_STATE=closed; say "  ✗ $repo#$num closed unmerged — $title"; return ;;
+  esac
+
+  if [[ "$repo" != "$WSREPO" && ! -d "$WS/$repo/.git" ]]; then
+    STEP_STATE=unknown
+    say "  ? $repo#$num merged — cannot verify deploy: clone $(office_github "$repo") under $WSREPO/ — $title"
+    return
+  fi
+  [[ "$repo" != "$WSREPO" ]] && fetch_once "$repo"
+  local evidence="" missing=""
+  run_evidence "$repo" "$owner_repo" "$merge" "$head" "$(jq -r '.files[].path' <<<"$pr")"
+
+  if [[ -z "$missing" ]]; then STEP_STATE=deployed; say "  ✓ $repo#$num deployed ($evidence) — $title"
+  else STEP_STATE=merged; say "  ! $repo#$num merged, NOT deployed: missing $missing${evidence:+ (has $evidence)} — $title"; fi
+}
+
+# PR url for a room's branch ($1 repo, $2 branch); empty when none or gh fails. the workspace repo -> $REPO.
+branch_pr_url() {
+  local r="$1" owner_repo
+  [[ -z "$r" || -z "$2" ]] && return
+  owner_repo="$(office_github "$r")"
+  gh pr list -R "$owner_repo" --head "$2" --state all --json url -q '.[0].url // empty' 2>/dev/null
+}
+
+# One initiative: $1 header line, $2 body text
+eval_initiative() {
+  local header="$1" body="$2" n=0 pending="" line url repo unverified="" p room_repo room_branch fallback_used=""
+  say "$header"
+  # `## Room` block: a step with no PR link falls back to the PR for the room's branch.
+  room_repo="$(awk '/^## /{s=($0 ~ /^## Room/)} s && /^[-*][[:space:]]*repo:/{sub(/^[^:]*:[[:space:]]*/,""); gsub(/`/,""); print; exit}' <<<"$body")"
+  room_branch="$(awk '/^## /{s=($0 ~ /^## Room/)} s && /^[-*][[:space:]]*branch:/{sub(/^[^:]*:[[:space:]]*/,""); gsub(/`/,""); print; exit}' <<<"$body")"
+  # Steps = numbered lines under '## Steps'; each step's PR links in order.
+  # `pending` holds "repo:step" for every earlier step without deploy evidence. Ordering is only
+  # flagged ACROSS repos (provider-first): within one repo a release PR always merges before
+  # the fixes it carries are deployed, so a same-repo flag would be noise.
+  while IFS= read -r line; do
+    n=$((n+1))
+    url="$(grep -oE 'https://github.com/[^/ ]+/[^/ ]+/pull/[0-9]+' <<<"$line" | head -1)"
+    repo=""; [[ -z "$REPO_RX" ]] || repo="$(grep -oE "($REPO_RX)" <<<"$line" | head -1)"
+    # Branch fallback: only the FIRST unlinked step naming the room's own repo.
+    if [[ -z "$url" && -z "$fallback_used" && -n "$room_repo" && "$repo" == "$room_repo" ]]; then
+      url="$(branch_pr_url "$room_repo" "$room_branch")"
+      fallback_used=1
+    fi
+    if [[ -z "$url" ]]; then
+      say "  · step $n: no PR yet — $(sed -E 's/^\s*[0-9]+\.\s*//' <<<"$line" | cut -c1-70)"
+      pending="$pending ${repo:-?}:$n"
+      continue
+    fi
+    repo="$(sed -E 's#https://github.com/[^/]+/([^/]+)/pull/.*#\1#' <<<"$url")"
+    eval_step "$url"
+    if [[ "$STEP_STATE" == merged || "$STEP_STATE" == deployed ]]; then
+      for p in $pending; do
+        [[ "${p%%:*}" != "$repo" ]] && say "    ⚠ ORDERING: step $n ($repo) merged while step ${p#*:} (${p%%:*}) has no deploy evidence"
+      done
+    fi
+    case "$STEP_STATE" in
+      deployed) ;;
+      unknown) unverified=1 ;;
+      *) pending="$pending $repo:$n" ;;
+    esac
+  done < <(awk '/^## /{s=($0 ~ /^## Steps/)} s && /^[[:space:]]*[0-9]+\./' <<<"$body")
+  [[ $n -eq 0 ]] && say "  (no '## Steps' list found)"
+  [[ $n -gt 0 && -z "$pending" && -z "$unverified" ]] && say "  → every step has deploy evidence — consider closing"
+}
+
+main() {
+  if [[ "${1:-}" == "--from-file" ]]; then
+    shift
+    for f in "$@"; do eval_initiative "▸ [file] $(basename "$f")" "$(cat "$f")"; done
+    return
+  fi
+  local issues
+  issues="$(gh issue list -R "$REPO" -l initiative --state open -L 30 \
+            --json number,title,body,assignees,labels,updatedAt,comments 2>/dev/null)" \
+    || { say "status: cannot list issues in $REPO (repo missing or no access) — skipped"; return; }
+  if [[ "$(jq length <<<"$issues")" == 0 ]]; then say "status: no open initiatives in $REPO"; return; fi
+  say "Open initiatives in $REPO (derived $(date -u +%FT%TZ)):"
+  local i count
+  count="$(jq length <<<"$issues")"
+  for ((i=0; i<count; i++)); do
+    local it hdr
+    it="$(jq ".[$i]" <<<"$issues")"
+    hdr="$(jq -r '"▸ #\(.number) \(.title) — owner: \([.assignees[].login] | join(",") | if .=="" then "UNASSIGNED" else . end)" +
+           (if any(.labels[]; .name=="blocked") then " — BLOCKED" else "" end) +
+           " — last comment: \(if (.comments|length)>0 then .comments[-1].createdAt[0:10] else "none" end)"' <<<"$it")"
+    eval_initiative "$hdr" "$(jq -r .body <<<"$it")"
+  done
+}
+
+# Cache the live (issue-list) result so the SessionStart hook is instant on startup/resume/compact.
+CACHE="$WS/.cache/status.out"; TTL="${STATUS_TTL:-300}"
+if [[ "${1:-}" == "--fresh" ]]; then shift; rm -f "$CACHE"; fi
+if [[ "${1:-}" != "--from-file" && -f "$CACHE" ]]; then
+  age=$(( $(date +%s) - $(stat -c %Y "$CACHE") ))
+  if (( age < TTL )); then
+    cat "$CACHE"; say "(cached ${age}s ago — run bin/status --fresh to re-derive)"; exit 0
+  fi
+fi
+
+out="$(main "$@" 2>/dev/null)"
+if (( ${#out} > MAX_BYTES )); then
+  out="${out:0:$MAX_BYTES}
+… (truncated at $MAX_BYTES bytes — run bin/status directly for the rest)"
+fi
+printf '%s\n' "$out"
+if [[ "${1:-}" != "--from-file" && "$out" != status:* ]]; then
+  mkdir -p "$WS/.cache" && printf '%s\n' "$out" > "$CACHE"
+fi
+exit 0

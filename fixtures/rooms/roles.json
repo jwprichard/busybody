@@ -1,0 +1,19 @@
+{"generated_at": "2026-10-06T03:00:00+00:00", "hook": true, "roles": [
+ {"name": "scribe", "goal": "Keep the notes in order", "enabled": true, "status": "probation", "issue": 91,
+  "budget_usd_month": 15.0, "contractor_budget_usd_month": 20.0, "drafts": {"approved": 2, "unedited": 1},
+  "use_count": 3, "last_use": "2026-10-05", "ratings": {"saved-time": 1, "useful": 2, "no-value": 0},
+  "pilot": {"start": "2026-10-02", "weeks": 3, "uses": 6, "days": 4},
+  "memory": {"index_bytes": 2048, "total_bytes": 3000, "cap_index": 8192, "cap_role": 16384, "files": 2, "dated_lines": 4, "stale_lines": 1},
+  "pending": [" M .claude/agent-memory/scribe/MEMORY.md", "?? .claude/agent-memory/scribe/new.md"],
+  "cost": {"month": 3.5, "last_activity": "2026-10-05T01:00:00Z", "contractors": {"month": 1.25}},
+  "disabled_reason": null, "flags": ["memory diff waiting for review (2 file(s))"]},
+ {"name": "auditor", "goal": "Audit things", "enabled": true, "status": "kept", "issue": 92,
+  "budget_usd_month": 10.0, "contractor_budget_usd_month": 5.0, "drafts": {"approved": 0, "unedited": 0},
+  "use_count": 8, "last_use": "2026-08-27", "pilot": null,
+  "memory": {"index_bytes": 9000, "total_bytes": 9000, "cap_index": 8192, "cap_role": 16384, "dated_lines": 0, "stale_lines": 0},
+  "pending": [], "cost": {"month": 0.0, "contractors": {"month": 0.0}}, "disabled_reason": null, "flags": ["unused 40 days"]},
+ {"name": "retired", "goal": "Old job", "enabled": false, "status": "disabled", "issue": null,
+  "budget_usd_month": 5.0, "contractor_budget_usd_month": null, "use_count": 1, "last_use": "2026-09-01", "pilot": null,
+  "memory": {"index_bytes": 100, "total_bytes": 100, "cap_index": 8192, "cap_role": 16384},
+  "pending": [], "cost": {"month": 0.0}, "disabled_reason": "not worth it", "flags": []}
+]}

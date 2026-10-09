@@ -1,0 +1,16 @@
+[
+ {"name": "waiting, dead watcher, PR open, new", "comment": "**WAITING** \u00b7 role \u00b7 PR #5 CI\n\nbody", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "expect": "nudge"},
+ {"name": "old WAITING: prefix", "comment": "WAITING: for review", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "expect": "nudge"},
+ {"name": "watcher alive", "comment": "**WAITING** \u00b7 role \u00b7 PR", "alive": true, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "expect": "none"},
+ {"name": "not waiting", "comment": "**PROGRESS** \u00b7 role \u00b7 building", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "expect": "none"},
+ {"name": "no PR", "comment": "**WAITING** \u00b7 role \u00b7 card", "alive": false, "pr": null, "expect": "none"},
+ {"name": "PR changed", "comment": "**WAITING** \u00b7 role \u00b7 PR", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@2"}, "last_sig": "OPEN@1", "expect": "nudge"},
+ {"name": "PR unchanged", "comment": "**WAITING** \u00b7 role \u00b7 PR", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "last_sig": "OPEN@1", "expect": "none"},
+ {"name": "PR merged while waiting", "comment": "**WAITING** \u00b7 role \u00b7 PR", "alive": false, "pr": {"number": 5, "state": "MERGED", "sig": "MERGED@3"}, "last_sig": "OPEN@1", "expect": "nudge"},
+ {"name": "merged, already noted", "comment": "**WAITING** \u00b7 role \u00b7 PR", "alive": false, "pr": {"number": 5, "state": "MERGED", "sig": "MERGED@3"}, "last_sig": "MERGED@3", "expect": "none"},
+ {"name": "own NOTE after WAITING does not end the watch (changed PR)", "comments": ["**WAITING** \u00b7 role \u00b7 PR", "**NOTE** \u00b7 cap-timer \u00b7 #1\n\nx"], "comment": "", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@2"}, "last_sig": "OPEN@1", "expect": "nudge"},
+ {"name": "NOTE after WAITING, PR unchanged", "comments": ["**WAITING** \u00b7 role \u00b7 PR", "**NOTE** \u00b7 cap-timer \u00b7 #1\n\nx"], "comment": "", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@1"}, "last_sig": "OPEN@1", "expect": "none"},
+ {"name": "RECORD and old ANSWER: after WAITING still waiting", "comments": ["**WAITING** \u00b7 role \u00b7 PR", "**RECORD** \u00b7 controller \u00b7 #1", "ANSWER: go"], "comment": "", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@2"}, "last_sig": "OPEN@1", "expect": "nudge"},
+ {"name": "room PROGRESS after WAITING ends it", "comments": ["**WAITING** \u00b7 role \u00b7 PR", "**PROGRESS** \u00b7 role \u00b7 resumed"], "comment": "", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@2"}, "expect": "none"},
+ {"name": "only NOTEs, no own minute", "comments": ["**NOTE** \u00b7 cap-timer \u00b7 #1"], "comment": "", "alive": false, "pr": {"number": 5, "state": "OPEN", "sig": "OPEN@2"}, "expect": "none"}
+]

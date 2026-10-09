@@ -1,0 +1,162 @@
+#!/usr/bin/python3 -I
+"""Who spent the GitHub quota: reads the log written by bin/gh-wrapper.
+
+  busybody gh-usage [--since 1h] [--json]   calls in the window: GraphQL vs REST, failures and retries, top callers by session and script
+  busybody gh-usage --install-help          how to put the logging shim ahead of the real gh (shows commands, runs nothing)
+  busybody gh-usage --self-test
+
+Points are an estimate (1 per GraphQL call, one more per 100 items asked for): a floor, not what GitHub charged.
+"""
+import json, os, sys, time
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+import ghusage  # noqa: E402
+
+selftest_reexec(ENGINE_ROOT)
+WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+CACHE = os.path.join(data_root(WORKSPACE_ROOT), ".cache")
+
+INSTALL = """The gh logging shim is opt-in. To turn it on, put a `gh` symlink to the shim in a directory that comes before the real gh on PATH:
+
+  mkdir -p ~/.local/share/busybody/shim
+  ln -s {shim} ~/.local/share/busybody/shim/gh
+  # then, in your shell rc (bash: ~/.bashrc, zsh: ~/.zshrc):
+  export PATH="$HOME/.local/share/busybody/shim:$PATH"
+
+Check with `type -a gh` (the shim first, the real gh after). Sessions started after that log every gh call to
+{log}/YYYY-MM-DD.jsonl (local only, 7 days kept). To turn it off, remove the PATH line or the symlink. Nothing here ran any of this."""
+
+
+def report(since_s, as_json):
+    now = time.time()
+    s = ghusage.summarise(ghusage.read(CACHE, now - since_s))
+    if as_json:
+        print(json.dumps(s))
+        return 0
+    t = s["totals"]
+    print(f"gh calls in the last {since_s // 60} min: {t['calls']} ({t['graphql']} GraphQL, {t['rest']} REST), ~{t['points_est']} GraphQL points (estimate, limit {ghusage.LIMIT}/h)")
+    print(f"failures {t['failures']}, retries {t['retries']}, 304s {t['not_modified']}, total gh time {t['ms'] / 1000:.1f}s")
+    for dim in ("session", "script"):
+        print(f"top by {dim}:")
+        total = max(t["points_est"], 1)
+        for name, e in s["top"][dim]:
+            print(f"  {name:<40} {e['calls']:>5} calls  {e['graphql']:>5} GraphQL  ~{e['points_est']:>5} pts  {100 * e['points_est'] // total:>3}%")
+    if t["calls"] == 0:
+        print(f"(no calls logged: is the shim installed? `busybody gh-usage --install-help`; log dir {ghusage.log_dir(CACHE)})")
+    return 0
+
+
+def self_test():
+    import subprocess, tempfile
+    bad = []
+    with tempfile.TemporaryDirectory() as d:
+        ws, shim = os.path.join(d, "ws"), os.path.join(d, "shim")
+        os.makedirs(os.path.join(ws, ".cache"))
+        os.makedirs(shim)
+        open(os.path.join(ws, "office.json"), "w").write("{}")
+        real = os.path.join(d, "realgh")
+        open(real, "w").write('#!/bin/sh\necho "out: $*"\ncase "$1" in fail) echo "gh: boom" >&2; exit 3;; nm) echo "gh: HTTP 304" >&2; exit 1;; esac\n')
+        os.chmod(real, 0o755)
+        os.symlink(os.path.join(ENGINE_ROOT, "bin", "gh-wrapper"), os.path.join(shim, "gh"))
+        os.symlink(real, os.path.join(d, "gh"))   # the "real" gh found on PATH
+        env = dict(os.environ, PATH=shim + os.pathsep + d + os.pathsep + os.environ["PATH"], BUSYBODY_WORKSPACE=ws)
+        env.pop("BUSYBODY_REAL_GH", None)
+        open(os.path.join(d, "none.json"), "w").write("[]")
+        env["BUSYBODY_AGENTS_JSON"] = os.path.join(d, "none.json")   # never the real agents list, whose pids include this test's own ancestors
+
+        def gh(*a, **kw):
+            return subprocess.run(["gh", *a], capture_output=True, text=True, env=env, cwd=ws, **kw)
+        r1 = gh("pr", "list", "-L", "250", "--body", "TOPSECRET")
+        r2 = gh("fail")
+        r3 = gh("nm")
+        r4 = gh("api", "repos/o/r/issues", "-f", "k=SECRETVALUE")
+        if (r1.returncode, r1.stdout) != (0, "out: pr list -L 250 --body TOPSECRET\n"):
+            bad.append(f"the real gh must run unchanged: {r1.returncode} {r1.stdout!r}")
+        if (r2.returncode, r2.stderr) != (3, "gh: boom\n"):
+            bad.append(f"exit code and stderr pass through: {r2.returncode} {r2.stderr!r}")
+        recs = ghusage.read(os.path.join(ws, ".cache"), 0)
+        if len(recs) != 4:
+            bad.append(f"one line per call: {len(recs)}")
+        else:
+            if "TOPSECRET" in json.dumps(recs) or "SECRETVALUE" in json.dumps(recs):
+                bad.append("values after --body and -f must be redacted")
+            if [r["kind"] for r in recs] != ["graphql", "rest", "rest", "rest"] or recs[0]["points"] != 3:
+                bad.append(f"kinds and estimated points: {[(r['kind'], r['points']) for r in recs]}")
+            if [r["exit"] for r in recs] != [0, 3, 1, 0] or [bool(r["not_modified"]) for r in recs] != [False, False, True, False]:
+                bad.append("exit codes and 304 detection")
+            if not all(r["cwd"] == ws and r["ms"] >= 0 and "session" in r and "script" in r for r in recs):
+                bad.append("cwd, duration, session and script fields")
+        # callers: a script run by an interpreter inside a `claude -n room-x` process
+        script = os.path.join(d, "poller.sh")
+        open(script, "w").write("#!/bin/sh\ngh issue list\n")
+        os.chmod(script, 0o755)
+        # the real shape: a live background session is `claude bg-spare --bg-spare <sock>` (no -n); `claude agents --json` maps its pid
+        agents_f, flag = os.path.join(d, "agents.json"), os.path.join(d, "go")
+        env3 = dict(env, BUSYBODY_AGENTS_JSON=agents_f)
+        bg = subprocess.Popen(["bash", "-c", f"exec -a claude bash -c 'while [ ! -e {flag} ]; do sleep 0.1; done; {script}; :' bg-spare --bg-spare /tmp/x.sock"],
+                              env=env3, cwd=ws, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        json.dump([{"name": "room-x", "kind": "background", "pid": bg.pid}], open(agents_f, "w"))
+        if os.path.exists(os.path.join(ws, ".cache", "agents-map.json")):
+            os.remove(os.path.join(ws, ".cache", "agents-map.json"))
+        open(flag, "w").close()
+        bg.wait(timeout=20)
+        last = ghusage.read(os.path.join(ws, ".cache"), 0)[-1]
+        if (last.get("script"), last.get("session")) != ("poller.sh", "room-x"):
+            bad.append(f"caller from the agents pid map: {(last.get('script'), last.get('session'))}")
+        # the -n fallback for a non-bg shape
+        if os.path.exists(os.path.join(ws, ".cache", "agents-map.json")):
+            os.remove(os.path.join(ws, ".cache", "agents-map.json"))
+        fake = os.path.join(d, "claude")
+        os.symlink("/bin/sh", fake)
+        subprocess.run([fake, "-c", f"{script} \"$0\"", "-n", "room-y"], env=dict(env, BUSYBODY_AGENTS_JSON=os.path.join(d, "none.json")), cwd=ws, capture_output=True)
+        last = ghusage.read(os.path.join(ws, ".cache"), 0)[-1]
+        if (last.get("script"), last.get("session")) != ("poller.sh", "room-y"):
+            bad.append(f"caller from the -n fallback: {(last.get('script'), last.get('session'))}")
+        # no workspace: nothing is logged, the call still runs
+        env2 = dict(env, BUSYBODY_WORKSPACE=os.path.join(d, "nowhere"))
+        before = len(ghusage.read(os.path.join(ws, ".cache"), 0))
+        r = subprocess.run(["gh", "x"], capture_output=True, text=True, env=env2, cwd=d)
+        if r.returncode != 0 or len(ghusage.read(os.path.join(ws, ".cache"), 0)) != before:
+            bad.append("with no workspace the call runs and nothing is logged")
+        s = ghusage.summarise(ghusage.read(os.path.join(ws, ".cache"), 0))
+        if s["totals"]["failures"] != 2:
+            bad.append(f"summary failures: {s['totals']}")
+    if bad:
+        print("gh-usage self-test: FAILED: " + "; ".join(bad))
+        return 1
+    print("gh-usage self-test: ok")
+    return 0
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        sub = os.path.join(ENGINE_ROOT, "bin", "lib", "ghusage.py")
+        import subprocess
+        if subprocess.run([sys.executable, "-I", sub, "--self-test"]).returncode:
+            return 1
+        return self_test()
+    if argv == ["--install-help"]:
+        print(INSTALL.format(shim=os.path.join(ENGINE_ROOT, "bin", "gh-wrapper"), log=ghusage.log_dir(CACHE)))
+        return 0
+    since, as_json = "1h", False
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--since" and i + 1 < len(argv):
+            since = argv[i + 1]
+            i += 1
+        elif argv[i] == "--json":
+            as_json = True
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+        i += 1
+    try:
+        return report(ghusage.parse_since(since), as_json)
+    except ValueError as e:
+        print(f"gh-usage: {e}", file=sys.stderr)
+        return 2
+
+
+sys.exit(main(sys.argv[1:]))

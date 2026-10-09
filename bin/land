@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Land a repo without PRs: the only way a role moves `main`.
+#
+#   bin/land <branch> [--dry-run] [--no-checks]      (run inside the repo, any of its worktrees)
+#   bin/land --self-test
+#
+# 1. Refuses a dirty tree (tracked changes in the worktree that has <branch> checked out; a modified
+#    .claude/room-settings.json alone is ignored, as bin/lead-start rewrites it) or a branch that is not directly on top of main:
+#    main (and origin/main, when a remote exists) must be an ancestor, with no merge commits in main..branch.
+# 2. Runs the repo's checks at EVERY commit in main..branch, oldest first, each in a temporary detached
+#    worktree (never your tree). The first failure stops it and main is untouched.
+# 3. Only then fast-forwards main and, if an `origin` remote exists, `git push origin main`.
+# --dry-run does everything except the fast-forward and the push, and prints what it would do.
+# --no-checks skips step 2 (only for a repo that defines no checks; say so in the minutes).
+# Checks per repo: a workspace that holds the engine (engine/bin/rooms and engine/bin/role, or bin/ in older commits) = the
+# engine/bin self-tests that exist at that commit (rooms role room-cost pr-watch land team init), `team check`, the workspace's
+# tests/*-selftest when present, plus `claude plugin test` on engine/ (mods/office in older commits; skipped with a note if the claude CLI is missing); any other
+# repo = an executable `.land-checks` script at its root, else the package.json scripts typecheck, lint,
+# test and build that exist. A repo with none of these is refused. Never force-pushes.
+
+set -euo pipefail
+
+die() { printf 'land: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+# Run the repo's checks inside directory $1 (a checkout of one commit). Returns non-zero on failure.
+run_checks() {
+  local d="$1" n=0 s
+  if [[ -x "$d/.land-checks" ]]; then
+    say "  check: .land-checks"; (cd "$d" && ./.land-checks) || return 1; n=1
+  elif [[ -x "$d/engine/bin/rooms" && -x "$d/engine/bin/role" || -x "$d/bin/rooms" && -x "$d/bin/role" ]]; then
+    # a workspace that holds the engine: engine/bin in the current layout, bin/ in commits from before the move
+    local e=bin; [[ -x "$d/engine/bin/rooms" ]] && e=engine/bin
+    for s in rooms role room-cost pr-watch land team init; do
+      [[ -x "$d/$e/$s" ]] || continue
+      say "  check: $e/$s --self-test"; (cd "$d" && "$e/$s" --self-test) || return 1; n=$((n + 1))
+    done
+    if [[ -x "$d/$e/team" ]]; then
+      say "  check: $e/team check"; (cd "$d" && "$e/team" check) || return 1; n=$((n + 1))
+    fi
+    local t
+    for t in "$d"/tests/*-selftest; do   # the workspace's own self-tests (executables named tests/<name>-selftest)
+      [[ -x "$t" ]] || continue
+      say "  check: tests/$(basename "$t")"; (cd "$d" && "tests/$(basename "$t")") || return 1; n=$((n + 1))
+    done
+    local plug=""; [[ -d "$d/engine/.claude-plugin" ]] && plug=engine; [[ -z "$plug" && -d "$d/mods/office" ]] && plug=mods/office
+    if [[ -n "$plug" ]]; then
+      if command -v claude >/dev/null; then
+        say "  check: claude plugin test $plug"; (cd "$d" && claude plugin test "$plug") || return 1; n=$((n + 1))
+      else say "  NOTE: claude CLI not found, skipping the office plugin tests"; fi
+    fi
+  elif [[ -f "$d/package.json" ]]; then
+    if [[ ! -d "$d/node_modules" && -f "$d/package-lock.json" ]]; then (cd "$d" && npm ci --silent) || return 1; fi
+    for s in typecheck lint test build; do
+      jq -e --arg s "$s" '.scripts[$s]' "$d/package.json" >/dev/null 2>&1 || continue
+      say "  check: npm run $s"; (cd "$d" && npm run -s "$s") || return 1; n=$((n + 1))
+    done
+  fi
+  ((n > 0)) || { say "  no checks defined (.land-checks, workspace self-tests or package.json scripts)" >&2; return 2; }
+}
+
+land() {
+  repo="" tmp=""
+  local bpath branch="$1" dry="$2" nochecks="$3" main_sha br_sha remote="" sha c total i=0 mpath
+  repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repo"
+  cd "$repo"
+  git rev-parse --verify -q "refs/heads/$branch" >/dev/null || die "no local branch '$branch'"
+  [[ "$branch" != main ]] || die "cannot land main onto itself"
+  # The dirty check looks at the worktree that has <branch> checked out (else this one). bin/lead-start
+  # overwrites the tracked .claude/room-settings.json in every room worktree, so that file alone is ignored.
+  bpath="$(git worktree list --porcelain | awk -v b="refs/heads/$branch" '/^worktree /{p=substr($0,10)} $0=="branch " b{print p; exit}')"
+  [[ -n "$bpath" ]] || bpath="$repo"
+  [[ -z "$(git -C "$bpath" status --porcelain --untracked-files=no -- . ':(exclude).claude/room-settings.json')" ]] || die "working tree is dirty at $bpath: commit or discard tracked changes first"
+  git rev-parse --verify -q refs/heads/main >/dev/null || die "no local main branch"
+  if git remote get-url origin >/dev/null 2>&1; then
+    remote=origin
+    git fetch -q origin main 2>/dev/null || die "cannot fetch origin main"
+  fi
+  main_sha="$(git rev-parse refs/heads/main)"; br_sha="$(git rev-parse "refs/heads/$branch")"
+  git merge-base --is-ancestor "$main_sha" "$br_sha" || die "'$branch' is not directly on top of main (main is not an ancestor): merge nothing, rebuild the branch from current main"
+  if [[ -n "$remote" ]]; then
+    git merge-base --is-ancestor "refs/remotes/origin/main" "$br_sha" || die "'$branch' does not contain origin/main: it is behind or has diverged from the remote"
+  fi
+  [[ -z "$(git rev-list --merges "$main_sha..$br_sha")" ]] || die "'$branch' has merge commits in main..$branch: the history must be linear"
+  total="$(git rev-list --count "$main_sha..$br_sha")"
+  ((total > 0)) || die "'$branch' has no commits beyond main: nothing to land"
+  say "land: $total commit(s) in main..$branch"
+
+  if [[ "$nochecks" == 1 ]]; then say "land: --no-checks: skipping checks"
+  else
+    tmp="$(mktemp -d)"; trap 'git -C "$repo" worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+    for sha in $(git rev-list --reverse "$main_sha..$br_sha"); do
+      i=$((i + 1)); c="$(git log -1 --format='%h %s' "$sha")"
+      say "land: [$i/$total] $c"
+      git worktree add -q --detach "$tmp/wt" "$sha" || die "cannot create a temporary worktree"
+      if ! run_checks "$tmp/wt"; then
+        git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
+        die "checks failed at commit $c; main is untouched"
+      fi
+      git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if [[ "$dry" == 1 ]]; then
+    say "land: dry run: checks passed; would fast-forward main to $(git rev-parse --short "$br_sha")${remote:+ and run: git push origin main}"
+    return 0
+  fi
+  mpath="$(git worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} $0=="branch refs/heads/main"{print p; exit}')"
+  if [[ -n "$mpath" ]]; then
+    [[ -z "$(git -C "$mpath" status --porcelain --untracked-files=no)" ]] || die "main is checked out at $mpath with tracked changes: cannot fast-forward"
+    git -C "$mpath" merge -q --ff-only "$br_sha" || die "fast-forward of main failed"
+  else
+    git update-ref -m "land: fast-forward to $branch" refs/heads/main "$br_sha" "$main_sha" || die "fast-forward of main failed"
+  fi
+  say "land: main is now $(git rev-parse --short main)"
+  if [[ -n "$remote" ]]; then
+    export BUSYBODY_LAND=1   # tells a repo's pre-push hook this is the lander, not a room
+    git push -q origin main || die "push failed; main is fast-forwarded locally, nothing was forced"
+    say "land: pushed origin main"
+  else say "land: no remote: fast-forward only"; fi
+}
+
+self_test() {
+  local SELF bad=() out rc before; T=""; R=""
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  g() { git -C "$R" "$@"; }
+  commit() { echo "$2" > "$R/$1"; g add "$1"; g commit -q -m "$1"; }
+  fresh() { # fresh [noremote]: scratch repo on main with a checks script that fails if a FAIL file exists
+    rm -rf "$T/r" "$T/bare.git"; R="$T/r"; git init -q -b main "$R"
+    printf '#!/bin/sh\n[ ! -e FAIL ] || { echo "FAIL present"; exit 1; }\n' > "$R/.land-checks"; chmod +x "$R/.land-checks"
+    g add .land-checks; g commit -q -m base
+    if [[ "${1:-}" != noremote ]]; then git init -q --bare -b main "$T/bare.git"; g remote add origin "$T/bare.git"; g push -q origin main; fi
+    g checkout -q -b feat
+  }
+  land_in() { rc=0; out="$(cd "$R" && "$SELF" "$@" 2>&1)" || rc=$?; }
+  # pass: lands, ff and push
+  fresh; commit a 1; commit b 2; land_in feat
+  [[ $rc == 0 && "$(g rev-parse main)" == "$(g rev-parse feat)" && "$(git -C "$T/bare.git" rev-parse main)" == "$(g rev-parse feat)" ]] || bad+=("pass: rc=$rc $out")
+  # pass without a remote
+  fresh noremote; commit a 1; land_in feat
+  [[ $rc == 0 && "$(g rev-parse main)" == "$(g rev-parse feat)" && "$out" == *"no remote"* ]] || bad+=("noremote: rc=$rc $out")
+  # failure at a middle commit (the last commit is fine again): main untouched, remote untouched
+  fresh; before="$(g rev-parse main)"; commit a 1; touch "$R/FAIL"; g add FAIL; g commit -q -m breaks; g rm -q FAIL; g commit -q -m fixes
+  land_in feat
+  [[ $rc != 0 && "$out" == *"checks failed at commit"*breaks* && "$(g rev-parse main)" == "$before" && "$(git -C "$T/bare.git" rev-parse main)" == "$before" ]] || bad+=("fail-middle: rc=$rc $out")
+  # non-linear: main moved on
+  fresh; commit a 1; g checkout -q main; commit m 1; g checkout -q feat; land_in feat
+  [[ $rc != 0 && "$out" == *"not directly on top of main"* ]] || bad+=("nonlinear: rc=$rc $out")
+  # merge commit in range
+  fresh; commit a 1; g checkout -q -b side main; commit s 1; g checkout -q feat; g merge -q --no-ff side -m merge; land_in feat
+  [[ $rc != 0 && "$out" == *"merge commits"* ]] || bad+=("merge: rc=$rc $out")
+  # behind origin/main
+  fresh; commit a 1; git clone -q "$T/bare.git" "$T/other"; git -C "$T/other" commit -q --allow-empty -m remote-only; git -C "$T/other" push -q origin main; rm -rf "$T/other"
+  land_in feat
+  [[ $rc != 0 && "$out" == *"origin/main"* ]] || bad+=("behind-remote: rc=$rc $out")
+  # dirty tree
+  fresh; commit a 1; echo x >> "$R/a"; land_in feat
+  [[ $rc != 0 && "$out" == *dirty* ]] || bad+=("dirty: rc=$rc $out")
+  # dirty in the branch's own worktree, invoked from another worktree (main)
+  fresh; commit a 1; g checkout -q main; git -C "$R" worktree add -q "$T/wt" feat; echo x >> "$T/wt/a"; land_in feat
+  [[ $rc != 0 && "$out" == *dirty* ]] || bad+=("dirty-other-worktree: rc=$rc $out")
+  g worktree remove --force "$T/wt"
+  # only .claude/room-settings.json modified: ignored, lands
+  fresh; mkdir -p "$R/.claude"; echo '{}' > "$R/.claude/room-settings.json"; g add .claude; g commit -q -m settings
+  echo '{"a":1}' > "$R/.claude/room-settings.json"; land_in feat
+  [[ $rc == 0 && "$(g rev-parse main)" == "$(g rev-parse feat)" ]] || bad+=("settings-only-dirty: rc=$rc $out")
+  # room-settings modified plus another tracked change: refused
+  fresh; commit a 1; mkdir -p "$R/.claude"; echo '{}' > "$R/.claude/room-settings.json"; g add .claude; g commit -q -m settings
+  echo '{"a":1}' > "$R/.claude/room-settings.json"; echo x >> "$R/a"; land_in feat
+  [[ $rc != 0 && "$out" == *dirty* ]] || bad+=("settings-plus-dirty: rc=$rc $out")
+  # dry run: checks run, nothing moves
+  fresh; before="$(g rev-parse main)"; commit a 1; land_in feat --dry-run
+  [[ $rc == 0 && "$out" == *"would fast-forward"* && "$(g rev-parse main)" == "$before" && "$(git -C "$T/bare.git" rev-parse main)" == "$before" ]] || bad+=("dry-run: rc=$rc $out")
+  # dry run still fails on a failing commit
+  fresh; touch "$R/FAIL"; g add FAIL; g commit -q -m breaks; land_in feat --dry-run
+  [[ $rc != 0 && "$out" == *"checks failed"* ]] || bad+=("dry-run-fail: rc=$rc $out")
+  # no checks defined
+  fresh; g rm -q .land-checks; g commit -q -m nochecks; land_in feat
+  [[ $rc != 0 && "$out" == *"no checks defined"* ]] || bad+=("nochecks: rc=$rc $out")
+  # the temporary worktrees are cleaned up
+  [[ "$(g worktree list | wc -l)" == 1 ]] || bad+=("temporary worktrees left behind")
+  if ((${#bad[@]})); then printf 'land self-test: FAILED: %s\n' "$(IFS=';'; echo "${bad[*]}")"; return 1; fi
+  echo "land self-test: ok"
+}
+
+BRANCH="" DRY=0 NOCHK=0
+while (($#)); do
+  case "$1" in
+    --self-test) self_test; exit $? ;;
+    --dry-run) DRY=1 ;;
+    --no-checks) NOCHK=1 ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag $1" ;;
+    *) [[ -z "$BRANCH" ]] || die "one branch only"; BRANCH="$1" ;;
+  esac
+  shift
+done
+[[ -n "$BRANCH" ]] || usage
+land "$BRANCH" "$DRY" "$NOCHK"

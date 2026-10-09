@@ -1,0 +1,19 @@
+{
+  "name": "dev-team",
+  "purpose": "Take a Ready card to a merged PR",
+  "room": "project",
+  "head": { "role": "room-lead", "model": "sonnet" },
+  "desks": [
+    { "name": "implementer", "model": "sonnet", "max": 2 },
+    { "name": "reviewer", "model": "opus", "max": 1, "readOnly": true }
+  ],
+  "entry": ["a Ready card: goal, scope, done-when", "the target repo, and the room's worktree in it", "the stack order, if there is more than one PR"],
+  "phases": ["work", "draft-pr", "watch"],
+  "output": "merged-pr",
+  "done": { "check": "pr-merged" },
+  "worktree": true,
+  "draftPr": true,
+  "land": false,
+  "caps": { "softUsdPerDay": 15, "hardUsdPerDay": 40 },
+  "measures": ["cost", "no-go", "rework", "review-rounds"]
+}

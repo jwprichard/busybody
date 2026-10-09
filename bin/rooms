@@ -1,0 +1,766 @@
+#!/usr/bin/python3 -I
+"""State of the office: one JSON document merging every project room.
+
+  bin/rooms --json       print the document (no model calls)
+  bin/rooms --json --fresh  the same, skipping the 60 s document cache and the minutes client's 10 s reuse (after an answer or a command)
+  bin/rooms --leftovers  session-start check: live room-*/role-* sessions no open issue accounts for, each with the command that ends it
+  bin/rooms --self-test  check the merge against fixtures/rooms/
+
+Minutes: line 1 `**TYPE** · who · where` then a one-line summary (old `TYPE:` prefixes still read).
+Types: PROGRESS DECISION BLOCKED DONE ANSWER WAITING NOTE RECORD. An ANSWER whose "who" is not the
+controller or the office is flagged (`flags`, per room `flagged`) and closes no DECISION.
+Per open `initiative` issue with a `## Room` block: the Room fields, the latest report comment, `state`
+(needs_input|capped|done|waiting|working|idle; waiting = last room minute is WAITING), the room lead's status from `claude agents --json`, spend from
+`bin/room-cost --json`, the `bin/status` line and whether the issue is labelled `capped`. Top level `minutes` = {stale, age_s}: whether
+the GitHub reads behind the document are stale (served from cache after a failure) and how old the last good one is.
+Each room also carries `team` (the Room block's `- team: <name>`, default dev-team), `phases` (from
+teams/<team>/team.json, [] when that file is missing or invalid) and `phase` (the last valid `Phase: <name>`
+line in the room's own PROGRESS/WAITING minutes, else the last phase while a watcher is alive, else the first
+phase when the room has posted at most its first minute, else null).
+Top level `decisions[]` = DECISIONs with no later ANSWER, from rooms and from role issues (those carry
+`role` and address the running role session, so an answer from the office nudges it).
+Pass issues (open, title `<role>: <task>`, label `refine` or `<role>-pass`) put their own DECISIONs on the list,
+addressed to `role-<role>-<slug of task>`; the role issue still feeds it for older passes.
+Top level `role_sessions[]` = running `role-<role>-*` sessions, shaped like a room's `lead` (the room lead's status).
+Top level `roles[]` = every standing role from `bin/role status --json` (reshaped, no model calls);
+`roles_error` says why it is empty when `bin/role` failed. Never breaks the rest of the document.
+"""
+import json, os, re, subprocess, sys
+from datetime import datetime, timezone
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+import officeconfig  # noqa: E402
+import minutes  # noqa: E402
+import prcache  # noqa: E402
+import ghusage  # noqa: E402
+import sessions  # noqa: E402
+from tracker import Tracker  # noqa: E402
+OFFICE = officeconfig.load_or_exit(WORKSPACE_ROOT, "rooms")
+REPO = OFFICE.minutes_repo
+TYPES = "PROGRESS|DECISION|BLOCKED|DONE|ANSWER|WAITING|NOTE|RECORD"
+VERBS = tuple(TYPES.split("|"))
+# New minute: first line `**TYPE** · who · where`, then a one-line summary. Old: `TYPE:` / `TYPE (…):` prefix.
+HEADER_RE = re.compile(rf"^\s*\*\*({TYPES})\*\*\s*·\s*([^·\n]*?)\s*(?:·\s*(.*?))?\s*$", re.I)
+VERB_RE = re.compile(rf"^\s*({TYPES})\b[^:\n]*:", re.I)
+ANSWER_WRITERS = ("controller", "office")
+# Rooms' reply types: a controller NOTE/RECORD/ANSWER is not the room speaking.
+CONTROL_TYPES = ("NOTE", "RECORD", "ANSWER")
+
+
+def run(cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def parse_room(body):
+    """Fields of the `## Room` block as a dict; None if the issue has no such block."""
+    m = re.search(r"^## Room\s*\n(.*?)(?=^## |\Z)", body or "", re.S | re.M)
+    if not m:
+        return None
+    room = {}
+    for line in m.group(1).splitlines():
+        kv = re.match(r"^\s*[-*]\s*([\w-]+):\s*(.*?)\s*$", line)
+        if kv:
+            room[kv.group(1).replace("-", "_")] = kv.group(2)
+    return room if room.get("room") else None
+
+
+def parse_minute(body):
+    """{type, who, where, summary, format, flags} for a minute comment; None for chatter.
+    New format reads only the header line; old formats (`TYPE:`, `ANSWER (from the user):`) still parse."""
+    lines = [l.strip() for l in (body or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    m = HEADER_RE.match(lines[0])
+    if m:
+        typ, who, where = m.group(1).upper(), m.group(2).strip(), (m.group(3) or "").strip()
+        flags = []
+        if typ == "ANSWER" and who.lower() not in ANSWER_WRITERS:
+            flags.append("answer not from the controller or the office")
+        return {"type": typ, "who": who, "where": where, "summary": lines[1] if len(lines) > 1 else "",
+                "format": "header", "flags": flags}
+    m = VERB_RE.match(body or "")
+    if m:
+        return {"type": m.group(1).upper(), "who": "", "where": "", "summary": lines[0],
+                "format": "legacy", "flags": []}
+    return None
+
+
+def classify(body):
+    p = parse_minute(body)
+    return p["type"] if p else None
+
+
+def first_line(body):
+    """What the sticky note and the office show: the summary of a new-format minute, else line 1."""
+    p = parse_minute(body)
+    if p and p["format"] == "header" and p["summary"]:
+        return p["summary"]
+    for line in (body or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def report(c, now):
+    p = parse_minute(c.get("body")) or {}
+    verb = p.get("type")
+    ts = c.get("createdAt") or c.get("created_at") or ""
+    return {
+        "verb": verb,
+        "who": p.get("who", ""),
+        "where": p.get("where", ""),
+        "flags": p.get("flags", []),
+        "first_line": first_line(c.get("body")),
+        "url": c.get("url", ""),
+        "at": ts,
+        "age_s": max(0, int((now - parse_ts(ts)).total_seconds())) if ts else None,
+        "body": c.get("body", ""),
+    }
+
+
+def lead_status(agent):
+    if not agent:
+        return "missing"
+    # `claude agents`: `state` is the job's lifecycle (a live background job stays "working"),
+    # `status` is turn activity (busy/idle). Trust `status` for busy vs idle when it's present.
+    state = str(agent.get("state", "")).lower()
+    status = str(agent.get("status", "")).lower()
+    blob = f"{state} {status}"
+    if any(w in blob for w in ("block", "wait", "input", "needs")):
+        return "needs_input"
+    activity = status or state
+    if any(w in activity for w in ("busy", "working", "running")):
+        return "busy"
+    return "idle"
+
+
+def status_lines(text):
+    """issue number -> the bin/status block for it (header + step lines)."""
+    out, cur = {}, None
+    for line in (text or "").splitlines():
+        m = re.match(r"^▸ #(\d+)\b", line)
+        if m:
+            cur = int(m.group(1))
+            out[cur] = [line[2:]]
+        elif cur and line.startswith("  "):
+            out[cur].append(line.strip())
+        else:
+            cur = None
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+DECISION_RECORD_RE = re.compile(r"^\s*DECISION\s*\(", re.I)
+
+
+def open_decisions(comments, now):
+    """DECISION comments with no later ANSWER comment. An attributed `DECISION (user|MAD|…):`
+    (old) or a `RECORD` records a decision already made, so it is not a sticky note for the owner.
+    An ANSWER from anyone but the controller or the office is flagged and does not close anything."""
+    pending = []
+    for c in comments:
+        p = parse_minute(c.get("body")) or {}
+        v = p.get("type")
+        if v == "DECISION" and not DECISION_RECORD_RE.match(c.get("body") or ""):
+            pending.append(c)
+        elif v == "ANSWER" and not p["flags"]:
+            pending = []
+    return [report(c, now) for c in pending]
+
+
+def flagged_answers(comments, now):
+    return [report(c, now) for c in comments if (parse_minute(c.get("body")) or {}).get("flags")]
+
+
+def room_state(lead, capped, comments):
+    """The room's state for the office: needs_input, capped, done, waiting, working or idle.
+    waiting = the room's own latest minute is WAITING (controller NOTE/RECORD/ANSWER don't count)
+    and the lead is not mid-turn."""
+    own = [c for c in comments if classify(c.get("body")) not in (None,) + CONTROL_TYPES]
+    last = classify(own[-1].get("body")) if own else None
+    if lead == "needs_input":
+        return "needs_input"
+    if capped:
+        return "capped"
+    if last == "DONE":
+        return "done"
+    if last == "WAITING" and lead != "busy":
+        return "waiting"
+    return "working" if lead == "busy" else "idle"
+
+
+DEFAULT_TEAM = "dev-team"
+# A role pass runs a recipe of its own, whatever the issue says.
+ROLE_TEAMS = {"analyst": "refine"}
+PHASE_RE = re.compile(r"^\s*Phase:\s*([\w.-]+)\s*$", re.I | re.M)
+ROOM_MINUTES = ("PROGRESS", "WAITING")
+
+
+def load_phases(team):
+    """The recipe's `phases` from teams/<team>/team.json: a list of names, or None when the file is
+    missing, invalid or has no usable list (the recipe name still shows; the phase is unknown)."""
+    if not re.fullmatch(r"[\w.-]+", team or ""):
+        return None
+    try:
+        doc = json.load(open(os.path.join(WORKSPACE_ROOT, "teams", team, "team.json")))
+    except (OSError, ValueError):
+        return None
+    phases = doc.get("phases") if isinstance(doc, dict) else None
+    if not isinstance(phases, list) or not phases or not all(isinstance(p, str) and p for p in phases):
+        return None
+    return phases
+
+
+def watcher_alive(worktree):
+    """True when `<worktree>/.claude/watch.json` names a running pid (read-only probe)."""
+    if not worktree:
+        return False
+    try:
+        pid = int(json.load(open(os.path.join(worktree, ".claude", "watch.json"))).get("pid"))
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def room_team(team, comments, watching, phases_of=load_phases):
+    """{team, phase, phases} for a room. Phase = the last valid `Phase: <name>` line (name in the
+    recipe's phases) in the body of the room's own PROGRESS/WAITING minutes, else inferred: watching
+    means the last phase, no minutes beyond lead-online means the first. None when unknown."""
+    phases = phases_of(team)
+    phase = None
+    if phases:
+        own = [c for c in comments if classify(c.get("body")) not in (None,) + CONTROL_TYPES]
+        for c in own:
+            if classify(c.get("body")) not in ROOM_MINUTES:
+                continue
+            for name in PHASE_RE.findall(c.get("body") or ""):
+                if name in phases:
+                    phase = name
+        if phase is None:
+            if watching:
+                phase = phases[-1]
+            elif len(own) <= 1:
+                phase = phases[0]
+    return {"team": team, "phase": phase, "phases": phases or []}
+
+
+def role_entry(r):
+    """One `bin/role status --json` role, reshaped for the office."""
+    cost = r.get("cost") or {}
+    con = cost.get("contractors") or {}
+    mem = r.get("memory") or {}
+    pil = r.get("pilot") or None
+    pending = r.get("pending") or []
+    return {
+        "name": r.get("name", ""),
+        "status": r.get("status", "probation"),
+        "enabled": bool(r.get("enabled")),
+        "goal": r.get("goal") or "",
+        "issue": r.get("issue"),
+        "use_count": r.get("use_count", 0),
+        "pilot": {"uses": pil.get("uses", 0), "weeks": pil.get("weeks", 0), "days": pil.get("days", 0)} if pil else None,
+        "last_use": r.get("last_use"),
+        "memory": {
+            "index_bytes": mem.get("index_bytes", 0), "total_bytes": mem.get("total_bytes", 0),
+            "cap_index": mem.get("cap_index", 0), "cap_role": mem.get("cap_role", 0),
+            "stale_lines": mem.get("stale_lines", 0), "dated_lines": mem.get("dated_lines", 0),
+        },
+        "cost": {
+            "month": cost.get("month", 0.0), "budget": r.get("budget_usd_month"),
+            "contractors_month": con.get("month", 0.0), "contractors_budget": r.get("contractor_budget_usd_month"),
+            "last_activity": cost.get("last_activity") or "",
+        },
+        "drafts": r.get("drafts") or {"approved": 0, "unedited": 0},
+        "ratings": r.get("ratings") or {},
+        "flags": r.get("flags") or [],
+        "pending_files": len(pending),
+        "memory_pending": bool(pending),
+        "disabled_reason": r.get("disabled_reason"),
+    }
+
+
+def workspace_doc():
+    """What the office band needs from office.json: the workspace's name, minutes repo, repos (name and GitHub slug) and tracker."""
+    t = Tracker(OFFICE.tracker)
+    return {"name": OFFICE.display_name, "minutes_repo": REPO, "workspace_repo": OFFICE.workspace_repo,
+            "repos": [{"name": r, "github": OFFICE.github(r)} for r in OFFICE.repos],
+            "tracker": {"type": t.type, "name": t.name, "card_url_regex": t.card_re.pattern if t.card_re else None}}
+
+
+def build_roles(role_doc):
+    return [role_entry(r) for r in (role_doc or {}).get("roles", []) if r.get("name")]
+
+
+def active_session(agents, role):
+    """The role's running session (`role-<role>-*`, not finished), newest first, or None."""
+    live = [a for a in agents if (a.get("name") or "").startswith(f"role-{role}-")
+            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
+    return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
+
+
+def pass_slug(task):
+    """The slug bin/role run puts in the session name (`role-<role>-<slug>`)."""
+    return re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:30].strip("-") or "pass"
+
+
+def pass_session(agents, role, task):
+    """A pass issue's running session: `role-<role>-<slug>[-n]` from its title, not finished, or None."""
+    slug = f"role-{role}-{pass_slug(task)}"
+    live = [a for a in agents if re.fullmatch(re.escape(slug) + r"(-\d+)?", a.get("name") or "")
+            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
+    return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
+
+
+def role_inbox(role_issues, agents, now, pass_issues=None):
+    """(role_sessions[], decisions[]): the sticky notes role sessions have put to the owner, each addressed
+    to the running session by name so the office can nudge it; the session entry has the same `lead`
+    shape as a room, which is what the nudge reads. Notes come from the pass's own issue (open, titled
+    `<role>: <task>`, labelled `refine` or `<role>-pass`) and from the role issue (older passes)."""
+    sessions, decisions, seen = [], [], set()
+
+    def add_session(ag, role, number, comments=()):
+        if ag["name"] not in seen:
+            seen.add(ag["name"])
+            sessions.append({"name": ag["name"], "role": role, "issue": number,
+                             "lead": {"status": lead_status(ag), "agent": ag},
+                             **room_team(ROLE_TEAMS.get(role, role), comments, False)})
+
+    for iss in sorted(pass_issues or [], key=lambda i: i.get("number", 0)):
+        title = iss.get("title", "")
+        role, _, task = title.partition(": ")
+        labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
+        if not task or role not in (role_issues or {}) or not ({"refine", f"{role}-pass"} & set(labels)):
+            continue
+        ag = pass_session(agents, role, task)
+        name = ag["name"] if ag else f"role-{role}-{pass_slug(task)}"
+        if ag:
+            add_session(ag, role, iss["number"], iss.get("comments", []))
+        for d in open_decisions(iss.get("comments", []), now):
+            d.update({"room": name, "issue": iss["number"], "repo": OFFICE.workspace_repo, "role": role})
+            decisions.append(d)
+    for role, iss in sorted((role_issues or {}).items()):
+        ag = active_session(agents, role)
+        name = ag["name"] if ag else f"role-{role}"
+        if ag:
+            add_session(ag, role, iss["number"])
+        for d in open_decisions(iss.get("comments", []), now):
+            d.update({"room": name, "issue": iss["number"], "repo": OFFICE.workspace_repo, "role": role})
+            decisions.append(d)
+    return sessions, decisions
+
+
+def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=None, role_issues=None, pass_issues=None,
+          watching=watcher_alive, phases_of=load_phases):
+    by_name = {a.get("name"): a for a in agents}
+    sl = status_lines(status_text)
+    caps = costs.get("caps", {"soft": 15.0, "hard": 40.0})
+    rooms, decisions = [], []
+    for iss in issues:
+        room = parse_room(iss.get("body"))
+        if not room:
+            continue
+        name = room["room"]
+        labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
+        comments = iss.get("comments", [])
+        reports = [c for c in comments if classify(c.get("body"))]
+        spend = costs.get("rooms", {}).get(name) or {"today": 0.0, "total": 0.0, "mix": {}}
+        today = spend.get("today", 0.0)
+        pend = open_decisions(comments, now)
+        status = lead_status(by_name.get(name))
+        entry = {
+            "name": name,
+            "issue": iss["number"],
+            "title": iss.get("title", ""),
+            "url": iss.get("url", ""),
+            "repo": room.get("repo", ""),
+            "room": room,
+            "latest": report(reports[-1], now) if reports else None,
+            "lead": {"status": status, "agent": by_name.get(name)},
+            "cost": {
+                "today": today, "total": spend.get("total", 0.0), "mix": spend.get("mix", {}),
+                "soft_pct": round(100 * today / caps["soft"], 1),
+                "hard_pct": round(100 * today / caps["hard"], 1),
+                "caps": caps,
+            },
+            "status_line": sl.get(iss["number"], ""),
+            "capped": "capped" in labels,
+            "open_decisions": len(pend),
+            "state": room_state(status, "capped" in labels, comments),
+            "flags": [f for c in flagged_answers(comments, now) for f in c["flags"]],
+            "flagged": flagged_answers(comments, now),
+            **room_team(room.get("team") or DEFAULT_TEAM, comments, watching(room.get("worktree", "")), phases_of),
+        }
+        rooms.append(entry)
+        for d in pend:
+            d.update({"room": name, "issue": iss["number"], "repo": room.get("repo", "")})
+            decisions.append(d)
+    roles = build_roles(role_doc)
+    role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues)
+    decisions += role_decisions
+    return {
+        "generated_at": now.isoformat(),
+        "rooms": rooms,
+        "decisions": decisions,
+        "roles": roles,
+        "role_sessions": role_sessions,
+        "roles_error": roles_error,
+        "workspace": workspace_doc(),
+        "totals": {
+            "rooms": len(rooms),
+            "decisions": len(decisions),
+            "today": round(sum(r["cost"]["today"] for r in rooms), 4),
+            "roles": sum(1 for r in roles if r["enabled"]),
+            "memory_reviews": sum(1 for r in roles if r["memory_pending"]),
+        },
+    }
+
+
+def load_roles():
+    """(bin/role status --json document, None) or (None, why it failed). Never raises."""
+    try:
+        r = subprocess.run([os.path.join(ENGINE_ROOT, "bin", "role"), "status", "--json"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"bin/role did not run ({type(e).__name__})"
+    if r.returncode != 0:
+        why = next((l.strip() for l in r.stderr.splitlines() if l.strip()), f"exit {r.returncode}")
+        return None, f"bin/role status failed: {why[:160]}"
+    try:
+        doc = json.loads(r.stdout)
+        if not isinstance(doc, dict):
+            raise ValueError("not an object")
+        return doc, None
+    except ValueError:
+        return None, "bin/role status printed no JSON"
+
+
+def live(now, fresh=False):
+    agents = json.loads(run(["claude", "agents", "--json"]) or "[]")
+    costs = json.loads(run([os.path.join(ENGINE_ROOT, "bin", "room-cost"), "--all", "--json"]) or "{}")
+    status_text = run([os.path.join(ENGINE_ROOT, "bin", "status")])
+    role_doc, roles_error = load_roles()
+    # Every issue read goes through the minutes client: conditional REST calls into a shared cache, stale on failure.
+    role_nums = {r["name"]: r["issue"] for r in (role_doc or {}).get("roles", []) if r.get("issue") and r.get("enabled")}
+    pass_labels = sorted({"refine"} | {f"{name}-pass" for name in role_nums}) if role_nums else []
+    mc = minutes.Minutes(REPO, CACHE_DIR)
+    mc.sync(labels=["initiative"] + pass_labels, issues=list(role_nums.values()), force=fresh)
+    issues = mc.issues("initiative")
+    role_issues = {name: d for name, n in role_nums.items() for d in [mc.issue(n)] if d}
+    pass_issues = []
+    for label in pass_labels:
+        pass_issues += mc.issues(label, ("number", "title", "labels", "url", "comments"))
+    pass_issues = list({i["number"]: i for i in pass_issues}.values())
+    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues)
+    attach_prs(doc)
+    # Live room and role sessions, whatever their issue says: `--leftovers` lists the ones whose issue is no longer open
+    # Whatever the state says, a session counts when its pid is alive (done and stopped sessions with live pids are the leftovers) and
+    # its cwd is under this workspace's data root.
+    root = data_root(WORKSPACE_ROOT)
+    doc["live_sessions"] = [{"name": a.get("name"), "pid": a.get("pid"), "state": a.get("state"), "cwd": a.get("cwd"), "started_ms": a.get("startedAt")}
+                            for a in agents if re.match(r"^(room|role)-", a.get("name") or "") and isinstance(a.get("pid"), int)
+                            and sessions.alive(a["pid"]) and (a.get("cwd") or "") .startswith(root.rstrip("/") + "/")]
+    # Additive: how fresh the GitHub reads behind this document are. No existing field changes.
+    doc["minutes"] = {"stale": mc.stale, "age_s": mc.age()}
+    # The hour's GraphQL use, estimated from the gh usage log when the logging shim is installed (no gh call): the band warns at 70%.
+    import time
+    points = ghusage.hour_graphql_points(CACHE_DIR, time.time())
+    doc["gh_usage"] = {"hour_points_est": points, "limit": ghusage.LIMIT} if os.path.isdir(ghusage.log_dir(CACHE_DIR)) else None
+    return doc
+
+
+PR_BUDGET_S = 10   # total seconds of PR lookups per document build
+
+
+def attach_prs(doc):
+    """Each room's PR (`pr`, `pr_checked_at`), from the shared PR cache: at most one gh call per branch per ten minutes, and none for a
+    repo with no GitHub remote. The band reads this instead of asking GitHub itself."""
+    import time
+    root = data_root(WORKSPACE_ROOT)
+    deadline = time.time() + PR_BUDGET_S   # the build holds rooms.lock: past the budget, rooms are served from the cache, marked stale
+    for r in doc["rooms"]:
+        info = r.get("room") or {}
+        repo, branch = info.get("repo"), info.get("branch")
+        r["pr"], r["pr_checked_at"], r["pr_stale"] = None, None, False
+        if not repo or not branch:
+            continue
+        repo_dir = root if OFFICE.is_workspace(repo) else os.path.join(root, repo)
+        r["pr"], r["pr_checked_at"], r["pr_stale"] = prcache.lookup(repo_dir, OFFICE.github(repo), branch, CACHE_DIR, deadline=deadline)
+
+
+def empty_document(why):
+    """A valid document with no rooms, for when nothing can be built and nothing is cached."""
+    doc = build([], [], {}, "", datetime.now(timezone.utc), None, why)
+    doc["minutes"] = {"stale": True, "age_s": None, "error": why}
+    return json.dumps(doc, indent=1)
+
+
+CACHE_DIR = os.path.join(data_root(WORKSPACE_ROOT), ".cache")   # one cache per workspace, shared by its worktrees
+DOC_TTL = 60
+
+
+def cached_document(compute, cache_dir=None, now=None, ttl=DOC_TTL, wait=30, empty=None):
+    """The `--json` document text, shared by every caller for `ttl` seconds: one computes (single-flight, flock), the rest read
+    its result. When computing fails the last document is served instead; with none yet, `empty(why)` gives a valid empty one
+    (a caller that passes no `empty` gets the exception)."""
+    import fcntl, time
+    now = now or time.time
+    cache_dir = cache_dir or CACHE_DIR
+    path = os.path.join(cache_dir, "rooms.json")
+
+    def read():
+        try:
+            d = json.load(open(path))
+            return d["at"], d["text"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None, None
+    at, text = read()
+    if at is not None and now() - at < ttl:
+        return text
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(os.path.join(cache_dir, "rooms.lock"), "w") as lk:
+        deadline = time.time() + wait
+        while True:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    if text is not None:
+                        return text
+                    if empty:
+                        return empty("another process is still building the first document")
+                    raise
+                time.sleep(0.2)
+        at, text = read()   # the holder we waited for may have just written it
+        if at is not None and now() - at < ttl:
+            return text
+        try:
+            fresh = compute()
+        except Exception as e:
+            print(f"rooms: could not build the document ({type(e).__name__}: {str(e)[:150]}); serving the last one", file=sys.stderr)
+            if text is None:
+                if empty:
+                    return empty(f"could not build the first document: {type(e).__name__}")
+                raise
+            return text
+        tmp = path + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"at": now(), "text": fresh}, f)
+        os.replace(tmp, path)
+        return fresh
+
+
+def self_test():
+    d = os.path.join(ENGINE_ROOT, "fixtures", "rooms")
+    load = lambda n: json.load(open(os.path.join(d, n)))
+    now = parse_ts("2026-10-06T03:00:00Z")
+    status_text = open(os.path.join(d, "status.txt")).read()
+    got = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, load("roles.json"),
+                None, load("role-issues.json"), load("pass-issues.json"))
+    none = build([], [], {}, "", now, None, "bin/role status failed: boom")
+    by = {r["name"]: r for r in got["rooms"]}
+    alpha, beta = by.get("room-alpha"), by.get("room-beta")
+    gamma, delta = by.get("room-gamma"), by.get("room-delta")
+    roles = {r["name"]: r for r in got["roles"]}
+    PH = {"dev-team": ["plan", "build", "review"], "t": ["plan", "build", "review"], "mad": ["plan", "build", "review"]}
+    prog = lambda body: {"body": f"**PROGRESS** · r · #1\n{body}"}
+    rt = lambda team, comments, watching, ph: room_team(team, comments, watching, lambda t: ph.get(t))
+    checks = [
+        ("five rooms, none for the issue without a Room block", sorted(by) == ["room-alpha", "room-beta", "room-delta", "room-epsilon", "room-gamma"]),
+        ("leftovers: live sessions with no open issue, old enough, on a conclusive read",
+         leftovers({"rooms": [{"name": "room-a"}], "role_sessions": [{"name": "role-x-y"}], "minutes": {"stale": False},
+                    "live_sessions": [{"name": "room-a", "state": "working", "started_ms": 0}, {"name": "room-old", "state": "done", "started_ms": 0},
+                                      {"name": "role-x-y", "started_ms": 0}, {"name": "role-gone-z", "state": "working", "started_ms": 0},
+                                      {"name": "room-new", "state": "working", "started_ms": 10_000_000}]}, now_ms=10_100_000)
+         == [("room-old", "done"), ("role-gone-z", "working")]),
+        ("leftovers: nothing on a stale read", leftovers({"minutes": {"stale": True}, "live_sessions": [{"name": "room-old", "started_ms": 0}]}, now_ms=9e12) == []),
+        ("workspace block from office.json", got["workspace"] == {"name": "Acme", "minutes_repo": "acme-co/acme-office", "workspace_repo": "acme-office",
+         "repos": [{"name": n, "github": g} for n, g in (("acme-office", "acme-co/acme-office"), ("acme-web", "acme-co/web-app"), ("acme-api", "acme-co/acme-api"), ("acme-bot", "acme-co/acme-bot"))],
+         "tracker": {"type": "none", "name": "None", "card_url_regex": None}}),
+        ("room fields parsed", alpha and alpha["repo"] == "acme-web" and alpha["room"]["prod_read"] == "no"),
+        ("latest report skips chatter", alpha and alpha["latest"]["verb"] == "DECISION" and alpha["latest"]["age_s"] == 1800),
+        ("lead busy / missing", alpha and alpha["lead"]["status"] == "busy" and beta["lead"]["status"] == "missing"),
+        ("cost percentages", alpha and alpha["cost"]["soft_pct"] == 50.0 and alpha["cost"]["hard_pct"] == 18.8),
+        ("capped from label", alpha and alpha["capped"] and not beta["capped"]),
+        ("status line attached", alpha and "step 1" in alpha["status_line"]),
+        ("an attributed DECISION (user…) is a record, not a question",
+         not any(d["first_line"].startswith("DECISION (") for d in got["decisions"])),
+        ("only the unanswered DECISION is open", [d["first_line"] for d in got["decisions"] if d["room"] == "room-alpha"] == ["DECISION: second question?"]),
+        ("role session questions join the sticky notes, addressed to the running session",
+         [(d["room"], d["issue"]) for d in got["decisions"] if d.get("role")]
+         == [("role-scribe-tidy-notes", 95), ("role-scribe-tidy-notes", 91)]),
+        ("a pass issue's question is addressed to its own running session, on the pass issue; a non-pass issue is ignored",
+         [(d["room"], d["issue"], d["role"]) for d in got["decisions"] if d.get("issue") == 95] == [("role-scribe-tidy-notes", 95, "scribe")]
+         and not any(d.get("issue") == 96 for d in got["decisions"])),
+        ("only a running role session is listed, with the room-shaped lead",
+         [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"]) for s in got["role_sessions"]]
+         == [("role-scribe-tidy-notes", "busy", "sess-scribe")]
+         and got["role_sessions"][0]["issue"] == 95 and none["role_sessions"] == []),
+        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1}),
+        ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
+         and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
+        ("role numbers", roles.get("scribe") and roles["scribe"]["memory"]["index_bytes"] == 2048
+         and roles["scribe"]["cost"]["budget"] == 15.0 and roles["scribe"]["cost"]["contractors_budget"] == 20.0
+         and roles["scribe"]["pilot"] == {"uses": 6, "weeks": 3, "days": 4} and roles["scribe"]["drafts"]["approved"] == 2),
+        ("pending memory diff", roles["scribe"]["memory_pending"] and roles["scribe"]["pending_files"] == 2
+         and not roles["auditor"]["memory_pending"] and roles["auditor"]["pilot"] is None),
+        ("flags and disabled reason carried", roles["auditor"]["flags"] == ["unused 40 days"]
+         and roles["retired"]["disabled_reason"] == "not worth it" and not roles["retired"]["enabled"]),
+        ("bin/role failure leaves the rooms and notes the error", none["roles"] == [] and none["roles_error"] == "bin/role status failed: boom"
+         and none["totals"]["roles"] == 0 and none["totals"]["memory_reviews"] == 0 and got["roles_error"] is None),
+        ("new-format header parsed: type, who, where, summary", (lambda p: p["type"] == "WAITING" and p["who"] == "room-gamma"
+         and p["where"] == "#12" and p["summary"] == "draft #5 is green" and p["flags"] == [])(
+         parse_minute("**WAITING** · room-gamma · #12\ndraft #5 is green\n\nbody"))),
+        ("old formats still classify", classify("DONE: shipped") == "DONE" and classify("ANSWER (from the user): \"x\"") == "ANSWER"
+         and parse_minute("ANSWER (from the user): \"x\"")["flags"] == [] and classify("chatter") is None),
+        ("every type reads in the new format", all(classify(f"**{t}** · a · b\nsum") == t for t in VERBS)),
+        ("new-format summary is what the office shows", gamma and gamma["latest"]["first_line"] == "draft #5 is green"
+         and gamma["latest"]["who"] == "room-gamma"),
+        ("WAITING is a room state, not while the lead is mid-turn", gamma and gamma["state"] == "waiting" and alpha["state"] == "capped"
+         and room_state("busy", False, [{"body": "**WAITING** · r · #1\nx"}]) == "working"
+         and room_state("idle", False, [{"body": "**WAITING** · r · #1\nx"}, {"body": "**NOTE** · controller · #1\ny"}]) == "waiting"),
+        ("new-format DECISION is a sticky note; RECORD is not; controller ANSWER closes it",
+         [d["first_line"] for d in got["decisions"] if d["room"] == "room-delta"] == ["which one?"]
+         and [d["first_line"] for d in got["decisions"] if d["room"] == "room-epsilon"] == []),
+        ("an ANSWER from anyone but controller or office is flagged and closes nothing",
+         delta and delta["flags"] == ["answer not from the controller or the office"] and delta["open_decisions"] == 1
+         and delta["flagged"][0]["who"] == "room-delta" and parse_minute("**ANSWER** · office · #1\nok")["flags"] == []
+         and parse_minute("**ANSWER** · controller · #1\nok")["flags"] == []),
+        ("needs_input mapping", lead_status({"state": "blocked"}) == "needs_input"),
+        ("the minute header reads as its type", classify("**ANSWER** · controller · re: x\nbody") == "ANSWER"
+         and classify("**RECORD** · controller · #1") == "RECORD" and classify("DONE: old style") == "DONE"),
+        ("a room's recipe defaults to dev-team; its phases come from team.json, a missing recipe file leaves them empty",
+         alpha and alpha["team"] == "dev-team" and rt("dev-team", [], False, PH)["phases"] == PH["dev-team"]
+         and rt("nope", [], False, PH) == {"team": "nope", "phase": None, "phases": []}
+         and load_phases("../etc") is None and load_phases("no-such-recipe") is None),
+        ("an explicit Phase line wins, the last valid one; an invalid phase name is ignored",
+         rt("t", [prog("Phase: build"), prog("x\nPhase: review")], True, PH)["phase"] == "review"
+         and rt("t", [prog("Phase: build"), prog("Phase: nonsense"), prog("y")], False, PH)["phase"] == "build"
+         and rt("t", [prog("up"), prog("Phase: nonsense")], False, PH)["phase"] is None
+         and rt("t", [{"body": "**DECISION** · r · #1\nPhase: review"}, prog("a"), prog("b")], False, PH)["phase"] is None),
+        ("phase is inferred: watching means the last phase, only lead-online means the first, else unknown",
+         rt("t", [prog("lead online"), prog("pr up")], True, PH)["phase"] == "review"
+         and rt("t", [prog("lead online")], False, PH)["phase"] == "plan"
+         and rt("t", [], False, PH)["phase"] == "plan"
+         and rt("t", [prog("a"), prog("b")], False, PH)["phase"] is None),
+        ("a team in the Room block is read, and watching comes from the worktree probe",
+         build([{"number": 1, "body": "## Room\n- room: room-z\n- repo: r\n- team: mad\n- worktree: /w\n",
+                 "comments": [prog("a"), prog("b")]}], [], {}, "", now, None, None, None, None,
+               watching=lambda w: w == "/w", phases_of=lambda t: PH.get(t))["rooms"][0]["phase"] == "review"
+         and not watcher_alive("") and not watcher_alive("/no/such/dir")),
+        ("a role pass shows the role's recipe", ROLE_TEAMS["analyst"] == "refine"
+         and got["role_sessions"][0]["team"] == "scribe" and got["role_sessions"][0]["phase"] is None),
+        ("a live job between turns is idle", lead_status({"state": "working", "status": "idle"}) == "idle"),
+    ]
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    clock, calls = [1000.0], []
+
+    def compute():
+        calls.append(1)
+        if len(calls) == 3:
+            raise RuntimeError("boom")
+        return f"doc{len(calls)}"
+    first = cached_document(compute, tmp, lambda: clock[0])
+    clock[0] += 59
+    second = cached_document(compute, tmp, lambda: clock[0])
+    clock[0] += 2
+    third = cached_document(compute, tmp, lambda: clock[0])
+    clock[0] += 61
+    fourth = cached_document(compute, tmp, lambda: clock[0])    # compute raises: the last document is served
+    # live() adds minutes.stale and age as new top-level fields and leaves every other field as build() made it
+    class FakeMinutes:
+        stale, synced = True, []
+        def __init__(self, repo, cache_dir): pass
+        def sync(self, labels=(), issues=(), force=False): FakeMinutes.synced.append(force)
+        def issues(self, label, keys=()): return []
+        def issue(self, n, keys=()): return None
+        def age(self): return 42
+    g = globals()
+    saved = {k: g[k] for k in ("run", "load_roles", "minutes")}
+    try:
+        g["run"], g["load_roles"] = (lambda cmd, timeout=60: ""), (lambda: (None, None))
+        g["minutes"] = type("M", (), {"Minutes": FakeMinutes})
+        doc_live = live(now, fresh=True)
+        doc_base = build([], [], {}, "", now, None, None, {}, [])
+    finally:
+        g.update(saved)
+    checks.append(("live() adds minutes.stale/age_s and force follows --fresh, nothing else changes",
+                   doc_live.pop("minutes") == {"stale": True, "age_s": 42} and doc_live.pop("gh_usage", 0) != 0 and doc_live.pop("live_sessions", 0) != 0 and doc_live == doc_base and FakeMinutes.synced == [True]))
+    ttl0 = cached_document(lambda: "doc-fresh", tmp, lambda: clock[0], ttl=0)
+    nocache = tempfile.mkdtemp()
+    boom = lambda: (_ for _ in ()).throw(RuntimeError("x"))
+    emp = json.loads(cached_document(boom, nocache, lambda: clock[0], empty=empty_document))
+    full_none = build([], [], {}, "", now, None, "x")
+    checks += [("--fresh (ttl 0) bypasses the document cache", ttl0 == "doc-fresh"),
+               ("no cache and a failing build: an empty valid document flagged stale, no traceback",
+                emp["rooms"] == [] and emp["minutes"]["stale"] is True and set(emp) - {"minutes"} == set(full_none)),
+               ("the document is cached for 60s and shared", (first, second, third, len(calls[:3])) == ("doc1", "doc1", "doc2", 3)),
+               ("a failing build serves the last document", fourth == "doc2"),
+               ("the minutes client self-test passes",
+                subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "minutes.py"), "--self-test"]).returncode == 0)]
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    bad = [n for n, c in checks if not c]
+    print("rooms self-test:", "ok" if not bad else "FAILED: " + "; ".join(bad))
+    sys.exit(1 if bad else 0)
+
+
+def leftovers(doc, now_ms=None, min_age_s=300):
+    """Live room-*/role-* sessions (pid alive, under this workspace) that no open issue accounts for: [(name, state)]. Nothing when the
+    GitHub reads behind the document are stale or errored (not conclusive), and sessions launched under `min_age_s` ago are skipped
+    (their issue may not be in the cached document yet)."""
+    m = doc.get("minutes") or {}
+    if m.get("stale") or m.get("error") or doc.get("roles_error"):
+        return []
+    known = {r.get("name") for r in doc.get("rooms", [])} | {s.get("name") for s in doc.get("role_sessions", [])}
+    import time
+    now_ms = now_ms if now_ms is not None else time.time() * 1000
+    return [(s["name"], s.get("state")) for s in doc.get("live_sessions", [])
+            if s.get("name") and s["name"] not in known and now_ms - (s.get("started_ms") or 0) >= min_age_s * 1000]
+
+
+def leftovers_cmd():
+    """Session-start check, for the controller session only (never inside a room or role session): one line per leftover with the
+    exact command that ends it. Reads the cached document (no per-room gh calls). An error is one line on stderr, never silence."""
+    try:
+        agents = {a["pid"]: a.get("name") or "" for a in sessions.agents_list(5) if isinstance(a.get("pid"), int)}
+        if any(re.match(r"^(room|role)-", agents.get(p, "")) for p in sessions.ancestors()):
+            return 0
+        doc = json.loads(cached_document(lambda: json.dumps(live(datetime.now(timezone.utc), False), indent=1), empty=empty_document))
+        end = os.path.join(ENGINE_ROOT, "bin", "end-session")
+        for name, state in leftovers(doc):
+            print(f"{name} is still running ({state or 'unknown'}) but no open issue has it: end it with `{end} {name}`")
+    except Exception as e:
+        print(f"rooms --leftovers: {type(e).__name__}: {str(e)[:150]}", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        self_test()
+    if "--leftovers" in argv:
+        sys.exit(leftovers_cmd())
+    if "-h" in argv or "--help" in argv or "--json" not in argv:
+        print(__doc__)
+        sys.exit(0 if ("-h" in argv or "--help" in argv) else 2)
+    fresh = "--fresh" in argv   # skip the 60 s document cache and the client's 10 s reuse (after an answer or a command)
+    print(cached_document(lambda: json.dumps(live(datetime.now(timezone.utc), fresh), indent=1),
+                          ttl=0 if fresh else DOC_TTL, empty=empty_document))
+
+
+main(sys.argv[1:])

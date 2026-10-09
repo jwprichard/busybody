@@ -1,0 +1,20 @@
+{
+  "name": "mad",
+  "purpose": "Converge on one contested, costly-to-reverse decision",
+  "room": "project",
+  "head": { "role": "room-lead", "model": "sonnet" },
+  "desks": [
+    { "name": "skeptic", "model": "opus", "max": 1, "readOnly": true },
+    { "name": "fact-checker", "model": "sonnet", "max": 1, "readOnly": true },
+    { "name": "alternatives", "model": "sonnet", "max": 1, "readOnly": true }
+  ],
+  "entry": ["the question, stated as one decision", "the options on the table", "what is already decided", "what the answer changes"],
+  "phases": ["brief", "rounds", "verdict"],
+  "output": "verdict",
+  "done": { "check": "verdict-posted" },
+  "worktree": false,
+  "draftPr": false,
+  "land": false,
+  "caps": { "softUsdPerDay": 15, "hardUsdPerDay": 40 },
+  "measures": ["cost", "no-go", "vetoed-assumptions", "verdict-used"]
+}

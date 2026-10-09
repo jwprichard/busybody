@@ -1,0 +1,120 @@
+#!/usr/bin/python3 -I
+"""A logging shim for gh. Opt-in: the owner puts a `gh` symlink to this file in a directory ahead of the real gh on PATH
+(`busybody gh-usage --install-help` shows how). Nothing here edits PATH or a shell rc.
+
+Each call appends one JSON line to <workspace>/.cache/gh-usage/YYYY-MM-DD.jsonl: time, argv (values after body/field/input/header
+flags and token-looking arguments redacted; never output), graphql or rest, exit code, duration, whether GitHub answered 304 (best
+effort, from stderr), the caller (the Claude session or room name from `-n <name>` in the process tree, and the script that ran gh)
+and the cwd. Then the real gh's exit code is passed through; its stdin, stdout and stderr are untouched.
+Logging never fails a call. With no workspace (no office.json above the cwd, no $BUSYBODY_WORKSPACE) nothing is logged.
+$BUSYBODY_REAL_GH names the real gh (a test hook); otherwise it is the first `gh` on PATH that is not this file.
+"""
+import os, sys, threading, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+
+
+def real_gh():
+    forced = os.environ.get("BUSYBODY_REAL_GH")
+    if forced:
+        return forced
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d or ".", "gh")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and os.path.realpath(cand) != me:
+            return cand
+    sys.stderr.write("gh-wrapper: no real gh found on PATH\n")
+    sys.exit(127)
+
+
+def proc(pid):
+    """(ppid, argv) of a process, or (0, [])."""
+    try:
+        stat = open(f"/proc/{pid}/stat").read()
+        ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        argv = [a.decode(errors="replace") for a in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if a]
+        return ppid, argv
+    except (OSError, ValueError, IndexError):
+        return 0, []
+
+
+def callers(start_pid, pid_map=None):
+    """(session, script). The session is the nearest ancestor whose pid `claude agents --json` lists (a live background session is
+    `claude bg-spare --bg-spare <sock>`, with no -n), else the nearest `claude ... -n <name>` ancestor. The script is the nearest
+    ancestor that is a script run by an interpreter."""
+    pid_map = pid_map or {}
+    session = script = None
+    pid, hops = start_pid, 0
+    while pid > 1 and hops < 25:
+        ppid, argv = proc(pid)
+        if session is None and pid_map.get(pid):
+            session = pid_map[pid]
+        if argv:
+            base = os.path.basename(argv[0])
+            if script is None:
+                if base in ("bash", "sh", "env") or base.startswith("python"):
+                    for a in argv[1:4]:
+                        if not a.startswith("-") and os.path.isfile(a) and os.path.basename(a) != "gh":
+                            script = os.path.basename(a)
+                            break
+                elif os.path.isfile(argv[0]) and base not in ("gh", "claude", "node"):
+                    script = base   # an executable script run directly
+            if session is None and ("claude" in base or any(os.path.basename(a) == "claude" for a in argv[:2])):
+                for i, a in enumerate(argv):
+                    if a in ("-n", "--name") and i + 1 < len(argv):
+                        session = argv[i + 1]
+                        break
+        pid, hops = ppid, hops + 1
+    return session, script
+
+
+def main():
+    import subprocess
+    argv = sys.argv[1:]
+    real = real_gh()
+    t0 = time.time()
+    p = subprocess.Popen([real] + argv, stderr=subprocess.PIPE)
+    seen = []
+
+    def pump():
+        while True:
+            chunk = os.read(p.stderr.fileno(), 65536)
+            if not chunk:
+                break
+            os.write(2, chunk)
+            if len(seen) < 8:
+                seen.append(chunk)
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    try:
+        rc = p.wait()
+    except KeyboardInterrupt:
+        p.wait()
+        rc = 130
+    th.join(timeout=2)
+    if rc < 0:
+        rc = 128 - rc
+    try:
+        import ghusage
+        from officeroot import data_root, workspace_root
+        ws = workspace_root(os.path.dirname(HERE))
+        if os.path.isfile(os.path.join(ws, "office.json")):
+            kind = ghusage.classify(argv)
+            cache = os.path.join(data_root(ws), ".cache")
+            try:
+                import sessions
+                pid_map = sessions.agents_pid_map(cache, ttl=60, timeout=1.0)   # cached for a minute; never costs more than 1 s
+            except Exception:
+                pid_map = {}
+            session, script = callers(os.getppid(), pid_map)
+            ghusage.append(cache, {
+                "ts": round(t0, 3), "argv": ghusage.redact(argv), "kind": kind, "points": ghusage.est_points(argv, kind), "exit": rc,
+                "ms": int((time.time() - t0) * 1000), "not_modified": b"HTTP 304" in b"".join(seen),
+                "session": session, "script": script, "cwd": os.getcwd()})
+    except Exception:
+        pass   # logging never fails a call
+    sys.exit(rc)
+
+
+main()

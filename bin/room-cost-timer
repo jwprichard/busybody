@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Run `bin/room-cost --enforce` every 5 minutes: the hard-cap backstop for project rooms.
+#
+#   bin/room-cost-timer install|uninstall|status
+#
+# Uses a systemd user timer when systemd is PID 1 and reachable, else a user crontab entry.
+# Log: .cache/room-cost.log. If neither scheduler is running, nothing enforces the cap.
+
+set -euo pipefail
+
+ENGINE_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+. "$ENGINE_ROOT/bin/lib/officeroot.sh"
+WS="$DATA_ROOT"   # cwd and .cache: the workspace's data root, never a worktree of it; the room-cost script itself is the engine's
+COST_BIN=bin/room-cost; [[ "$ENGINE_ROOT" == "$WS" ]] || COST_BIN="$ENGINE_ROOT/bin/room-cost"
+LOG="$WS/.cache/room-cost.log"
+TAG="room-cost-timer"   # matched with grep -F, so a line written before the rename (`# <old name> room-cost-timer`) is still ours
+# Minimal PATH: WSL's inherited PATH (Windows dirs included) exceeds crontab's line limit.
+CRON_PATH="$(for c in claude gh git python3 bash; do d="$(dirname "$(command -v "$c" 2>/dev/null)")"; [[ -n "$d" && "$d" != . ]] && echo "$d"; done | awk '!seen[$0]++' | paste -sd: -):/usr/bin:/bin"
+CRON_LINE="*/5 * * * * cd $WS && BUSYBODY_WORKSPACE=$WS PATH=\"$CRON_PATH\" $COST_BIN --enforce >> $LOG 2>&1 # busybody $TAG"
+UNIT_DIR="$HOME/.config/systemd/user"
+
+have_systemd() { [[ "$(ps -p 1 -o comm= 2>/dev/null)" == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; }
+cron_running() { pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; }
+cron_has() { crontab -l 2>/dev/null | grep -qF "$TAG"; }
+
+case "${1:-status}" in
+  install)
+    mkdir -p "$WS/.cache"
+    if have_systemd; then
+      mkdir -p "$UNIT_DIR"
+      cat > "$UNIT_DIR/busybody-room-cost.service" <<EOF
+[Unit]
+Description=busybody room-cost hard-cap enforcement
+[Service]
+Type=oneshot
+WorkingDirectory=$WS
+Environment=PATH=$PATH
+Environment=BUSYBODY_WORKSPACE=$WS
+ExecStart=$ENGINE_ROOT/bin/room-cost --enforce
+StandardOutput=append:$LOG
+StandardError=append:$LOG
+EOF
+      cat > "$UNIT_DIR/busybody-room-cost.timer" <<EOF
+[Unit]
+Description=Run room-cost --enforce every 5 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now busybody-room-cost.timer
+      echo "installed systemd user timer busybody-room-cost.timer"
+    else
+      command -v crontab >/dev/null || { echo "no systemd and no crontab: cannot install" >&2; exit 1; }
+      { crontab -l 2>/dev/null | grep -vF "$TAG" || true; echo "$CRON_LINE"; } | crontab -
+      echo "installed crontab entry"
+      cron_running || echo "WARNING: the cron daemon is not running; start it (sudo service cron start) or nothing enforces the cap" >&2
+    fi ;;
+  uninstall)
+    if have_systemd && [[ -e "$UNIT_DIR/busybody-room-cost.timer" ]]; then
+      systemctl --user disable --now busybody-room-cost.timer || true
+      rm -f "$UNIT_DIR/busybody-room-cost.timer" "$UNIT_DIR/busybody-room-cost.service"
+      systemctl --user daemon-reload
+      echo "removed systemd user timer"
+    fi
+    if cron_has; then
+      crontab -l | grep -vF "$TAG" | crontab -
+      echo "removed crontab entry"
+    fi ;;
+  status)
+    echo "scheduler: $(have_systemd && echo 'systemd user manager reachable' || echo 'no systemd (PID 1 is '"$(ps -p 1 -o comm= 2>/dev/null)"')'); cron daemon: $(cron_running && echo running || echo NOT running)"
+    if have_systemd && systemctl --user is-enabled busybody-room-cost.timer >/dev/null 2>&1; then
+      echo "timer: INSTALLED (systemd)"; systemctl --user list-timers busybody-room-cost.timer --no-pager | head -3
+    elif cron_has; then
+      echo "timer: INSTALLED (cron)$(cron_running || echo ', but the cron daemon is NOT running, so nothing enforces the cap')"
+    else
+      echo "timer: NOT installed: nothing enforces the hard cap (run: bin/room-cost-timer install)"
+    fi
+    [[ -s "$LOG" ]] && { echo "last log lines ($LOG):"; tail -n 3 "$LOG"; } || echo "log: none yet ($LOG)" ;;
+  *) echo "usage: $0 install|uninstall|status" >&2; exit 1 ;;
+esac

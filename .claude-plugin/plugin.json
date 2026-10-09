@@ -1,0 +1,9 @@
+{
+  "name": "busybody",
+  "version": "0.1.0",
+  "description": "Busybody: the office engine. Control room, staff rooms, project rooms, controls, spend bars and a band above the prompt; the rooms, role, team, status and room-cost tools.",
+  "author": {
+    "name": "jwprichard"
+  },
+  "types": "./types/index.d.ts"
+}

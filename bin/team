@@ -1,0 +1,1168 @@
+#!/usr/bin/python3 -I
+"""Team recipes: validate, launch and resolve (docs/team-recipes.md is the spec).
+
+  bin/team check [name…]    validate teams/*/ (all by default); one line per recipe; non-zero on any failure
+  bin/team powers <recipe> [--land]
+                            the powers text for a launch brief, from the recipe's flags
+  bin/team brief <recipe> commit|prs|prlimit [--land]
+                            the recipe-dependent lines of the room lead's brief (@BRANCH@ stands for the room's branch)
+  bin/team start <recipe> <initiative|"task"> [--repo R] [--base REF] [--controller NAME] [--dry-run]
+                            open the room: a project room through the lead launcher, a staff room through the role launcher
+                            (initiative = N, #N or an issue URL of the workspace repo; anything else is a free-text task)
+                            TEAM_LEAD_START and TEAM_ROLE_RUN name the launchers (default: the real scripts), TEAM_GH the gh command
+  bin/team resolve <initiative> [--check NAME] [--room NAME] [--close]
+                            run the recipe's done check (or NAME) against the issue: PASS / FAIL with the evidence it found.
+                            --room NAME is needed for an issue with no Room block (a staff pass): only a DONE minute whose who is
+                            exactly that name counts, and an old-style `DONE:` never does. Exit 0 pass, 1 fail, 2 cannot decide. Never writes anything (no comment, label or close), except with --close:
+                            after a PASS it runs `claude stop <room>` and then ends the room's own process (the claude binary with `-n <room>`,
+                            SIGTERM, SIGKILL only if ignored; TEAM_CLAUDE names the claude command), which `claude stop` can miss.
+                            Checks: pr-merged verdict-posted ready-card report-posted landed card-has-design-link.
+                            TEAM_GH, TEAM_GIT and TEAM_TRACKER name the gh, git and tracker commands (TEAM_TRELLO is read too); TEAM_REPOS_DIR the clones' parent
+  bin/team --self-test      one fixture case per rule, in a temp dir (never the real teams/)
+
+A recipe is teams/<name>/SKILL.md (judgement) plus teams/<name>/team.json (what the harness enforces).
+"""
+import json, os, re, shlex, subprocess, sys, tempfile
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import invoked_root, workspace_root, bb_env, selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+import officeconfig  # noqa: E402
+from tracker import Tracker, TrackerError  # noqa: E402
+OFFICE = officeconfig.load_or_exit(WORKSPACE_ROOT, "team")
+TRACKER = Tracker(OFFICE.tracker)
+REPO = OFFICE.minutes_repo
+
+KEYS = ("name", "purpose", "room", "head", "desks", "entry", "phases", "output", "done",
+        "worktree", "draftPr", "land", "caps", "measures")
+MODELS = ("sonnet", "opus", "haiku")
+HEAD_MODELS = ("sonnet", "opus")
+OPTIONAL = ("designSystem", "canvas")
+ROOMS = ("project", "staff")
+OUTPUT_CHECK = {"verdict": "verdict-posted", "merged-pr": "pr-merged", "ready-card": "ready-card",
+                "report": "report-posted", "landed-branch": "landed",
+                "approved-design": "card-has-design-link"}
+DESK_KEYS = ("name", "model", "max", "readOnly", "phase")
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"team: {msg}\n")
+    sys.exit(code)
+
+
+def _str(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _strlist(v):
+    return isinstance(v, list) and all(_str(x) for x in v)
+
+
+def frontmatter_name(path):
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    m = re.match(r"---\n(.*?)\n---", text, re.S)
+    if not m:
+        return None
+    n = re.search(r"^name:\s*(\S+)\s*$", m.group(1), re.M)
+    return n.group(1) if n else None
+
+
+def validate(root, name):
+    """Return a list of problems for teams/<name>/ under root (empty = valid) and the recipe (or None)."""
+    d = os.path.join(root, "teams", name)
+    errs = []
+    path = os.path.join(d, "team.json")
+    try:
+        t = json.load(open(path))
+    except OSError:
+        return [f"teams/{name}/team.json is missing"], None
+    except ValueError as e:
+        return [f"team.json is not valid JSON ({e})"], None
+    if not isinstance(t, dict):
+        return ["team.json is not an object"], None
+    for k in KEYS:
+        if k not in t:
+            errs.append(f"missing key {k}")
+    for k in t:
+        if k not in KEYS and k not in OPTIONAL:
+            errs.append(f"unknown key {k}")
+    if "designSystem" in t and not (_str(t["designSystem"]) and t["designSystem"].startswith("https://")):
+        errs.append("designSystem must be an https URL")
+    if "canvas" in t:
+        c = t["canvas"]
+        if not isinstance(c, dict) or set(c) != {"type", "onePerCard"} or not _str(c.get("type")) or not isinstance(c.get("onePerCard"), bool):
+            errs.append("canvas must be {type: string, onePerCard: boolean}")
+    if "name" in t:
+        if not _str(t["name"]):
+            errs.append("name must be a non-empty string")
+        elif t["name"] != name:
+            errs.append(f"name {t['name']!r} is not the directory name {name!r}")
+    if "purpose" in t and not _str(t["purpose"]):
+        errs.append("purpose must be a non-empty string")
+    room = t.get("room")
+    if "room" in t and room not in ROOMS:
+        errs.append("room must be project or staff")
+    head = t.get("head")
+    if "head" in t:
+        if not isinstance(head, dict) or set(head) != {"role", "model"}:
+            errs.append("head must be {role, model}")
+        else:
+            if head["model"] not in HEAD_MODELS:   # the lead launcher accepts only these
+                errs.append("head.model must be sonnet or opus")
+            if not _str(head["role"]):
+                errs.append("head.role must be a non-empty string")
+            elif room == "project" and head["role"] != "room-lead":
+                errs.append("a project room's head is room-lead")
+            elif room == "staff" and not os.path.isfile(os.path.join(root, "roles", head["role"], "role.json")):
+                errs.append(f"staff head {head['role']!r} has no roles/{head['role']}/role.json")
+    if "desks" in t:
+        desks = t["desks"]
+        if not isinstance(desks, list):
+            errs.append("desks must be a list")
+        else:
+            seen = set()
+            for i, dk in enumerate(desks):
+                if not isinstance(dk, dict):
+                    errs.append(f"desks[{i}] must be an object")
+                    continue
+                for k in dk:
+                    if k not in DESK_KEYS:
+                        errs.append(f"desks[{i}] has unknown key {k}")
+                if not _str(dk.get("name")):
+                    errs.append(f"desks[{i}].name must be a non-empty string")
+                elif dk["name"] in seen:
+                    errs.append(f"duplicate desk name {dk['name']}")
+                else:
+                    seen.add(dk["name"])
+                if dk.get("model") not in MODELS:
+                    errs.append(f"desks[{i}].model must be sonnet, opus or haiku")
+                if not _int(dk.get("max")) or dk["max"] < 1:
+                    errs.append(f"desks[{i}].max must be a positive integer")
+                if "readOnly" in dk and not isinstance(dk["readOnly"], bool):
+                    errs.append(f"desks[{i}].readOnly must be a boolean")
+                if "phase" in dk and not (isinstance(t.get("phases"), list) and dk["phase"] in t["phases"]):
+                    errs.append(f"desks[{i}].phase must be one of the recipe's phases")
+    for k in ("entry", "phases"):
+        if k in t and (not _strlist(t[k]) or not t[k]):
+            errs.append(f"{k} must be a non-empty list of non-empty strings")
+    if "measures" in t and not _strlist(t["measures"]):
+        errs.append("measures must be a list of non-empty strings")
+    out, done = t.get("output"), t.get("done")
+    if "output" in t and out not in OUTPUT_CHECK:
+        errs.append("output must be one of " + ", ".join(OUTPUT_CHECK))
+    if "done" in t:
+        if not isinstance(done, dict) or set(done) != {"check"} or not _str(done.get("check")):
+            errs.append("done must be {check}")
+        elif out in OUTPUT_CHECK and done["check"] != OUTPUT_CHECK[out]:
+            errs.append(f"output {out} pairs with done.check {OUTPUT_CHECK[out]}, not {done['check']}")
+    for k in ("worktree", "draftPr", "land"):
+        if k in t and not isinstance(t[k], bool):
+            errs.append(f"{k} must be a boolean")
+    if t.get("draftPr") is True and out in OUTPUT_CHECK and out != "merged-pr":
+        errs.append("only a merged-pr recipe may open draft PRs")
+    if t.get("land") is True and out in OUTPUT_CHECK and out != "landed-branch":
+        errs.append("only a landed-branch recipe may land")
+    if "caps" in t:
+        c = t["caps"]
+        if not isinstance(c, dict) or set(c) != {"softUsdPerDay", "hardUsdPerDay"}:
+            errs.append("caps must be {softUsdPerDay, hardUsdPerDay}")
+        elif not (_num(c["softUsdPerDay"]) and _num(c["hardUsdPerDay"])) or c["softUsdPerDay"] <= 0 or c["hardUsdPerDay"] <= 0:
+            errs.append("caps must be positive numbers")
+        elif c["softUsdPerDay"] > c["hardUsdPerDay"]:
+            errs.append("caps: soft must not exceed hard")
+    fm = frontmatter_name(os.path.join(d, "SKILL.md"))
+    if not os.path.isfile(os.path.join(d, "SKILL.md")):
+        errs.append("SKILL.md is missing")
+    elif fm != name:
+        errs.append(f"SKILL.md frontmatter name {fm!r} is not {name!r}")
+    return errs, t
+
+
+def recipe_names(root):
+    base = os.path.join(root, "teams")
+    if not os.path.isdir(base):
+        return []
+    return sorted(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
+
+
+def summary(t):
+    return (f"{t['room']:<7} {t['output']:<13} done:{t['done']['check']:<14} head={t['head']['role']}/{t['head']['model']}"
+            f" desks={len(t['desks'])} wt={'y' if t['worktree'] else 'n'} draft={'y' if t['draftPr'] else 'n'}"
+            f" land={'y' if t['land'] else 'n'}")
+
+
+def check(root, names):
+    names = names or recipe_names(root)
+    if not names:
+        print("team check: no recipes found", file=sys.stderr)
+        return 1
+    bad = 0
+    for n in names:
+        if not os.path.isdir(os.path.join(root, "teams", n)):
+            print(f"FAIL {n}: no such recipe")
+            bad += 1
+            continue
+        errs, t = validate(root, n)
+        if errs:
+            bad += 1
+            print(f"FAIL {n}: " + "; ".join(errs))
+        else:
+            print(f"ok   {n:<14} {summary(t)}")
+    return 1 if bad else 0
+
+
+# ------------------------------------------------------------------------------------------------
+# self-test
+
+def _base():
+    return {"name": "x", "purpose": "p", "room": "project", "head": {"role": "room-lead", "model": "sonnet"},
+            "desks": [{"name": "impl", "model": "sonnet", "max": 2}, {"name": "rev", "model": "opus", "max": 1, "readOnly": True}],
+            "entry": ["a"], "phases": ["work"], "output": "merged-pr", "done": {"check": "pr-merged"},
+            "worktree": True, "draftPr": True, "land": False,
+            "caps": {"softUsdPerDay": 15, "hardUsdPerDay": 40}, "measures": ["cost"]}
+
+
+def _write(root, name, t, skill_name=None, skill=True):
+    d = os.path.join(root, "teams", name)
+    os.makedirs(d, exist_ok=True)
+    json.dump(t, open(os.path.join(d, "team.json"), "w"))
+    if skill:
+        open(os.path.join(d, "SKILL.md"), "w").write(f"---\nname: {skill_name or name}\ndescription: d\n---\n# {name}\n")
+
+
+def self_test():
+    bad = []
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "roles", "analyst"))
+    open(os.path.join(root, "roles", "analyst", "role.json"), "w").write("{}")
+
+    def case(label, mutate, expect, **kw):
+        t = _base()
+        mutate(t)
+        n = "x"
+        import shutil
+        shutil.rmtree(os.path.join(root, "teams"), ignore_errors=True)
+        _write(root, n, t, **kw)
+        errs, _ = validate(root, n)
+        hit = any(expect in e for e in errs) if expect else not errs
+        if not hit:
+            bad.append(f"{label}: wanted {expect or 'valid'}, got {errs}")
+
+    def drop(k):
+        return lambda t: t.pop(k)
+
+    case("valid", lambda t: None, None)
+    case("valid staff", lambda t: t.update(room="staff", head={"role": "analyst", "model": "sonnet"}, output="report",
+                                           done={"check": "report-posted"}, draftPr=False, worktree=False), None)
+    for k in ("name", "purpose", "head", "desks", "output", "done", "worktree", "draftPr", "land", "caps", "measures", "phases", "entry"):
+        case(f"missing {k}", drop(k), f"missing key {k}")
+    case("unknown key", lambda t: t.update(extra=1), "unknown key extra")
+    case("wrong name", lambda t: t.update(name="y"), "not the directory name")
+    case("bad room", lambda t: t.update(room="lab"), "room must be")
+    case("project head not room-lead", lambda t: t.update(head={"role": "analyst", "model": "sonnet"}), "room-lead")
+    case("staff head without role.json", lambda t: t.update(room="staff", head={"role": "ghost", "model": "sonnet"}), "no roles/ghost/role.json")
+    case("bad head model", lambda t: t["head"].update(model="gpt"), "head.model")
+    case("haiku head", lambda t: t["head"].update(model="haiku"), "head.model must be sonnet or opus")
+    case("haiku desk is fine", lambda t: t["desks"][0].update(model="haiku"), None)
+    case("bad desk model", lambda t: t["desks"][0].update(model="fast"), "desks[0].model")
+    case("duplicate desk", lambda t: t["desks"][1].update(name="impl"), "duplicate desk")
+    case("max zero", lambda t: t["desks"][0].update(max=0), "desks[0].max")
+    case("max bool", lambda t: t["desks"][0].update(max=True), "desks[0].max")
+    case("readOnly not bool", lambda t: t["desks"][1].update(readOnly="yes"), "readOnly")
+    case("desk unknown key", lambda t: t["desks"][0].update(color="red"), "unknown key color")
+    case("empty phases", lambda t: t.update(phases=[]), "phases must be")
+    case("blank entry", lambda t: t.update(entry=["ok", " "]), "entry must be")
+    case("done mismatch", lambda t: t.update(done={"check": "landed"}), "pairs with done.check pr-merged")
+    case("design recipe", lambda t: t.update(output="approved-design", done={"check": "card-has-design-link"}, draftPr=False,
+                                              designSystem="https://claude.ai/artifact/x", canvas={"type": "Design", "onePerCard": True}), None)
+    case("designSystem not a URL", lambda t: t.update(designSystem="ds"), "designSystem must be an https URL")
+    case("canvas wrong shape", lambda t: t.update(canvas={"type": "Design"}), "canvas must be")
+    case("canvas onePerCard not bool", lambda t: t.update(canvas={"type": "Design", "onePerCard": "yes"}), "canvas must be")
+    case("desk phase in phases", lambda t: t["desks"][0].update(phase="work"), None)
+    case("desk phase not in phases", lambda t: t["desks"][0].update(phase="nope"), "phase must be one of")
+    case("approved-design pairs with card-has-design-link", lambda t: t.update(output="approved-design", draftPr=False), "pairs with done.check card-has-design-link")
+    case("bad output", lambda t: t.update(output="essay"), "output must be")
+    case("draft without merged-pr", lambda t: t.update(output="verdict", done={"check": "verdict-posted"}), "draft PRs")
+    case("land without landed-branch", lambda t: t.update(land=True, draftPr=False), "may land")
+    case("land ok for landed-branch", lambda t: t.update(land=True, draftPr=False, output="landed-branch", done={"check": "landed"}), None)
+    case("soft above hard", lambda t: t["caps"].update(softUsdPerDay=50), "soft must not exceed hard")
+    case("non-positive cap", lambda t: t["caps"].update(softUsdPerDay=0), "positive")
+    case("flag not bool", lambda t: t.update(worktree="yes"), "worktree must be a boolean")
+    case("missing SKILL.md", lambda t: None, "SKILL.md is missing", skill=False)
+    case("SKILL name differs", lambda t: None, "frontmatter name", skill_name="other")
+    # check(): one line per recipe, non-zero on any failure, never reads the real teams/
+    import shutil, io, contextlib
+    shutil.rmtree(os.path.join(root, "teams"), ignore_errors=True)
+    _write(root, "x", _base())
+    t2 = _base(); t2["name"] = "y"; t2["caps"]["softUsdPerDay"] = 99
+    _write(root, "y", t2)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = check(root, [])
+        rc_one = check(root, ["x"])
+        rc_none = check(root, ["nope"])
+    lines = buf.getvalue().splitlines()
+    if not (rc == 1 and rc_one == 0 and rc_none == 1 and lines[0].startswith("ok   x") and lines[1].startswith("FAIL y")):
+        bad.append(f"check(): rc={rc},{rc_one},{rc_none} lines={lines}")
+    # powers: wording follows the flags
+    def pw(**kw):
+        t = _base(); t.update(kw)
+        return powers_text(t)
+    a = pw()
+    if not ("gh pr create --draft" in a and "may not land" in a and "impl up to 2 on sonnet" in a
+            and "rev up to 1 on opus (read-only)" in a and "(read-only)" in a and "soft $15 per day, hard $40 per day" in a and "has a worktree" in a
+            and "gh pr ready" in a and "open a room" in a):
+        bad.append(f"powers draft: {a}")
+    b = pw(draftPr=False, worktree=False, desks=[])
+    if not ("may not open a PR" in b and "gh pr create --draft" not in b and "Desks: none" in b and "needs none" in b):
+        bad.append(f"powers none: {b}")
+    c = pw(draftPr=False, land=True, output="landed-branch")
+    if not ("bin/land <branch>" in c and "never `--no-checks`" in c and "may not open a PR" in c):
+        bad.append(f"powers land: {c}")
+    d = powers_text(_base(), True)
+    if not ("bin/land <branch>" in d and "gh pr create --draft" not in d):
+        bad.append(f"powers land override: {d}")
+    # start: stub launchers record their argv, a stub gh serves issue fixtures; nothing real is launched
+    for f, want in (("Fix the Frost Alert bug!", "fix-the-frost-alert-bug"), ("room-Sort Tree", "sort-tree"),
+                    ("a" * 60, "a" * 41), ("  --  ", ""), ("x" * 40 + " yy", "x" * 40)):
+        if slugify(f) != want:
+            bad.append(f"slugify {f!r} -> {slugify(f)!r}")
+    for f, want in (("21", ("initiative", 21)), ("#21", ("initiative", 21)), (f"https://github.com/{REPO}/issues/7", ("initiative", 7)),
+                    ("https://github.com/other/repo/issues/7", ("task", "https://github.com/other/repo/issues/7")),
+                    ("tidy the inbox", ("task", "tidy the inbox"))):
+        if parse_target(f) != want:
+            bad.append(f"parse_target {f!r} -> {parse_target(f)!r}")
+    if room_repo("goal\n\n## Room\n- room: room-x\n- repo: acme-api\n- branch: b\n") != "acme-api" or room_repo("no room here") is not None:
+        bad.append("room_repo")
+    fx = tempfile.mkdtemp()
+    rec = os.path.join(fx, "rec")
+    for n, body in ((21, "Goal\n\n## Room\n- room: room-x\n- repo: acme-web\n"), (22, "Goal, no room block"),
+                    (23, "## Room\n- repo: acme-office\n")):
+        json.dump({"title": f"Issue {n}: Sort the Tree", "body": body}, open(os.path.join(fx, f"issue-{n}.json"), "w"))
+    for name, text in (("gh", 'cat "$TEAM_FIX/issue-$3.json"\n'), ("launch", 'for a in "$@"; do printf "%s\\n" "$a"; done > "$TEAM_REC"\n')):
+        open(os.path.join(fx, name), "w").write("#!/bin/sh\n" + text)
+        os.chmod(os.path.join(fx, name), 0o755)
+    shutil.rmtree(os.path.join(root, "teams"), ignore_errors=True)
+    t3 = _base(); t3["name"] = "pj"; t3["head"]["model"] = "opus"
+    _write(root, "pj", t3)
+    t4 = _base(); t4.update(name="st", room="staff", head={"role": "analyst", "model": "sonnet"}, output="report",
+                           done={"check": "report-posted"}, draftPr=False, worktree=False)
+    _write(root, "st", t4)
+    t5 = _base(); t5.update(name="nd", draftPr=False, worktree=False, output="verdict", done={"check": "verdict-posted"})
+    _write(root, "nd", t5)
+    saved = {k: os.environ.get(k) for k in ("TEAM_GH", "TEAM_LEAD_START", "TEAM_ROLE_RUN", "TEAM_FIX", "TEAM_REC", "SCH_LIAISON_SESSION", "BUSYBODY_CONTROLLER")}
+    os.environ.update(TEAM_GH=os.path.join(fx, "gh"), TEAM_LEAD_START=os.path.join(fx, "launch"), TEAM_ROLE_RUN=os.path.join(fx, "launch"),
+                      TEAM_FIX=fx, TEAM_REC=rec)
+    os.environ.pop("SCH_LIAISON_SESSION", None)
+    os.environ.pop("BUSYBODY_CONTROLLER", None)
+
+    def start(*a):
+        if os.path.exists(rec):
+            os.remove(rec)
+        o, e = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            try:
+                rc = cmd_start(list(a), root)
+            except SystemExit as x:
+                rc = x.code
+        return rc, o.getvalue(), e.getvalue(), (open(rec).read().splitlines() if os.path.exists(rec) else None)
+
+    rc, o, e, argv = start("pj", "21", "--controller", "ctl", "--base", "origin/dev")
+    if not (rc == 0 and argv == ["acme-web", "issue-21-sort-the-tree", "--controller", "ctl", "--issue", "21", "--base", "origin/dev",
+                                 "--model", "opus", "--team", "pj"]):
+        bad.append(f"start project: rc={rc} argv={argv} {e}")
+    rc, o, e, argv = start("pj", "22", "--repo", "acme-api", "--controller", "ctl")
+    if not (rc == 0 and argv[:2] == ["acme-api", "issue-22-sort-the-tree"]):
+        bad.append(f"start --repo: rc={rc} argv={argv} {e}")
+    rc, o, e, argv = start("pj", "21", "--repo", "acme-api", "--controller", "ctl")
+    if not (rc == 0 and argv[0] == "acme-api"):
+        bad.append(f"start --repo beats the Room block: {argv}")
+    rc, o, e, argv = start("pj", "22", "--controller", "ctl")
+    if not (rc != 0 and argv is None and "--repo" in e):
+        bad.append(f"start without a repo must refuse: rc={rc} {e}")
+    rc, o, e, argv = start("pj", "tidy the inbox now", "--repo", "acme-api", "--controller", "ctl")
+    if not (rc == 0 and argv[:2] == ["acme-api", "tidy-the-inbox-now"] and "--issue" not in argv):
+        bad.append(f"start task: rc={rc} argv={argv}")
+    rc, o, e, argv = start("pj", "23", "--controller", "ctl")
+    if not (rc == 0 and argv[0] == "acme-office" and "--land" not in argv):
+        bad.append(f"start no longer passes --land (the launcher reads the repo's merge mode): {argv}")
+    rc, o, e, argv = start("nd", "23", "--controller", "ctl")
+    if not (rc == 0 and "--land" not in argv):
+        bad.append(f"start of a no-PR recipe never lands: {argv}")
+    rc, o, e, argv = start("st", "tidy the inbox", "--controller", "ctl")
+    if not (rc == 0 and argv == ["run", "analyst", "tidy the inbox", "--controller", "ctl", "--team", "st"]):
+        bad.append(f"start staff: rc={rc} argv={argv} {e}")
+    rc, o, e, argv = start("st", "21", "--controller", "ctl")
+    if not (rc == 0 and argv[:3] == ["run", "analyst", "Issue 21: Sort the Tree (initiative #21)"]):
+        bad.append(f"start staff from an initiative: {argv}")
+    rc, o, e, argv = start("nope", "21", "--controller", "ctl")
+    if not (rc != 0 and argv is None and "no such recipe" in e):
+        bad.append(f"unknown recipe must be refused: rc={rc} {e}")
+    rc, o, e, argv = start("pj", "21")
+    if not (rc != 0 and argv is None and "controller" in e):
+        bad.append(f"start needs a controller: rc={rc} {e}")
+    os.environ["BUSYBODY_CONTROLLER"] = "envctl"
+    rc, o, e, argv = start("pj", "21")
+    if not (rc == 0 and argv[argv.index("--controller") + 1] == "envctl"):
+        bad.append(f"controller from the environment: {argv}")
+    rc, o, e, argv = start("pj", "21", "--controller", "ctl", "--dry-run")
+    if not (rc == 0 and argv is None and "DRY RUN" in o and "command:" in o and "--issue 21" in o and "powers (goes into the launch brief)" in o
+            and "gh pr create --draft" in o):
+        bad.append(f"start --dry-run: rc={rc} {o}")
+    rc, o, e, argv = start("pj", "23", "--controller", "ctl", "--dry-run")
+    if not ("bin/land <branch>" in o and "gh pr create --draft" not in o):
+        bad.append(f"dry-run powers for a repo without PRs: {o}")
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    shutil.rmtree(fx, ignore_errors=True)
+    saved_tracker0 = TRACKER
+    globals()["TRACKER"] = Tracker({"type": "acme", "name": "Acme", "cardUrlRegex": r"https://tasks\.acme\.test/t/([A-Za-z0-9]+)", "get": "acme-tasks get {id}"})
+    # resolve: stub gh/tracker serve fixtures, real git on a scratch repo; every case checks the exit code and the evidence line
+    fx = tempfile.mkdtemp()
+    glog = os.path.join(fx, "gh.log")
+    for name, text in (("gh", 'echo "$*" >> "$TEAM_FIX/gh.log"\ncase "$1 $2" in\n"issue view") cat "$TEAM_FIX/issue-$3.json" ;;\n'
+                                   '"pr list") cat "$TEAM_FIX/pr.json" ;;\n*) exit 1 ;;\nesac\n'),
+                       ("tracker", 'cat "$TEAM_FIX/card-$2.json"\n')):
+        open(os.path.join(fx, name), "w").write("#!/bin/sh\n" + text)
+        os.chmod(os.path.join(fx, name), 0o755)
+    repos = os.path.join(fx, "repos")
+    r1 = os.path.join(repos, "r1")
+    genv = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+                GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
+    def git(*a):
+        subprocess.run(["git", "-C", r1] + list(a), check=True, capture_output=True, env=genv)
+
+    os.makedirs(r1)
+    git("init", "-q", "-b", "main")
+    git("commit", "-q", "--allow-empty", "-m", "base")
+    git("checkout", "-q", "-b", "landed-b")
+    os.makedirs(os.path.join(r1, "docs"))
+    open(os.path.join(r1, "docs", "findings.md"), "w").write("findings\n")
+    git("add", "docs/findings.md")
+    git("commit", "-q", "-m", "one")
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--ff-only", "landed-b")
+    git("branch", "empty-b")
+    git("checkout", "-q", "-b", "open-b")
+    git("commit", "-q", "--allow-empty", "-m", "two")
+    git("checkout", "-q", "main")
+    os.environ.update(TEAM_GH=os.path.join(fx, "gh"), TEAM_TRACKER=os.path.join(fx, "tracker"), TEAM_GIT="git", TEAM_FIX=fx,
+                      TEAM_REPOS_DIR=repos, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+    appr = f"https://github.com/{REPO}/issues/9#issuecomment-1234"
+
+    def issue(n, branch="landed-b", team="dev-team", comments=(), room=True, who="room-r", repo="r1"):
+        body = "Goal\n\n## Room\n- room: room-r\n- team: %s\n- repo: %s\n- branch: %s\n" % (team, repo, branch) if room else "Goal"
+        cs = [{"body": c.replace("WHO", who), "url": f"https://x/c{i}"} for i, c in enumerate(comments)]
+        json.dump({"title": "T", "body": body, "comments": cs}, open(os.path.join(fx, f"issue-{n}.json"), "w"))
+
+    def resolve(n, *a):
+        o = io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(o):
+            try:
+                rc = cmd_resolve([str(n), *a], root)
+            except SystemExit as x:
+                rc = x.code
+        return rc, o.getvalue().strip()
+
+    def card(cid, labels, desc):
+        json.dump({"labels": [{"name": x} for x in labels], "description": desc}, open(os.path.join(fx, f"card-{cid}.json"), "w"))
+
+    def expect(label, got, rc, text):
+        if not (got[0] == rc and text in got[1]):
+            bad.append(f"resolve {label}: wanted rc {rc} with {text!r}, got {got}")
+
+    t6 = _base(); t6["name"] = "dev-team"
+    shutil.rmtree(os.path.join(root, "teams"), ignore_errors=True)
+    _write(root, "dev-team", t6)
+    t7 = _base(); t7.update(name="mad", draftPr=False, worktree=False, output="verdict", done={"check": "verdict-posted"})
+    _write(root, "mad", t7)
+    t8 = _base(); t8.update(name="scribe", room="staff", head={"role": "analyst", "model": "sonnet"}, output="ready-card",
+                           done={"check": "ready-card"}, draftPr=False, worktree=False)
+    _write(root, "scribe", t8)
+    t9 = _base(); t9.update(name="writer", draftPr=False, worktree=False, output="report", done={"check": "report-posted"})
+    _write(root, "writer", t9)
+    t10 = _base(); t10.update(name="lander", draftPr=False, land=True, output="landed-branch", done={"check": "landed"})
+    _write(root, "lander", t10)
+    # pr-merged (the recipe's check, from the Room block's team)
+    issue(31)
+    json.dump([{"url": "https://github.com/acme-co/r1/pull/5", "state": "MERGED"}], open(os.path.join(fx, "pr.json"), "w"))
+    expect("pr-merged pass", resolve(31), 0, "PASS pr-merged on #31: https://github.com/acme-co/r1/pull/5 is merged")
+    # --close: claude stop (stubbed to find no job), then the process matched by its exact -n; another room's process is left alone
+    open(os.path.join(fx, "claude"), "w").write('#!/bin/sh\necho "No job matching $2" >&2\nexit 1\n')
+    os.chmod(os.path.join(fx, "claude"), 0o755)
+    # the real shape: a background session is `claude bg-spare --bg-spare <sock>`, and `claude agents --json` lists its pid
+    open(os.path.join(fx, "ps.jsonl"), "w").write(json.dumps({"pid": 4194001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"]}) + "\n"
+                                                  + json.dumps({"pid": 4194002, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/y.sock"]}) + "\n")
+    json.dump([{"name": "room-r", "pid": 4194001}, {"name": "room-r2", "pid": 4194002}], open(os.path.join(fx, "agents.json"), "w"))
+    os.environ.update(TEAM_CLAUDE=os.path.join(fx, "claude"), BUSYBODY_PS_FILE=os.path.join(fx, "ps.jsonl"), BUSYBODY_NO_SIGNAL="1",
+                      BUSYBODY_AGENTS_JSON=os.path.join(fx, "agents.json"))
+    expect("--close ends the room's own process through the agents pid map", resolve(31, "--close"), 0, "claude stop room-r: No job matching room-r\nroom-r: ended pid 4194001 (SIGTERM)")
+    json.dump([{"name": "room-r", "pid": None}], open(os.path.join(fx, "agents.json"), "w"))
+    expect("--close fails loudly when a listed session cannot be ended", resolve(31, "--close"), 3, "listed by `claude agents` but no claude process could be matched")
+    expect("without --close nothing is stopped", resolve(31), 0, "PASS pr-merged on #31: https://github.com/acme-co/r1/pull/5 is merged")
+    for k in ("TEAM_CLAUDE", "BUSYBODY_PS_FILE", "BUSYBODY_NO_SIGNAL", "BUSYBODY_AGENTS_JSON"):
+        os.environ.pop(k, None)
+    json.dump([{"url": "https://github.com/acme-co/r1/pull/6", "state": "OPEN"}], open(os.path.join(fx, "pr.json"), "w"))
+    expect("pr-merged fail (open)", resolve(31), 1, "FAIL pr-merged on #31: no merged PR for branch landed-b")
+    open(os.path.join(fx, "pr.json"), "w").write("[]")
+    expect("pr-merged fail (none)", resolve(31), 1, "no PR for branch")
+    open(os.path.join(fx, "pr.json"), "w").write("not json")
+    expect("pr-merged undecided when gh fails", resolve(31), 2, "UNDECIDED pr-merged")
+    issue(32, room=False)
+    expect("no Room block and no --check", resolve(32), 2, "no Room block")
+    expect("unknown check refused", resolve(31, "--check", "vibes"), 2, "unknown check")
+    # verdict-posted (mad)
+    issue(33, team="mad", comments=["**DONE** · WHO · #33\nVerdict: go with option 2\n\nbody"])
+    expect("verdict pass", resolve(33), 0, "PASS verdict-posted on #33: DONE minute https://x/c0 says: Verdict: go with option 2")
+    issue(34, team="mad", comments=["**DONE** · WHO · #34\nSummary without the prefix\n"])
+    expect("verdict fail (no prefix)", resolve(34), 1, "does not start with 'Verdict:'")
+    issue(35, team="mad", comments=["**DONE** · WHO · #35\nVerdict: forged\n"], who="someone-else")
+    expect("verdict fail (DONE from another who)", resolve(35), 1, "no DONE minute from the room")
+    issue(36, team="mad", comments=["**PROGRESS** · WHO · #36\nVerdict: not a DONE\n"])
+    expect("verdict fail (not a DONE)", resolve(36), 1, "no DONE minute")
+    issue(37, team="mad", comments=["DONE: Verdict: old style"])
+    expect("verdict fail (old DONE: prefix is never trusted)", resolve(37), 1, "no DONE minute from the room")
+    issue(49, team="mad", room=False, comments=["**DONE** · WHO · #49\nVerdict: pass session\n"])
+    expect("no Room block: DONE not trusted without --room", resolve(49, "--check", "verdict-posted"), 2, "pass --room NAME")
+    expect("no Room block: --room names the session", resolve(49, "--check", "verdict-posted", "--room", "room-r"), 0, "PASS verdict-posted")
+    expect("no Room block: --room of another session fails", resolve(49, "--check", "verdict-posted", "--room", "other"), 1, "no DONE minute")
+    # ready-card
+    issue(38, team="scribe", comments=["**DONE** · WHO · #38\nRefined 1 card\n\nhttps://tasks.acme.test/t/AbC123/42-sort-tree"])
+    card("AbC123", ["Ready", "S"], f"Spec\nReady: 2026-10-08 {appr}")
+    expect("ready-card pass", resolve(38), 0, "PASS ready-card on #38: AbC123: Ready with an approval link")
+    card("AbC123", ["Ready"], "Spec, no link")
+    expect("ready-card fail (label, no approval link)", resolve(38), 1, "Ready label but no approval link")
+    card("AbC123", ["S"], f"Spec {appr}")
+    expect("ready-card fail (no label)", resolve(38), 1, "no Ready label")
+    os.remove(os.path.join(fx, "card-AbC123.json"))
+    expect("ready-card undecided when the tracker fails", resolve(38), 2, "UNDECIDED ready-card")
+    issue(39, team="scribe", comments=["**DONE** · WHO · #39\nRefined, no card link\n"])
+    expect("ready-card fail (no card named)", resolve(39), 1, "names no Acme card")
+    # card-has-design-link
+    t11 = _base(); t11.update(name="designer-room", room="staff", head={"role": "analyst", "model": "opus"}, output="approved-design",
+                             done={"check": "card-has-design-link"}, draftPr=False, worktree=False)
+    _write(root, "designer-room", t11)
+    issue(54, team="designer-room", comments=["**DONE** · WHO · #54\nDesigned\n\nhttps://tasks.acme.test/t/Dz1/7-screen"])
+    card("Dz1", ["Ready"], f"Spec\nDesign: https://claude.ai/artifact/AbC-123\nApproved: {appr}")
+    expect("design link pass", resolve(54), 0, "PASS card-has-design-link on #54: Dz1: Design: line links https://claude.ai/artifact/AbC-123")
+    card("Dz1", [], f"Spec\nApproved: {appr}")
+    expect("design link fail (no Design: line)", resolve(54), 1, "no Design: line")
+    card("Dz1", [], "Design: https://claude.ai/artifact/AbC-123")
+    expect("design link fail (no approval link)", resolve(54), 1, "no link to the owner's approval comment")
+    card("Dz1", [], f"Design: https://example.com/x {appr}")
+    expect("design link fail (not a claude.ai artifact)", resolve(54), 1, "no Design: line")
+    os.remove(os.path.join(fx, "card-Dz1.json"))
+    expect("design link undecided when the tracker fails", resolve(54), 2, "UNDECIDED card-has-design-link")
+    issue(55, team="designer-room", room=False, comments=["**DONE** · WHO · #55\nDesigned\n\nhttps://tasks.acme.test/t/Dz2/8-x"])
+    card("Dz2", [], f"Design: https://claude.ai/artifact/Q1 {appr}")
+    expect("design link: staff pass needs --room", resolve(55, "--check", "card-has-design-link"), 2, "pass --room NAME")
+    expect("design link: staff pass with --room", resolve(55, "--check", "card-has-design-link", "--room", "room-r"), 0, "PASS card-has-design-link")
+    issue(56, team="designer-room", who="someone-else", comments=["**DONE** · WHO · #56\nDesigned\n\nhttps://tasks.acme.test/t/Dz2/8-x"])
+    expect("design link: DONE from another who is ignored", resolve(56), 1, "no DONE minute from the room")
+    # tracker none (a fixture config): the card is not read, the DONE minute still has to exist
+    saved_tracker, globals()["TRACKER"] = TRACKER, Tracker({"type": "none"})
+    expect("ready-card with tracker none passes with a note", resolve(38), 0, "PASS ready-card on #38: DONE minute https://x/c0; tracker is none, so the card is not checked")
+    expect("design link with tracker none passes with a note", resolve(54), 0, "tracker is none")
+    expect("ready-card with tracker none still needs a DONE minute", resolve(56, "--check", "ready-card"), 1, "no DONE minute from the room")
+    globals()["TRACKER"] = saved_tracker
+    # report-posted
+    issue(40, team="writer", comments=["**DONE** · WHO · #40\nWrote it up\n\nReport: docs/findings.md"])
+    expect("report pass (repo doc)", resolve(40), 0, "PASS report-posted on #40: DONE minute https://x/c0 names docs/findings.md, which exists on the room's branch")
+    issue(41, team="writer", comments=["**DONE** · WHO · #41\nWrote it up\n\nReport: https://github.com/acme-co/acme-office/issues/41#issuecomment-5"])
+    expect("report pass (comment link)", resolve(41), 0, "PASS report-posted")
+    issue(42, team="writer", comments=["**DONE** · WHO · #42\nWrote it up\n\nReport: it is in my head"])
+    expect("report fail (no link)", resolve(42), 1, "holds no link")
+    issue(52, team="writer", comments=["**DONE** · WHO · #52\nWrote it up\n\nReport: README.md"])
+    expect("report fail (bare README.md not on the branch)", resolve(52), 1, "README.md, which is not on the room's branch")
+    issue(53, team="writer", branch="no-such-branch", comments=["**DONE** · WHO · #53\nWrote it up\n\nReport: docs/findings.md"])
+    expect("report undecided (path, branch missing)", resolve(53), 2, "UNDECIDED report-posted")
+    issue(43, team="writer", comments=["**DONE** · WHO · #43\nWrote it up\n"])
+    expect("report fail (no line)", resolve(43), 1, "no Report: line")
+    issue(50, repo="acme-office")
+    expect("a dev team in this repo (no PRs) resolves with landed, not pr-merged", resolve(50), 2, "UNDECIDED landed")
+    issue(51, repo="acme-office", team="mad", comments=["**DONE** · WHO · #51\nVerdict: x\n"])
+    expect("a no-PR recipe in this repo keeps its own check", resolve(51), 0, "PASS verdict-posted")
+    # landed, and --check overriding the recipe
+    issue(44, team="lander")
+    expect("landed pass", resolve(44), 0, "PASS landed on #44: refs/heads/landed-b")
+    issue(45, team="lander", branch="open-b")
+    expect("landed fail", resolve(45), 1, "FAIL landed on #45: refs/heads/open-b")
+    issue(48, team="lander", branch="empty-b")
+    expect("landed fail (branch with no commits of its own)", resolve(48), 1, "no commits of its own")
+    issue(46, team="lander", branch="no-such-branch")
+    expect("landed undecided (no branch)", resolve(46), 2, "UNDECIDED landed")
+    issue(47, team="dev-team", branch="landed-b")
+    expect("--check overrides the recipe's check", resolve(47, "--check", "landed"), 0, "PASS landed on #47")
+    git("remote", "add", "origin", os.path.join(fx, "nowhere"))
+    git("update-ref", "refs/remotes/origin/main", "main~1")
+    expect("landed fail when origin/main is behind", resolve(47, "--check", "landed"), 1, "origin/main")
+    # resolve never writes
+    log = open(glog).read()
+    if re.search(r"\b(comment|edit|close|reopen|create|label)\b", log):
+        bad.append(f"resolve wrote through gh: {log}")
+    globals()["TRACKER"] = saved_tracker0
+    for k in ("TEAM_GH", "TEAM_TRACKER", "TEAM_GIT", "TEAM_FIX", "TEAM_REPOS_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        os.environ.pop(k, None)
+    for k, v in saved.items():
+        if v is not None:
+            os.environ[k] = v
+    shutil.rmtree(fx, ignore_errors=True)
+    # brief parts follow the flags
+    for kw, part, want, nowant in (({}, "commit", "push the room's branch", "no repo changes"), ({"worktree": False}, "commit", "no repo changes", "push the room"),
+                                   ({}, "prs", "draft\n  stack", "Open no PR"), ({"draftPr": False}, "prs", "Open no PR", "draft\n  stack"),
+                                   ({}, "prlimit", "a dev team's draft", "opening any PR"), ({"draftPr": False}, "prlimit", "opening any PR", "draft")):
+        t = _base(); t.update(kw)
+        got = brief_part(t, part)
+        if want not in got or nowant in got:
+            bad.append(f"brief_part {part} {kw}: {got}")
+    if "Open no PR" not in brief_part(_base(), "prs", True):
+        bad.append("brief_part prs with --land must forbid PRs")
+    # roots: the engine is this script's checkout; OFFICE_WORKSPACE moves only the workspace
+    if workspace_root(ENGINE_ROOT, {"OFFICE_WORKSPACE": root}, root) != os.path.abspath(root):
+        bad.append("OFFICE_WORKSPACE must set the workspace root")
+    if workspace_root(ENGINE_ROOT, {}, tempfile.gettempdir()) != ENGINE_ROOT and not os.path.isfile(os.path.join(tempfile.gettempdir(), "office.json")):
+        bad.append("with no OFFICE_WORKSPACE and no office.json the workspace root is the engine root")
+    if subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "officeroot.py"), "--self-test"]).returncode:
+        bad.append("officeroot self-test")
+    if subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "officeconfig.py"), "--self-test"]).returncode:
+        bad.append("officeconfig self-test")
+    if subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "tracker.py"), "--self-test"]).returncode:
+        bad.append("tracker self-test")
+    if subprocess.run([os.path.join(ENGINE_ROOT, "bin", "status"), "--self-test"]).returncode:
+        bad.append("status self-test")
+    shutil.rmtree(root, ignore_errors=True)
+    if bad:
+        print("team self-test: FAILED: " + "; ".join(bad))
+        return 1
+    print("team self-test: ok")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------
+# powers
+
+def load_recipe(name, root=None):
+    root = root or WORKSPACE_ROOT   # recipes belong to the workspace, not the engine
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") or not os.path.isdir(os.path.join(root, "teams", name)):
+        die(f"no such recipe: {name}")
+    errs, t = validate(root, name)
+    if errs:
+        die(f"recipe {name} is invalid: " + "; ".join(errs))
+    return t
+
+
+def _or_list(names):
+    """`a`, `b` or `c`"""
+    q = [f"`{n}`" for n in names]
+    return q[0] if len(q) == 1 else ", ".join(q[:-1]) + " or " + q[-1]
+
+
+def powers_text(t, land_override=False):
+    """The bullets the launch brief states, from the recipe's flags. `land_override` is for a repo without
+    PRs: the room lands with bin/land instead of opening draft PRs."""
+    draft = t["draftPr"] and not land_override
+    land = t["land"] or land_override
+    head = t["head"]
+    out = [f"- **Team: {t['name']}** ({t['purpose']}). Recipe: `teams/{t['name']}/SKILL.md`. The room settings deny what this "
+           "recipe withholds (as command patterns, a backstop), and the skill never loosens them."]
+    if t["desks"]:
+        ds = "; ".join(f"{d['name']} up to {d['max']} on {d['model']}" + (" (read-only)" if d.get("readOnly") else "") for d in t["desks"])
+        out.append(f"- Desks (a maximum, never a quota: leave desks empty for small work): {ds}. You head the room on {head['model']}.")
+    else:
+        out.append(f"- Desks: none. You work alone on {head['model']}.")
+    out.append("- Worktree: this room has a worktree, and you may edit and commit in it." if t["worktree"] else
+               "- Worktree: this team needs none. Do not edit repo files; your output is the minutes.")
+    if draft:
+        out.append("- Draft PRs: you may `gh pr create --draft` for the room's branch. Never open one ready and never run `gh pr ready`: "
+                   "the owner promotes." + (" " + OFFICE.draft_note if OFFICE.draft_note else ""))
+    else:
+        out.append("- PRs: you may not open a PR (not even a draft).")
+    if land:
+        out.append("- Landing: this repo has no PRs, so you land your branch with `bin/land <branch>` (never `--no-checks`, never force-push).")
+    else:
+        out.append("- Landing: you may not land or move `main`.")
+    c = t["caps"]
+    out.append(f"- Caps: soft ${c['softUsdPerDay']:g} per day, hard ${c['hardUsdPerDay']:g} per day.")
+    out.append(f"- Never, whatever the recipe says: merge a PR, run `gh pr ready`, push {_or_list(OFFICE.protected_branches())}, open a room "
+               "(`claude --bg`, `bin/team start`, or the old launchers). Ask with a `DECISION:` sticky note.")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------------------------------------
+# start
+
+def slugify(text):
+    """Lowercase, dashes, at most 41 characters, no leading `room-` (a room is always room-<slug>)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    slug = re.sub(r"^room-", "", slug)
+    return slug[:41].strip("-")
+
+
+def parse_target(text):
+    """('initiative', number) for N, #N or an issue URL of the workspace repo; else ('task', text)."""
+    text = (text or "").strip()
+    m = re.fullmatch(r"#?(\d+)", text) or re.fullmatch(rf"https://github\.com/{re.escape(REPO)}/issues/(\d+)/?", text)
+    return ("initiative", int(m.group(1))) if m else ("task", text)
+
+
+def room_repo(body):
+    """The `- repo:` line of the issue's `## Room` block, or None."""
+    sec = re.search(r"(?ms)^## Room\b.*?(?=^## |\Z)", body or "")
+    m = sec and re.search(r"(?m)^[-*]\s*repo:\s*`?([\w./-]+)`?\s*$", sec.group(0))
+    return m.group(1) if m else None
+
+
+def tool(env, default, args, **kw):
+    return subprocess.run(shlex.split(os.environ.get(env) or default) + args, capture_output=True, text=True, **kw)
+
+
+def read_issue(n):
+    r = tool("TEAM_GH", "gh", ["issue", "view", str(n), "-R", REPO, "--json", "title,body"])
+    try:
+        d = json.loads(r.stdout)
+        return d["title"], d.get("body") or ""
+    except (ValueError, KeyError):
+        die(f"cannot read issue #{n} in {REPO}: {(r.stderr or r.stdout).strip()[:200]}")
+
+
+def cmd_start(argv, root=None):
+    root = root or WORKSPACE_ROOT   # recipes belong to the workspace, not the engine
+    pos, opt, dry = [], {}, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--dry-run":
+            dry = True
+        elif a in ("--repo", "--base", "--controller", "--liaison"):
+            if i + 1 >= len(argv):
+                die(f"{a} needs a value")
+            opt["--controller" if a == "--liaison" else a] = argv[i + 1]
+            i += 1
+        elif a.startswith("--"):
+            die(f"unknown flag {a}")
+        else:
+            pos.append(a)
+        i += 1
+    if len(pos) < 2:
+        die('usage: bin/team start <recipe> <initiative|"task"> [--repo R] [--base REF] [--controller NAME] [--dry-run]')
+    t = load_recipe(pos[0], root)
+    kind, target = parse_target(" ".join(pos[1:]))
+    controller = opt.get("--controller") or bb_env(None, "CONTROLLER", "SCH_LIAISON_SESSION")
+    if not controller:
+        die("controller session name required: --controller NAME or BUSYBODY_CONTROLLER")
+    issue, title, body = None, target, ""
+    if kind == "initiative":
+        issue = target
+        title, body = read_issue(issue)
+    head = t["head"]
+    if t["room"] == "staff":
+        launcher = os.environ.get("TEAM_ROLE_RUN") or os.path.join(ENGINE_ROOT, "bin", "role")
+        task = f"{title} (initiative #{issue})" if issue else title   # the pass issue is new; this is its link back
+        argv_out = [launcher, "run", head["role"], task, "--controller", controller, "--team", t["name"]]
+        repo = None
+    else:
+        repo = opt.get("--repo") or room_repo(body)
+        if not repo:
+            die("no repo: name one with --repo (the issue has no Room block repo)")
+        slug = slugify(title)
+        if not slug:
+            die("cannot derive a slug from the title: " + repr(title))
+        launcher = os.environ.get("TEAM_LEAD_START") or os.path.join(ENGINE_ROOT, "bin", "lead-start")
+        argv_out = [launcher, repo, slug, "--controller", controller]
+        if issue:
+            argv_out += ["--issue", str(issue)]
+        if opt.get("--base"):
+            argv_out += ["--base", opt["--base"]]
+        argv_out += ["--model", head["model"], "--team", t["name"]]
+    # a repo whose merge is "land" has no PRs: a team that opens draft PRs lands instead. The launcher reads that from office.json itself.
+    land = bool(repo) and t["draftPr"] and merge_mode(repo) == "land"
+    if dry:
+        print("DRY RUN: nothing is launched.")
+        print(f"recipe:   {t['name']} ({t['room']} room, head {head['role']} on {head['model']})")
+        print("target:   " + (f"initiative #{issue} {title!r}" if issue else f"task {title!r}"))
+        if repo:
+            print(f"repo:     {repo}")
+        print("command:  " + " ".join(shlex.quote(a) for a in argv_out))
+        print("powers (goes into the launch brief):")
+        print("\n".join("  " + ln for ln in powers_text(t, land).splitlines()))
+        return 0
+    return subprocess.run(argv_out).returncode
+
+
+# ------------------------------------------------------------------------------------------------
+# resolve
+
+TYPES = "PROGRESS|DECISION|BLOCKED|DONE|ANSWER|WAITING|NOTE|RECORD"
+HEADER_RE = re.compile(rf"^\s*\*\*({TYPES})\*\*\s*·\s*([^·\n]*?)\s*(?:·\s*(.*?))?\s*$", re.I)
+VERB_RE = re.compile(rf"^\s*({TYPES})\b[^:\n]*:\s*(.*)$", re.I)
+APPROVAL_RE = re.compile(rf"github\.com/{re.escape(REPO)}/issues/\d+#issuecomment-\d+")
+
+
+class Undecided(Exception):
+    pass
+
+
+def room_block(body):
+    """The `## Room` block's `- key: value` lines as a dict (empty when there is none)."""
+    sec = re.search(r"(?ms)^## Room\b.*?(?=^## |\Z)", body or "")
+    out = {}
+    for m in re.finditer(r"(?m)^[-*]\s*([\w-]+):\s*(.*?)\s*$", sec.group(0) if sec else ""):
+        out.setdefault(m.group(1), m.group(2).strip("`"))
+    return out
+
+
+def minute(comment):
+    """(type, who, summary, body, url) of a comment, or None when it is not a minute."""
+    body = comment.get("body") or ""
+    lines = body.splitlines()
+    if not lines:
+        return None
+    h = HEADER_RE.match(lines[0])
+    if h:
+        rest = [ln.strip() for ln in lines[1:] if ln.strip()]
+        return h.group(1).upper(), h.group(2).strip(), rest[0] if rest else "", body, comment.get("url", "")
+    v = VERB_RE.match(lines[0])
+    if v:
+        return v.group(1).upper(), "", v.group(2).strip(), body, comment.get("url", "")
+    return None
+
+
+def done_minute(comments, room):
+    """The latest DONE minute whose `who` is exactly the room's name. An old-style `DONE:` has no who, so it is never trusted:
+    anyone could have typed it."""
+    found = None
+    for c in comments:
+        m = minute(c)
+        if m and m[0] == "DONE" and room and m[1] == room:
+            found = m
+    return found
+
+
+def need_done(ctx):
+    if not ctx.get("room_name"):
+        raise Undecided("no Room block names the room, so no DONE minute can be trusted: pass --room NAME (the session name)")
+    return ctx["done"]
+
+
+def gh_json(args):
+    r = tool("TEAM_GH", "gh", args)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        raise Undecided(f"gh {' '.join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:150]}")
+
+
+def repo_dir(repo):
+    base = os.environ.get("TEAM_REPOS_DIR")
+    if OFFICE.is_workspace(repo) and not base:
+        return WORKSPACE_ROOT
+    return os.path.join(base or WORKSPACE_ROOT, repo)
+
+
+def check_pr_merged(ctx):
+    repo, branch = ctx["room"].get("repo"), ctx["room"].get("branch")
+    if not repo or not branch:
+        raise Undecided("the Room block names no repo and branch")
+    owner_repo = OFFICE.github(repo)
+    prs = gh_json(["pr", "list", "-R", owner_repo, "--head", branch, "--state", "all", "--json", "url,state"])
+    if not isinstance(prs, list):
+        raise Undecided("unexpected gh pr list output")
+    for pr in prs:
+        if pr.get("state") == "MERGED":
+            return True, f"{pr.get('url')} is merged"
+    return False, ("no PR for branch " + branch if not prs else "no merged PR for branch " + branch + ": " + ", ".join(f"{x.get('url')} {x.get('state')}" for x in prs))
+
+
+def check_verdict_posted(ctx):
+    m = need_done(ctx)
+    if not m:
+        return False, "no DONE minute from the room"
+    if m[2].startswith("Verdict:"):
+        return True, f"DONE minute {m[4] or '(no url)'} says: {m[2][:100]}"
+    return False, f"the DONE minute's summary line does not start with 'Verdict:' ({m[4] or 'no url'})"
+
+
+def branch_has_file(ctx, path):
+    """Whether `path` exists on the room's branch (local, else origin as last fetched)."""
+    repo, branch = ctx["room"].get("repo"), ctx["room"].get("branch")
+    if not repo or not branch:
+        raise Undecided("the Report: line names a path, but the Room block names no repo and branch to look it up on")
+    d = repo_dir(repo)
+    if not os.path.isdir(d):
+        raise Undecided(f"no local clone of {repo} at {d} to look {path} up in")
+    git = shlex.split(os.environ.get("TEAM_GIT") or "git") + ["-C", d]
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        if subprocess.run(git + ["rev-parse", "--verify", "-q", ref], capture_output=True).returncode == 0:
+            return subprocess.run(git + ["cat-file", "-e", f"{ref}:{path}"], capture_output=True).returncode == 0
+    raise Undecided(f"branch {branch} is not in {repo}, so {path} cannot be looked up")
+
+
+def check_report_posted(ctx):
+    m = need_done(ctx)
+    if not m:
+        return False, "no DONE minute from the room"
+    for ln in m[3].splitlines():
+        r = re.match(r"\s*Report:\s*(.*)$", ln)
+        if r:
+            url = re.search(r"https?://[^\s)>\]]+", r.group(1))
+            if url:
+                return True, f"DONE minute {m[4] or '(no url)'} links {url.group(0).rstrip('.,')}"
+            path = re.search(r"(?<![\w/.-])[\w.-]+(?:/[\w.-]+)*\.md\b", r.group(1))
+            if not path:
+                return False, "the Report: line holds no link"
+            if branch_has_file(ctx, path.group(0)):
+                return True, f"DONE minute {m[4] or '(no url)'} names {path.group(0)}, which exists on the room's branch"
+            return False, f"the Report: line names {path.group(0)}, which is not on the room's branch"
+    return False, "the DONE minute has no Report: line"
+
+
+def fetch_card(cid):
+    try:
+        return TRACKER.get(cid)
+    except TrackerError as e:
+        raise Undecided(str(e))
+
+
+DESIGN_RE = re.compile(r"(?mi)^\s*Design:\s*.*?(https://claude\.ai/(?:code/)?artifact/[\w-]+)")
+
+
+def check_card_has_design_link(ctx):
+    m = need_done(ctx)
+    if not m:
+        return False, "no DONE minute from the room"
+    if not TRACKER.enabled:
+        return True, f"DONE minute {m[4] or '(no url)'}; tracker is none, so the card is not checked"
+    ids = TRACKER.ids(m[3])
+    if not ids:
+        return False, f"the DONE minute names no {TRACKER.name} card URL"
+    good, bad = [], []
+    for cid in ids:
+        desc = fetch_card(cid)["description"]
+        d, a = DESIGN_RE.search(desc), APPROVAL_RE.search(desc)
+        if d and a:
+            good.append(f"{cid}: Design: line links {d.group(1)} with an approval link")
+        else:
+            bad.append(f"{cid}: " + ("no Design: line with a claude.ai artifact link" if not d else "no link to the owner's approval comment"))
+    return (False, "; ".join(bad + good)) if bad else (True, "; ".join(good))
+
+
+def check_ready_card(ctx):
+    m = need_done(ctx)
+    if not m:
+        return False, "no DONE minute from the room"
+    if not TRACKER.enabled:
+        return True, f"DONE minute {m[4] or '(no url)'}; tracker is none, so the card is not checked"
+    ids = TRACKER.ids(m[3])
+    if not ids:
+        return False, f"the DONE minute names no {TRACKER.name} card URL"
+    notes, bad = [], []
+    for cid in ids:
+        card = fetch_card(cid)
+        ready = any(lab.strip().lower() == "ready" for lab in card["labels"])
+        approved = bool(APPROVAL_RE.search(card["description"]))
+        (notes if ready and approved else bad).append(f"{cid}: " + ("Ready with an approval link" if ready and approved else
+                                                                  ("Ready label but no approval link" if ready else "no Ready label")))
+    if bad:
+        return False, "; ".join(bad + notes)
+    return True, "; ".join(notes)
+
+
+def check_landed(ctx):
+    repo, branch = ctx["room"].get("repo"), ctx["room"].get("branch")
+    if not repo or not branch:
+        raise Undecided("the Room block names no repo and branch")
+    d = repo_dir(repo)
+    if not os.path.isdir(d):
+        raise Undecided(f"no local clone of {repo} at {d}")
+    git = shlex.split(os.environ.get("TEAM_GIT") or "git") + ["-C", d]
+
+    def g(*a):
+        return subprocess.run(git + list(a), capture_output=True, text=True)
+
+    tip = None
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        r = g("rev-parse", "--verify", "-q", ref)
+        if r.returncode == 0:
+            tip, src = r.stdout.strip(), ref
+            break
+    if not tip:
+        raise Undecided(f"branch {branch} is not in {repo} (locally or on origin as last fetched)")
+    # A branch with no commits of its own sits on an old main commit and would pass the ancestor test: the oldest
+    # reflog entry is where the branch was created, so the tip must differ from it.
+    first = [x for x in g("reflog", "show", "--format=%H", src).stdout.split() if x]
+    if not first:
+        raise Undecided(f"{src} has no reflog, so its creation point is unknown")
+    if first[-1] == tip:
+        return False, f"{src} ({tip[:7]}) has no commits of its own (still at the commit it was created from)"
+    targets = ["refs/heads/main"]
+    if g("remote", "get-url", "origin").returncode == 0:
+        targets.append("refs/remotes/origin/main")
+    for ref in targets:
+        if g("rev-parse", "--verify", "-q", ref).returncode:
+            raise Undecided(f"{ref} does not exist in {repo}")
+        if g("merge-base", "--is-ancestor", tip, ref).returncode != 0:
+            return False, f"{src} ({tip[:7]}) is not an ancestor of {ref.replace('refs/heads/', '').replace('refs/remotes/', '')}"
+    return True, f"{src} ({tip[:7]}) is an ancestor of " + " and ".join(t.replace("refs/heads/", "").replace("refs/remotes/", "") for t in targets)
+
+
+def merge_mode(repo):
+    """The repo's `merge` from office.json ("pr" or "land"); a repo without one stops the command with one line."""
+    try:
+        return OFFICE.merge(repo)
+    except officeconfig.ConfigError as e:
+        die(str(e))
+
+
+def effective_check(t, repo):
+    """The recipe's done check, except in this repo (no PRs): a recipe that opens draft PRs lands here instead, as bin/team start
+    arranges, so it is `landed` and never `pr-merged`."""
+    if t["draftPr"] and repo in OFFICE.repos and merge_mode(repo) == "land":   # a repo office.json does not list has no merge mode: PRs
+        return "landed"
+    return t["done"]["check"]
+
+
+RESOLVERS = {"pr-merged": check_pr_merged, "verdict-posted": check_verdict_posted, "ready-card": check_ready_card,
+             "report-posted": check_report_posted, "landed": check_landed,
+             "card-has-design-link": check_card_has_design_link}
+
+
+CHECKS = tuple(RESOLVERS)
+
+
+def cmd_resolve(argv, root=None):
+    root = root or WORKSPACE_ROOT   # recipes belong to the workspace, not the engine
+    pos, override, room_opt, i, close = [], None, None, 0, False
+    while i < len(argv):
+        if argv[i] == "--close":
+            close = True
+        elif argv[i] in ("--check", "--room"):
+            if i + 1 >= len(argv):
+                die(f"{argv[i]} needs a value", 2)
+            if argv[i] == "--check":
+                override = argv[i + 1]
+            else:
+                room_opt = argv[i + 1]
+            i += 1
+        elif argv[i].startswith("--"):
+            die(f"unknown flag {argv[i]}", 2)
+        else:
+            pos.append(argv[i])
+        i += 1
+    kind, n = parse_target(" ".join(pos))
+    if len(pos) != 1 or kind != "initiative":
+        die("usage: bin/team resolve <initiative> [--check NAME] [--room NAME] [--close]", 2)
+    if override and override not in CHECKS:
+        die(f"unknown check {override}; one of: " + ", ".join(CHECKS), 2)
+    check = override
+    try:
+        r = tool("TEAM_GH", "gh", ["issue", "view", str(n), "-R", REPO, "--json", "title,body,comments"])
+        try:
+            issue = json.loads(r.stdout)
+        except ValueError:
+            raise Undecided(f"cannot read issue #{n}: {(r.stderr or r.stdout).strip()[:150]}")
+        room = room_block(issue.get("body"))
+        if not check:
+            if not room:
+                raise Undecided("the issue has no Room block, so no recipe: name a check with --check")
+            team = room.get("team") or "dev-team"
+            errs, t = validate(root, team) if os.path.isdir(os.path.join(root, "teams", team)) else (["no such recipe"], None)
+            if errs:
+                raise Undecided(f"recipe {team} cannot be read ({'; '.join(errs)}): name a check with --check")
+            check = effective_check(t, room.get("repo"))
+        comments = issue.get("comments") or []
+        name = room.get("room") or room_opt   # the Room block wins: --room only names a pass session when there is no block
+        ctx = {"room": room, "room_name": name, "done": done_minute(comments, name), "comments": comments}
+        ok, evidence = RESOLVERS[check](ctx)
+    except Undecided as e:
+        print(f"UNDECIDED {check or '?'} on #{n}: {e}")
+        return 2
+    print(f"{'PASS' if ok else 'FAIL'} {check} on #{n}: {evidence}")
+    if ok and close and name and not close_session(name):
+        return 3   # the check passed but the session is still running: fail loudly
+    return 0 if ok else 1
+
+
+def close_session(name):
+    """--close, after a PASS: `claude stop`, then end the room's process itself (it may be running although stop finds no job)."""
+    import sessions
+    try:
+        r = tool("TEAM_CLAUDE", "claude", ["stop", name], timeout=60)
+        print(f"claude stop {name}: " + ("ok" if r.returncode == 0 else ((r.stderr or r.stdout).strip().splitlines() or [f"exit {r.returncode}"])[0][:120]))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"claude stop {name}: did not run ({type(e).__name__})")
+    try:
+        ok, lines = sessions.end(name)
+    except ValueError as e:
+        print(f"end-session: {e}")
+        return False
+    print("\n".join(lines) + ("" if ok else f"\n(end it by hand: {os.path.join(ENGINE_ROOT, 'bin', 'end-session')} {name})"))
+    return ok
+
+
+def brief_part(t, part, land_override=False):
+    """Lines of templates/lead-brief.md that depend on the recipe, so the brief never contradicts the powers text."""
+    draft = t["draftPr"] and not land_override
+    if part == "commit":
+        if t["worktree"]:
+            return "- Commit, and push the room's branch `@BRANCH@` (and only branches you created for this room)."
+        return "- This team makes no repo changes: do not commit or push. Your output is the minutes."
+    if part == "prs":
+        if draft:
+            return ("- Open any other PR only if the issue says so. If the work splits into several PRs, open them as a **draft\n"
+                    "  stack** up front per `decisions/2026-10-07-stacked-prs.md`: one worker per branch, update by\n"
+                    "  `git merge origin/<parent>` (never rebase or force-push), and never mark ready.")
+        return "- Open no PR of any kind, not even a draft or a stack. If the work needs one, ask with a `DECISION:` sticky note."
+    if part == "prlimit":
+        if draft:
+            return ("opening a PR that is not a draft (a dev team's draft, or a stack draft, is allowed; unless the issue says otherwise); "
+                    "marking ready; merging, ever")
+        return "opening any PR; marking ready; merging, ever"
+    die(f"unknown brief part {part}; one of commit, prs, prlimit")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 1
+    if argv[0] == "--self-test":
+        return self_test()
+    if argv[0] == "check":
+        return check(WORKSPACE_ROOT, argv[1:])
+    if argv[0] == "resolve":
+        return cmd_resolve(argv[1:])
+    if argv[0] == "start":
+        return cmd_start(argv[1:])
+    if argv[0] == "brief":
+        names = [a for a in argv[1:] if not a.startswith("--")]
+        if len(names) != 2:
+            die("usage: bin/team brief <recipe> commit|prs|prlimit [--land]")
+        print(brief_part(load_recipe(names[0]), names[1], "--land" in argv))
+        return 0
+    if argv[0] == "powers":
+        names = [a for a in argv[1:] if not a.startswith("--")]
+        if len(names) != 1:
+            die("usage: bin/team powers <recipe> [--land]")
+        print(powers_text(load_recipe(names[0]), "--land" in argv))
+        return 0
+    die(f"unknown command {argv[0]}; see bin/team --help")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# bin/status --self-test: the engine's own cases, offline, on a made-up acme workspace (a stub gh, a throwaway clone, one evidence
+# executable). A workspace's own evidence rules are tested in that workspace.
+set -uo pipefail
+ENGINE_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+WSX="$T/ws"; STUB="$T/stub"; mkdir -p "$WSX/evidence" "$WSX/acme-api" "$STUB"
+git init -q -b main "$WSX/acme-api"
+cat > "$WSX/office.json" <<'JSON'
+{"minutesRepo": "acme-co/acme-office", "workspaceRepo": "acme-office",
+ "repos": {"acme-office": {"evidence": null}, "acme-api": {"evidence": "gate"}}}
+JSON
+cat > "$WSX/evidence/gate" <<'SH'
+#!/usr/bin/env bash
+[[ "$1" == aaa ]] && { echo "PASS gate open for $BUSYBODY_REPO ($OFFICE_GITHUB)"; exit 0; }
+echo "WAIT gate closed"; echo "has: a merge"; exit 1
+SH
+chmod +x "$WSX/evidence/gate"
+cat > "$STUB/gh" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") m=aaa; [[ "$3" == 3 ]] && m=bbb
+             echo "{\"state\":\"MERGED\",\"isDraft\":false,\"title\":\"PR $3\",\"mergeCommit\":{\"oid\":\"$m\"},\"headRefOid\":\"h\",\"files\":[],\"statusCheckRollup\":[]}" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$STUB/gh"
+body="$T/body.md"
+printf '## Steps\n1. a: https://github.com/acme-co/acme-office/pull/1\n2. b: https://github.com/acme-co/acme-api/pull/2\n3. c: https://github.com/acme-co/acme-api/pull/3\n' > "$body"
+run() { (cd "$T" && env -u OFFICE_WORKSPACE -u OFFICE_CONFIG -u BUSYBODY_CONFIG BUSYBODY_WORKSPACE="$WSX" PATH="$STUB:$PATH" "$ENGINE_ROOT/bin/status" --from-file "$@" 2>&1); }
+bad=0
+got="$(run "$body")"
+for want in "acme-office#1 deployed (merged)" "acme-api#2 deployed (gate open for acme-api (acme-co/acme-api))" "acme-api#3 merged, NOT deployed: missing gate closed (has a merge)"; do
+  grep -qF "$want" <<<"$got" || { echo "status self-test: FAILED: want '$want' in:"; echo "$got"; bad=1; }
+done
+got="$(cd "$T" && env -u OFFICE_WORKSPACE -u OFFICE_CONFIG BUSYBODY_CONFIG=/nonexistent BUSYBODY_WORKSPACE="$WSX" PATH="$STUB:$PATH" "$ENGINE_ROOT/bin/status" 2>&1)"
+[[ "$got" == 'status: no minutesRepo: run `busybody init`' ]] || { echo "status self-test: FAILED: no minutesRepo: $got"; bad=1; }
+((bad)) && exit 1
+echo "status self-test: ok"

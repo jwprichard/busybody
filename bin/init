@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# Set up a workspace folder for the Busybody engine (runs as `busybody init`). Non-interactive; never pushes.
+#
+#   busybody init [DIR] --minutes-repo OWNER/NAME [--name DISPLAYNAME] [--engine PATH] [--tracker none] [--create] [--dry-run]
+#   busybody init --self-test
+#
+# DIR (default: the cwd) is the workspace folder: a git repo, `git init`ed when it is not one yet. OWNER/NAME is its GitHub repo,
+# whose issues are the minutes. An existing repo is only CHECKED (issues must be enabled, else init refuses); --create makes it
+# (`gh repo create --private`) and is the only way init creates anything on GitHub. --engine PATH is the engine checkout the shim
+# runs (default: the engine this script lives in); it must be INSIDE DIR (a plugin cannot load from outside its marketplace folder),
+# so clone it there first: git clone <engine repo url> DIR/busybody. DIR must not sit inside another git repo. Writes, each skipped when it already exists as wanted:
+#   office.json                     minutesRepo, the workspace repo alone, tracker, room rules. Never overwritten.
+#   bin/busybody                    the shim: runs <engine>/bin/busybody (the plugin root is not in Bash, so the path is written here)
+#   .claude-plugin/marketplace.json the workspace's local marketplace, its one plugin being the engine
+#   .claude/settings.json           merged, never clobbered, portable: enabledPlugins and a small permissions.deny
+#   .claude/settings.local.json     merged, gitignored: this machine's marketplace path
+#   .git/hooks/pre-push             the seatbelt (a room worktree never pushes main); left alone when core.hooksPath is set
+#   .gitignore                      the engine's per-machine files
+#   CLAUDE.md                       from templates/workspace-CLAUDE.md, only when absent
+#   teams/dev-team, teams/mad       the default team recipes (templates/teams), each only when absent: a room cannot launch without one
+# and, on GitHub, the `initiative` label on the minutes repo when it is missing (the one GitHub write besides --create).
+# A second run changes nothing and says so. --dry-run prints what would be written and writes nothing.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ENGINE_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+die() { printf 'init: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+# --- JSON writers: one python helper per file, each prints created | updated | unchanged ----------------------------------
+# $1 = mode, then its arguments; the last argument is always DRY (1 = write nothing).
+py() {
+  python3 -I - "$@" <<'PY'
+import json, os, re, sys
+
+def write(path, text, dry):
+    old = open(path).read() if os.path.exists(path) else None
+    if old == text:
+        return "unchanged"
+    if not dry:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+    return "created" if old is None else "updated"
+
+def load(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        d = json.load(open(path))
+    except ValueError:
+        sys.exit(f"init: {path} is not valid JSON: fix it or move it aside")
+    if not isinstance(d, dict):
+        sys.exit(f"init: {path} must hold a JSON object")
+    return d
+
+def dump(d):
+    return json.dumps(d, indent=2) + "\n"
+
+# What a workspace session may never do. Plugin settings cannot carry deny rules, so they live here at project scope.
+# Kept small and generic; a workspace adds its own. The pre-push hook is the second layer for pushes.
+DENY = [
+    "Bash(git push *--force*)", "Bash(git push -f*)", "Bash(git push * -f*)", "Bash(git push *+*)",    # history rewrites
+    "Bash(git *--no-verify*)",                                                                          # skipping hooks
+    # switching the pre-push seatbelt off: setting core.hooksPath (reading it, `git config --get core.hooksPath`, stays allowed)
+    "Bash(git config *hooksPath *)", "Bash(git config *hooksPath=*)", "Bash(git -c *hooksPath*)",
+    "Bash(gh pr merge*)", "Bash(gh pr ready*)", "Bash(gh pr * --admin*)",                               # the owner merges and promotes
+]
+
+mode, args = sys.argv[1], sys.argv[2:]
+dry = args.pop() == "1"
+if mode == "office":
+    path, repo_name, minutes, display = args
+    if os.path.exists(path):
+        print("unchanged")
+    else:
+        cfg = {
+            "minutesRepo": minutes,
+            "workspaceRepo": repo_name,
+            "displayName": display,
+            "repos": {repo_name: {"path": ".", "github": minutes, "branchPrefix": "feat/", "noPush": ["main"], "merge": "land"}},
+            "tracker": {"type": "none"},
+            "room": {"env": {}, "deny": [], "prodRead": [], "portBase": 41000},
+            "ownerOnly": ["anything touching prod", "merging, ever", "spending over the cap"],
+        }
+        print(write(path, dump(cfg), dry))
+elif mode == "market":   # a plugin source must be a "./" path inside the marketplace, so `engine` is a path under the workspace
+    path, name, engine, ws = args
+    d = load(path)
+    d.setdefault("name", name)
+    d.setdefault("owner", {"name": "workspace"})
+    d.setdefault("description", "This workspace's local marketplace: the Busybody engine, loaded in place.")
+    rel = os.path.relpath(engine, ws)
+    src = "./" + rel
+    plugins = d.setdefault("plugins", [])
+    if not any(isinstance(p, dict) and p.get("name") == "busybody" for p in plugins):
+        plugins.append({"name": "busybody", "source": src, "description": "Busybody: the office engine."})
+    print(write(path, dump(d), dry))
+elif mode == "marketname":   # the marketplace name already in the file, else the one given
+    path, name = args
+    print(load(path).get("name") or name)
+elif mode == "localsettings":   # the machine-specific half, gitignored: the marketplace is an absolute path
+    path, name, ws = args
+    d = load(path)
+    d.setdefault("extraKnownMarketplaces", {}).setdefault(name, {"source": {"source": "directory", "path": ws}})
+    print(write(path, dump(d), dry))
+elif mode == "settings":   # the committed, portable half: no absolute path, no env (scripts walk up to office.json)
+    path, name = args
+    d = load(path)
+    d.setdefault("enabledPlugins", {}).setdefault(f"busybody@{name}", True)
+    perms = d.setdefault("permissions", {})
+    deny = perms.setdefault("deny", [])
+    deny += [x for x in DENY if x not in deny]
+    print(write(path, dump(d), dry))
+elif mode == "minutes":   # the minutesRepo of an existing office.json (empty when absent)
+    print(load(args[0]).get("minutesRepo", ""))
+PY
+}
+
+# --- the self-test: a fresh install in a scratch directory with a stub gh --------------------------------------------------
+self_test() {
+  local bad=() out rc rc2 W before after; T=""
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE BUSYBODY_WORKSPACE BUSYBODY_CONFIG OFFICE_WORKSPACE OFFICE_CONFIG
+  mkdir -p "$T/stub"
+  # the stub gh: `api repos/*` answers $GH_STUB (true | false | fail); `repo create` is recorded; anything else is an error
+  cat > "$T/stub/gh" <<'EOS'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "api repos/"*) [[ "${GH_STUB:-true}" == fail ]] && { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo "${GH_STUB:-true}" ;;
+  "repo create") echo "$*" >> "$GH_LOG" ;;
+  "label list"|"label create")   # labels are kept per repo in $T/labels.<repo>; `-R <repo>` names it
+    repo=""; for ((i = 1; i <= $#; i++)); do [[ "${!i}" == -R ]] && { j=$((i + 1)); repo="${!j}"; }; done
+    f="${GH_LABELS_DIR}/labels.${repo//\//_}"
+    if [[ "$2" == list ]]; then cat "$f" 2>/dev/null || true; else echo "$3" >> "$f"; fi ;;
+  *) echo "stub gh: unexpected: $*" >&2; exit 1 ;;
+esac
+EOS
+  chmod +x "$T/stub/gh"
+  export GH_LOG="$T/gh.log" GH_LABELS_DIR="$T"; : > "$GH_LOG"
+  PATH="$T/stub:$PATH"
+  run() { rc=0; out="$("$SELF" "$@" 2>&1)" || rc=$?; }
+  snap() { (cd "$1" && find . -path ./.git -prune -o -path ./busybody -prune -o -type f -print0 | sort -z | xargs -0 cksum; cksum .git/hooks/pre-push .git/config 2>/dev/null); }
+  # a scratch workspace folder holding a clone of the engine (a copy with its own .git), as a real install does
+  ws() { W="$T/$1"; mkdir -p "$W"; cp -a "$ENGINE_ROOT" "$W/busybody"; git -C "$W/busybody" init -q -b main; }
+
+  # issues off: refuses, writes nothing
+  ws off; GH_STUB=false run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ $rc != 0 && "$out" == *"issues are disabled"* && ! -e "$W/office.json" && ! -e "$W/.git" ]] || bad+=("issues-off: rc=$rc $out")
+  # unreachable: refuses
+  ws gone; GH_STUB=fail run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ $rc != 0 && "$out" == *"cannot reach"* && ! -e "$W/office.json" ]] || bad+=("unreachable: rc=$rc $out")
+  # missing --minutes-repo is usage
+  ws nomin; run "$W" --engine "$W/busybody"
+  [[ $rc != 0 && "$out" == *"--minutes-repo"* && ! -e "$W/office.json" ]] || bad+=("no-minutes-flag: rc=$rc $out")
+  # an engine outside the workspace is refused with the clone instruction
+  mkdir "$T/outside"; run "$T/outside" --minutes-repo acme-co/acme-office --engine "$ENGINE_ROOT"
+  [[ $rc != 0 && "$out" == *"git clone"* && -z "$(ls -A "$T/outside")" ]] || bad+=("engine-outside: rc=$rc $out")
+  # a folder inside another repo is refused, whether it exists or not
+  git init -q -b main "$T/outer"; mkdir "$T/outer/sub"
+  run "$T/outer/sub" --minutes-repo acme-co/acme-office; [[ $rc != 0 && "$out" == *"inside another git repo"* ]] || bad+=("nested-existing: rc=$rc $out")
+  run "$T/outer/new" --minutes-repo acme-co/acme-office; [[ $rc != 0 && "$out" == *"inside another git repo"* && ! -e "$T/outer/new" ]] || bad+=("nested-new: rc=$rc $out")
+
+  # dry run: prints, writes nothing
+  ws dry; run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody" --dry-run
+  [[ $rc == 0 && "$out" == *"would create: "*office.json* && "$(ls -A "$W")" == busybody ]] || bad+=("dry-run: rc=$rc $out")
+
+  # fresh install over pre-existing settings, with a display name that needs escaping
+  ws acme-office; mkdir -p "$W/.claude"
+  cat > "$W/.claude/settings.json" <<'EOS'
+{"model": "keep-me", "permissions": {"allow": ["Bash(ls)"], "deny": ["Bash(mine)"]}, "env": {"MINE": "1"}}
+EOS
+  NAME_Q='Acme "Pty" O'"'"'Brien & Co'
+  run "$W" --minutes-repo acme-co/acme-office --name "$NAME_Q" --engine "$W/busybody"
+  [[ $rc == 0 ]] || bad+=("install: rc=$rc $out")
+  python3 -I "$ENGINE_ROOT/bin/lib/officeconfig.py" --workspace "$W" check >/dev/null 2>&1 || bad+=("office.json fails officeconfig check")
+  [[ "$(python3 -I "$ENGINE_ROOT/bin/lib/officeconfig.py" --workspace "$W" get acme-office merge 2>&1)" == land \
+     && "$(python3 -I "$ENGINE_ROOT/bin/lib/officeconfig.py" --workspace "$W" display-name 2>&1)" == "$NAME_Q" ]] || bad+=("office.json content")
+  [[ "$("$W/bin/busybody" help 2>&1)" == *"  init"* ]] || bad+=("shim does not run busybody help")
+  [[ "$(cat "$T/labels.acme-co_acme-office" 2>/dev/null)" == initiative ]] || bad+=("the initiative label was not created")
+  BUSYBODY_WORKSPACE="$W" "$W/bin/busybody" team check >/dev/null 2>&1 && [[ -f "$W/teams/dev-team/team.json" && -f "$W/teams/mad/team.json" ]] || bad+=("the seeded team recipes fail team check")
+  grep -qF "$W/busybody/bin/busybody" "$W/bin/busybody" || bad+=("shim does not record the engine path")
+  grep -qxF "/busybody" "$W/.gitignore" || bad+=("the engine clone is not gitignored")
+  python3 -I - "$W" <<'PY' || bad+=("settings merge")
+import json, sys
+w = sys.argv[1]
+s = json.load(open(w + "/.claude/settings.json"))
+assert s["model"] == "keep-me" and s["env"] == {"MINE": "1"} and "extraKnownMarketplaces" not in s
+assert s["permissions"]["allow"] == ["Bash(ls)"] and s["permissions"]["deny"][0] == "Bash(mine)"
+assert "Bash(gh pr merge*)" in s["permissions"]["deny"] and "Bash(git push *--force*)" in s["permissions"]["deny"]
+assert s["enabledPlugins"] == {"busybody@acme-office": True}
+assert "Bash(git push -f*)" in s["permissions"]["deny"] and not any("core.hooksPath*" in x for x in s["permissions"]["deny"])
+assert w not in json.dumps(s)   # nothing machine-specific in the committed file
+l = json.load(open(w + "/.claude/settings.local.json"))
+assert l["extraKnownMarketplaces"]["acme-office"]["source"] == {"source": "directory", "path": w}
+m = json.load(open(w + "/.claude-plugin/marketplace.json"))
+assert m["name"] == "acme-office" and m["plugins"][0]["name"] == "busybody" and m["plugins"][0]["source"] == "./busybody"
+PY
+  [[ "$(head -1 "$W/CLAUDE.md")" == "# $NAME_Q workspace (control room)" ]] && ! grep -q '{{' "$W/CLAUDE.md" || bad+=("CLAUDE.md: display name not substituted")
+  # the generic files carry nothing from any one organisation (the SCH_* alias names in engine/CLAUDE.md are the exception)
+  leak=0; grep -nE 'SCH([^_]|$)|sch-|Trello' "$ENGINE_ROOT/templates/workspace-CLAUDE.md" "$ENGINE_ROOT/CLAUDE.md" >/dev/null 2>&1 || leak=$?
+  [[ $leak == 1 ]] || bad+=("workspace template or engine/CLAUDE.md names SCH or Trello, or is missing (grep rc=$leak)")
+  grep -qxF "/.cache/" "$W/.gitignore" && grep -qxF ".claude/settings.local.json" "$W/.gitignore" || bad+=(".gitignore")
+  [[ -x "$W/.git/hooks/pre-push" && "$(grep -c '^MERGE="land"' "$W/.git/hooks/pre-push")" == 1 ]] || bad+=("hook not installed")
+  # the install really loads: the manifest validates and the plugin installs and shows enabled (needs the claude CLI)
+  if command -v claude >/dev/null; then
+    out="$(CLAUDE_CONFIG_DIR="$T/cc" claude plugin validate "$W" 2>&1)" || bad+=("claude plugin validate: $out")
+    out="$(cd "$W" && CLAUDE_CONFIG_DIR="$T/cc" bash -c 'claude plugin marketplace add ./ --scope user && claude plugin install busybody@acme-office --scope user && claude plugin list' 2>&1)" || bad+=("plugin install: $out")
+    [[ "$out" == *"busybody@acme-office"* && "$out" == *"enabled"* && "$out" == *"$W/busybody"* ]] || bad+=("plugin not enabled from the clone: $out")
+  else echo "init self-test: NOTE: claude CLI not found, skipping the plugin load check" >&2; fi
+  # second run: a no-op that says so
+  before="$(snap "$W")"; run "$W" --minutes-repo acme-co/acme-office --name "$NAME_Q" --engine "$W/busybody"; after="$(snap "$W")"
+  [[ $rc == 0 && "$out" == *"nothing to change"* && "$before" == "$after" ]] || bad+=("second run: rc=$rc $out")
+
+  # the hook: a room worktree may not push main, may push its own branch; the lander (BUSYBODY_LAND=1) may push main
+  git init -q --bare -b main "$T/bare.git"
+  git -C "$W" remote set-url origin "$T/bare.git" 2>/dev/null || git -C "$W" remote add origin "$T/bare.git"
+  git -C "$W" add -A; git -C "$W" commit -q -m base
+  git -C "$W" worktree add -q "$W/.claude/worktrees/room-x" -b feat/x
+  rc=0; out="$(git -C "$W/.claude/worktrees/room-x" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc != 0 && "$out" == *"pre-push seatbelt"* ]] || bad+=("hook let a room push main: rc=$rc $out")
+  rc=0; out="$(git -C "$W/.claude/worktrees/room-x" push origin HEAD:feat/x 2>&1)" || rc=$?
+  [[ $rc == 0 ]] || bad+=("hook blocked a room's own branch: rc=$rc $out")
+  rc=0; out="$(BUSYBODY_LAND=1 git -C "$W/.claude/worktrees/room-x" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc == 0 ]] || bad+=("hook blocked the lander: rc=$rc $out")
+
+  # an existing office.json is never overwritten
+  ws adopt; printf '{"minutesRepo": "acme-co/acme-office", "workspaceRepo": "adopt", "extra": 1}\n' > "$W/office.json"
+  before="$(cksum < "$W/office.json")"; run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ $rc == 0 && "$(cksum < "$W/office.json")" == "$before" && -x "$W/bin/busybody" ]] || bad+=("adopt: rc=$rc $out")
+  # ... and its minutes repo is used when the flag is omitted, but a conflicting flag is refused
+  run "$W" --minutes-repo other-co/other --engine "$W/busybody"
+  [[ $rc != 0 && "$out" == *"minutesRepo"* ]] || bad+=("adopt-conflict: rc=$rc $out")
+
+  # an adopted config wins: the hook takes the workspace repo's noPush and merge from office.json
+  ws adopt-hook; printf '{"minutesRepo": "acme-co/acme-office", "workspaceRepo": "adopt-hook", "repos": {"adopt-hook": {"path": ".", "branchPrefix": "", "noPush": ["release"], "merge": "pr"}}}\n' > "$W/office.json"
+  run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ $rc == 0 && "$(grep -c '^PROTECTED="main release"' "$W/.git/hooks/pre-push")" == 1 && "$(grep -c '^MERGE="pr"' "$W/.git/hooks/pre-push")" == 1 ]] || bad+=("hook tokens from config: rc=$rc $out")
+  # a foreign pre-push hook is kept as pre-push.chained and still runs
+  ws chain; git -C "$W" init -q -b main; mkdir -p "$W/.git/hooks"
+  printf '#!/bin/sh\ncat >/dev/null\ntouch "$FOREIGN_RAN"\n' > "$W/.git/hooks/pre-push"; chmod +x "$W/.git/hooks/pre-push"
+  run "$W" --minutes-repo acme-co/chain --engine "$W/busybody"
+  git init -q --bare -b main "$T/chain.git"; git -C "$W" remote set-url origin "$T/chain.git"; git -C "$W" add -A; git -C "$W" commit -q -m base
+  rc2=0; FOREIGN_RAN="$T/foreign.ran" git -C "$W" push -q origin HEAD:feat/y 2>/dev/null || rc2=$?
+  [[ $rc == 0 && -x "$W/.git/hooks/pre-push.chained" && $rc2 == 0 && -e "$T/foreign.ran" ]] || bad+=("foreign hook not chained: rc=$rc rc2=$rc2 $out")
+
+  # core.hooksPath set: no hook, a note, still ok
+  ws hp; git -C "$W" init -q -b main; git -C "$W" config core.hooksPath "$T/elsewhere"
+  run "$W" --minutes-repo acme-co/hp --engine "$W/busybody"
+  [[ $rc == 0 && "$out" == *"core.hooksPath"* && ! -e "$W/.git/hooks/pre-push" ]] || bad+=("hooksPath: rc=$rc $out")
+
+  # --create runs gh repo create (private) and nothing else on GitHub
+  ws created; : > "$GH_LOG"; GH_STUB=fail run "$W" --minutes-repo acme-co/created --create --engine "$W/busybody"
+  [[ $rc == 0 && "$(cat "$GH_LOG")" == "repo create acme-co/created --private --source $W --remote origin" ]] || bad+=("create: rc=$rc $out $(cat "$GH_LOG")")
+  # ... and is idempotent: the repo now exists, so a second --create creates nothing
+  : > "$GH_LOG"; run "$W" --minutes-repo acme-co/created --create --engine "$W/busybody"
+  [[ $rc == 0 && ! -s "$GH_LOG" ]] || bad+=("create twice: rc=$rc $out $(cat "$GH_LOG")")
+  # ... and does not create the repo when a later step would refuse (here: a pre-push hook and its .chained both exist)
+  ws late; git -C "$W" init -q -b main; mkdir -p "$W/.git/hooks"; echo x > "$W/.git/hooks/pre-push"; echo x > "$W/.git/hooks/pre-push.chained"
+  : > "$GH_LOG"; GH_STUB=fail run "$W" --minutes-repo acme-co/late --create --engine "$W/busybody"
+  [[ $rc != 0 && ! -s "$GH_LOG" ]] || bad+=("create before a refusal: rc=$rc $out $(cat "$GH_LOG")")
+
+  if ((${#bad[@]})); then printf 'init self-test: FAILED: %s\n' "$(IFS=';'; echo "${bad[*]}")"; return 1; fi
+  echo "init self-test: ok"
+}
+
+# --- arguments --------------------------------------------------------------------------------------------------------------
+DIR="" MINUTES="" NAME="" ENGINE="" TRACKER=none CREATE=0 DRY=0
+while (($#)); do
+  case "$1" in
+    --self-test) self_test; exit $? ;;
+    --minutes-repo) MINUTES="${2:?--minutes-repo needs OWNER/NAME}"; shift 2 ;;
+    --name) NAME="${2:?}"; shift 2 ;;
+    --engine) ENGINE="${2:?}"; shift 2 ;;
+    --tracker) TRACKER="${2:?}"; shift 2 ;;
+    --create) CREATE=1; shift ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag $1" ;;
+    *) [[ -z "$DIR" ]] || die "one DIR only"; DIR="$1"; shift ;;
+  esac
+done
+[[ "$TRACKER" == none ]] || die "--tracker: only 'none' is supported for now (edit office.json by hand for a tracker)"
+for c in git python3; do command -v "$c" >/dev/null || die "$c not installed"; done
+
+DIR="${DIR:-$PWD}"
+if [[ -d "$DIR" ]]; then DIR="$(cd "$DIR" && pwd -P)"; else DIR="$(cd "$(dirname "$DIR")" 2>/dev/null && pwd -P)/$(basename "$DIR")" || die "the parent of $DIR does not exist"; fi
+FOLDER="$(basename "$DIR")"
+[[ "$FOLDER" =~ ^[A-Za-z0-9._-]+$ ]] || die "the folder name '$FOLDER' must be letters, digits, dot, dash or underscore (it names the workspace repo)"
+# DIR must be a git root or sit outside every repo: init never creates a repo nested in another
+PROBE="$DIR"; [[ -d "$PROBE" ]] || PROBE="$(dirname "$DIR")"
+TOP="$(git -C "$PROBE" rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -z "$TOP" || "$TOP" == "$DIR" ]] || die "$DIR is inside another git repo ($TOP): give init that repo's root or a folder outside it"
+
+# the engine must sit inside the workspace: a plugin source cannot leave its marketplace folder (a link out is refused at load)
+ENGINE="$(cd "${ENGINE:-$ENGINE_ROOT}" 2>/dev/null && pwd -P)" || die "--engine: no such directory"
+for f in bin/busybody bin/lib/pre-push-seatbelt templates/workspace-CLAUDE.md; do [[ -e "$ENGINE/$f" ]] || die "$ENGINE is not an engine checkout (no $f)"; done
+[[ -x "$ENGINE/bin/busybody" ]] || die "$ENGINE/bin/busybody is not executable"
+[[ "$ENGINE" != "$DIR" && "$ENGINE/" == "$DIR/"* ]] || die "the engine at $ENGINE is outside the workspace $DIR: clone it into the workspace folder first (git clone <engine repo url> $DIR/busybody), then rerun with --engine $DIR/busybody"
+ENGINE_REL="${ENGINE#"$DIR"/}"
+
+# an existing office.json names the minutes repo when the flag is left out, and must not disagree with it
+if [[ -f "$DIR/office.json" ]]; then
+  HAVE="$(py minutes "$DIR/office.json" 0)"
+  [[ -n "$MINUTES" ]] || MINUTES="$HAVE"
+  [[ -z "$HAVE" || "$HAVE" == "$MINUTES" ]] || die "$DIR/office.json has minutesRepo $HAVE but --minutes-repo says $MINUTES: change one of them"
+fi
+[[ -n "$MINUTES" ]] || die "--minutes-repo OWNER/NAME is required (the GitHub repo whose issues are this workspace's minutes)"
+[[ "$MINUTES" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || die "--minutes-repo must be OWNER/NAME"
+NAME="${NAME:-$FOLDER}"
+
+CHANGED=0
+report() { # state path: the first word is what was (or, in a dry run, would be) done
+  case "$1" in
+    unchanged) say "  unchanged: $2" ;;
+    *) CHANGED=1; if ((DRY)); then say "  would ${1%d}: $2"; else say "  $1: $2"; fi ;;
+  esac
+}
+
+# 1. GitHub, read-only: the repo must exist with issues on. --create only plans to make a missing one (done last, once every other step has passed) --
+command -v gh >/dev/null || die "gh not installed"
+NEED_CREATE=0
+if out="$(gh api "repos/$MINUTES" --jq .has_issues 2>&1)"; then
+  [[ "$out" == true ]] || die "issues are disabled on $MINUTES: enable them (repo Settings, Features, Issues); the minutes are its issues"
+elif ((CREATE)); then NEED_CREATE=1
+else die "cannot reach $MINUTES on GitHub ($out): check the name and your gh login, or pass --create"; fi
+
+# 2. the folder and its git repo -----------------------------------------------------------------------------------------------
+if [[ ! -e "$DIR/.git" ]]; then
+  if ((DRY)); then say "  would create: $DIR as a git repo"; else mkdir -p "$DIR"; git -C "$DIR" init -q -b main; say "  created: $DIR as a git repo"; fi
+  CHANGED=1
+fi
+if [[ -e "$DIR/.git" ]] && ((!NEED_CREATE)) && ! git -C "$DIR" remote get-url origin >/dev/null 2>&1; then
+  if ((DRY)); then say "  would add: remote origin https://github.com/$MINUTES.git"
+  else git -C "$DIR" remote add origin "https://github.com/$MINUTES.git"; say "  added: remote origin https://github.com/$MINUTES.git (nothing is pushed)"; CHANGED=1; fi
+fi
+
+# 3. office.json, the shim, the marketplace and the settings ------------------------------------------------------------------
+report "$(py office "$DIR/office.json" "$FOLDER" "$MINUTES" "$NAME" "$DRY")" "office.json"
+if [[ -f "$DIR/office.json" ]] && ! chk="$(python3 -I "$ENGINE/bin/lib/officeconfig.py" --workspace "$DIR" check 2>&1)"; then
+  say "  NOTE: the existing office.json has problems (init leaves it alone):"; sed 's/^/    /' <<<"$chk"
+fi
+
+SHIM_WANT="#!/usr/bin/env bash
+# busybody shim written by \`busybody init\`: runs the engine at the path below (a plugin's root is not in Bash, so it is written here).
+# The workspace is this folder. Re-run \`busybody init --engine PATH\` after moving the engine.
+export BUSYBODY_WORKSPACE=\"\${BUSYBODY_WORKSPACE:-\$(cd \"\$(dirname \"\$(readlink -f \"\$0\")\")/..\" && pwd)}\"
+exec $(printf '%q' "$ENGINE/bin/busybody") \"\$@\""
+SHIM="$DIR/bin/busybody"
+if [[ -e "$SHIM" ]] && ! grep -qF "busybody shim written by" "$SHIM"; then
+  say "  NOTE: $SHIM exists and is not a busybody shim: left alone"
+elif [[ -e "$SHIM" && "$(cat "$SHIM")" == "$SHIM_WANT" && -x "$SHIM" ]]; then report unchanged "bin/busybody"
+else
+  st=created; [[ -e "$SHIM" ]] && st=updated
+  if ! ((DRY)); then mkdir -p "$DIR/bin"; printf '%s\n' "$SHIM_WANT" > "$SHIM"; chmod +x "$SHIM"; fi
+  report "$st" "bin/busybody"
+fi
+
+# the engine is a plugin source "./<its folder>"; a clone (it has its own .git) is gitignored here like a child repo
+PLUGIN_DIR="$ENGINE"; EXTRA_IGNORE=()
+[[ ! -e "$ENGINE/.git" ]] || EXTRA_IGNORE=("/$ENGINE_REL")
+MKT="$(py marketname "$DIR/.claude-plugin/marketplace.json" "$(tr 'A-Z_.' 'a-z--' <<<"$FOLDER")" 0)"
+report "$(py market "$DIR/.claude-plugin/marketplace.json" "$MKT" "$PLUGIN_DIR" "$DIR" "$DRY")" ".claude-plugin/marketplace.json"
+report "$(py settings "$DIR/.claude/settings.json" "$MKT" "$DRY")" ".claude/settings.json"
+report "$(py localsettings "$DIR/.claude/settings.local.json" "$MKT" "$DIR" "$DRY")" ".claude/settings.local.json (this machine's marketplace path; gitignored)"
+
+# 4. the pre-push seatbelt (a room worktree never pushes main; the lander may) -----------------------------------------------
+if [[ -e "$DIR/.git" ]]; then
+  if [[ -n "$(git -C "$DIR" config --get core.hooksPath || true)" ]]; then
+    say "  NOTE: core.hooksPath is set, so the pre-push seatbelt would not run: not installed (install it from $ENGINE/bin/lib/pre-push-seatbelt into that hooks directory by hand)"
+  else
+    COMMON="$(git -C "$DIR" rev-parse --path-format=absolute --git-common-dir)"; HOOK="$COMMON/hooks/pre-push"
+    # the workspace repo's protected branches and merge mode come from office.json, as lead-start reads them (main and land until it lists the repo)
+    PROTECTED=main MERGE=land; OC="$ENGINE/bin/lib/officeconfig.py"
+    if [[ -f "$DIR/office.json" ]] && WSR="$(python3 -I "$OC" --workspace "$DIR" repos 2>/dev/null | sed -n 1p)" && [[ -n "$WSR" ]] \
+       && NP="$(python3 -I "$OC" --workspace "$DIR" get "$WSR" noPush 2>/dev/null)" && MG="$(python3 -I "$OC" --workspace "$DIR" get "$WSR" merge 2>/dev/null)"; then
+      PROTECTED="$(paste -sd' ' <<<"$NP")" MERGE="$MG"
+    elif [[ -f "$DIR/office.json" ]]; then say "  NOTE: office.json does not give the workspace repo's noPush and merge: the hook protects main and assumes merge \"land\""; fi
+    HOOK_WANT="$(sed -e "s|@PROTECTED@|$PROTECTED|" -e "s|@MERGE@|$MERGE|" "$ENGINE/bin/lib/pre-push-seatbelt")"
+    if [[ -e "$HOOK" && "$(cat "$HOOK")" == "$HOOK_WANT" ]]; then report unchanged ".git/hooks/pre-push"
+    else
+      st=created
+      if [[ -e "$HOOK" ]]; then
+        st=updated
+        if ! grep -qF -e "busybody lead-start pre-push seatbelt" -e "sch-workspace lead-start pre-push seatbelt" "$HOOK"; then   # not ours: chain to it, as lead-start does
+          [[ ! -e "$HOOK.chained" ]] || die "$HOOK and $HOOK.chained both exist; resolve by hand"
+          if ! ((DRY)); then mv "$HOOK" "$HOOK.chained"; fi; say "  NOTE: the existing pre-push hook is moved to $HOOK.chained; the seatbelt chains to it"
+        fi
+      fi
+      if ! ((DRY)); then mkdir -p "$COMMON/hooks"; printf '%s\n' "$HOOK_WANT" > "$HOOK"; chmod +x "$HOOK"; fi
+      report "$st" ".git/hooks/pre-push"
+    fi
+  fi
+fi
+
+# 5. .gitignore: the engine's per-machine files (child clone dirs are added as repos are added) -----------------------------
+GI="$DIR/.gitignore"; MISSING=()
+for l in "/.cache/" ".claude/settings.local.json" ".claude/watch.json" "/.claude/role-sessions/" ${EXTRA_IGNORE[@]+"${EXTRA_IGNORE[@]}"}; do
+  grep -qxF -e "$l" "$GI" 2>/dev/null || MISSING+=("$l")
+done
+if ((${#MISSING[@]})); then
+  st=updated; [[ -e "$GI" ]] || st=created
+  if ! ((DRY)); then
+    [[ ! -s "$GI" || -z "$(tail -c1 "$GI")" ]] || echo >> "$GI"
+    printf '%s\n' "# busybody: per-machine files" "${MISSING[@]}" >> "$GI"
+  fi
+  report "$st" ".gitignore"
+else report unchanged ".gitignore"; fi
+
+# 6a. the default team recipes: lead-start needs teams/dev-team, and a MAD is the other one every workspace calls on -------------
+for t in dev-team mad; do
+  if [[ -e "$DIR/teams/$t" ]]; then report unchanged "teams/$t"
+  else
+    if ! ((DRY)); then mkdir -p "$DIR/teams"; cp -r "$ENGINE/templates/teams/$t" "$DIR/teams/$t"; fi
+    report created "teams/$t"
+  fi
+done
+
+# 6. the workspace CLAUDE.md, only when there is none ---------------------------------------------------------------------------
+if [[ -e "$DIR/CLAUDE.md" ]]; then report unchanged "CLAUDE.md"
+else
+  if ! ((DRY)); then
+    DISPLAY_NAME="$NAME" python3 -I -c '
+import os,re,sys
+print(re.sub(r"\{\{DISPLAY_NAME\}\}", lambda m: os.environ["DISPLAY_NAME"], open(sys.argv[1]).read()), end="")' "$ENGINE/templates/workspace-CLAUDE.md" > "$DIR/CLAUDE.md"
+  fi
+  report created "CLAUDE.md"
+fi
+
+# 7. GitHub writes, last: --create makes the repo (private) when the probe found none, then the `initiative` label ---------------------
+if ((NEED_CREATE)); then
+  SRC=(--source "$DIR" --remote origin); [[ ! -e "$DIR/.git" ]] || ! git -C "$DIR" remote get-url origin >/dev/null 2>&1 || SRC=()   # an origin that is already set is kept
+  if ((DRY)); then say "  would run: gh repo create $MINUTES --private ${SRC[*]:-}"
+  else
+    out="$(gh repo create "$MINUTES" --private ${SRC[@]+"${SRC[@]}"} 2>&1)" || die "gh repo create $MINUTES failed (everything else is written; rerun to retry): $out"
+    say "  created: github.com/$MINUTES (private)"; CHANGED=1
+  fi
+fi
+# the `initiative` label on the minutes repo: `busybody lead-start` files every initiative under it ------------------------------
+if ((DRY && NEED_CREATE)); then say "  would create: label initiative on $MINUTES"
+elif labels="$(gh label list -R "$MINUTES" --json name --jq '.[].name' 2>/dev/null)"; then
+  if grep -qxF initiative <<<"$labels"; then report unchanged "label initiative on $MINUTES"
+  elif ((DRY)); then report created "label initiative on $MINUTES"
+  elif gh label create initiative -R "$MINUTES" --color 0E8A16 --description "One piece of work: its issue is the minutes" >/dev/null 2>&1; then report created "label initiative on $MINUTES"
+  else say "  NOTE: could not create the 'initiative' label on $MINUTES: create it by hand before starting a room"; fi
+else say "  NOTE: could not list labels on $MINUTES: make sure it has an 'initiative' label before starting a room"; fi
+
+if ((CHANGED)); then
+  ((DRY)) || say "init: $DIR is set up. Nothing was pushed. Next: cd $DIR && claude   (then /reload-plugins if the plugin is not loaded). The shim is $DIR/bin/busybody: run bin/busybody help, or add $DIR/bin to your PATH"
+  ((!DRY)) || say "init: dry run, nothing written"
+else say "init: nothing to change: $DIR is already set up"; fi

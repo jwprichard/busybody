@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Background PR watcher: wakes a role only on an event, with no model turns while it waits.
+#
+#   bin/pr-watch <pr> [-R owner/repo]
+#   bin/pr-watch --self-test
+#
+# Run it as a background shell. It polls GitHub every BUSYBODY_PR_WATCH_INTERVAL seconds (default 240; the old
+# PR_WATCH_INTERVAL is still read; use 180-300), and on the first event prints one line, `EVENT: <name> <PR url>`, and exits 0. That
+# exit wakes the role, which handles the event and re-arms the watcher. Events:
+#   ready      draft promoted to ready      ci-passed / ci-failed   the checks' overall result changed
+#   review     a new review                 comment                 a new comment  (bot comments, e.g. github-actions, do not count)
+#   merged     the PR merged                closed                  closed unmerged
+#   cap        7 days (PR_WATCH_CAP seconds) passed with no event
+# An already merged or closed PR exits at once. Exit 2: gh failed 30 polls in a row. Exit 3: another
+# live watcher already owns .claude/watch.json (it is left untouched).
+# While it runs, <repo root>/.claude/watch.json ({pr, start, pid}) marks the room "watching"; it is
+# removed on exit, but only if it still names this process. Output is the event name and the PR URL only (link, don't paste).
+# PR_WATCH_GH overrides the gh command (tests).
+
+set -euo pipefail
+
+GH="${PR_WATCH_GH:-gh}"
+INTERVAL="${BUSYBODY_PR_WATCH_INTERVAL:-${PR_WATCH_INTERVAL:-240}}"   # 240 s: the poll costs GitHub quota, and an event can wait a few minutes
+CAP="${PR_WATCH_CAP:-604800}"
+
+die() { printf 'pr-watch: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+# One compact snapshot: state, draft flag, overall CI, review and comment counts, url. Two calls at most, and usually one: every
+# poll fetches only the light fields (state, draft, url, updatedAt, the check rollup); reviews and comments, the expensive part,
+# are fetched only when updatedAt moved since the last snapshot (a new comment or review always moves it), else the last counts are reused.
+snapshot() {
+  local light heavy
+  light="$("$GH" pr view "$PR" "${REPO_ARGS[@]}" --json state,isDraft,url,updatedAt,statusCheckRollup 2>/dev/null | jq -c '
+    (.statusCheckRollup // []) as $c
+    | { state, draft: .isDraft, url, updated: .updatedAt,
+        ci: (if ($c | length) == 0 then "none"
+             elif any($c[]; (.conclusion // .state // "") | test("^(FAILURE|ERROR|TIMED_OUT|CANCELLED|STARTUP_FAILURE|ACTION_REQUIRED)$")) then "failure"
+             elif any($c[]; (.status // "COMPLETED") != "COMPLETED" or ((.state // "") | test("^(PENDING|EXPECTED)$"))) then "pending"
+             else "success" end) }')" || return 1
+  [[ -n "$light" ]] || return 1
+  if [[ "$(jq -r .state <<<"$light")" != OPEN ]]; then jq -c '. + {reviews: 0, comments: 0}' <<<"$light"; return; fi   # merged or closed: the event needs no counts
+  if [[ -n "$prev" && "$(jq -r .updated <<<"$light")" == "$(jq -r .updated <<<"$prev")" ]]; then
+    jq -c --argjson p "$prev" '. + {reviews: $p.reviews, comments: $p.comments}' <<<"$light"
+    return
+  fi
+  heavy="$("$GH" pr view "$PR" "${REPO_ARGS[@]}" --json reviews,comments 2>/dev/null | jq -c '
+    { reviews: (.reviews | length),
+      comments: ([.comments[] | select((.author.login // "") | test("^(github-actions|.*\\[bot\\])$") | not)] | length) }')" || return 1
+  [[ -n "$heavy" ]] || return 1
+  jq -c --argjson h "$heavy" '. + $h' <<<"$light"
+}
+
+run() {
+  local cur ev fails=0 start now
+  prev=""
+  start=$(date +%s)
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  mkdir -p "$ROOT/.claude"
+  # Refuse to run beside another live watcher. A pid we may not signal (EPERM) still counts as alive,
+  # hence the /proc check beside kill -0.
+  other="$(jq -r '.pid // empty' "$ROOT/.claude/watch.json" 2>/dev/null || true)"
+  if [[ "$other" =~ ^[0-9]+$ && "$other" != "$$" ]] && { kill -0 "$other" 2>/dev/null || [[ -d "/proc/$other" ]]; }; then
+    echo "pr-watch: another watcher (pid $other) is already running for this room: $ROOT/.claude/watch.json" >&2
+    return 3
+  fi
+  jq -n --argjson pr "$PR_NUM" --argjson start "$start" --argjson pid "$$" '{pr:$pr,start:$start,pid:$pid}' > "$ROOT/.claude/watch.json"
+  # Remove the marker only if it is ours.
+  trap '[[ "$(jq -r .pid "$ROOT/.claude/watch.json" 2>/dev/null)" == "$$" ]] && rm -f "$ROOT/.claude/watch.json"; true' EXIT
+  trap 'exit 143' TERM INT
+  while :; do
+    if cur="$(snapshot)" && [[ -n "$cur" ]]; then
+      fails=0
+      url="$(jq -r .url <<<"$cur")"
+      case "$(jq -r .state <<<"$cur")" in
+        MERGED) echo "EVENT: merged $url"; return 0 ;;
+        CLOSED) echo "EVENT: closed $url"; return 0 ;;
+      esac
+      if [[ -n "$prev" ]]; then
+        ev="$(jq -rn --argjson p "$prev" --argjson c "$cur" '
+          [ (if $p.draft and ($c.draft | not) then "ready" else empty end),
+            (if $p.ci != $c.ci and $c.ci == "success" then "ci-passed" else empty end),
+            (if $p.ci != $c.ci and $c.ci == "failure" then "ci-failed" else empty end),
+            (if $c.reviews > $p.reviews then "review" else empty end),
+            (if $c.comments > $p.comments then "comment" else empty end) ] | .[]')"
+        if [[ -n "$ev" ]]; then
+          while read -r e; do echo "EVENT: $e $url"; done <<<"$ev"
+          return 0
+        fi
+      fi
+      prev="$cur"
+    else
+      fails=$((fails + 1))
+      ((fails >= 30)) && { echo "pr-watch: gh failed 30 polls in a row" >&2; return 2; }
+    fi
+    now=$(date +%s)
+    if ((now - start >= CAP)); then echo "EVENT: cap ${url:-PR #$PR_NUM}"; return 0; fi
+    sleep "$INTERVAL"
+  done
+}
+
+self_test() {
+  local bad=() out rc; T=""
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  git -C "$T" init -q
+  # Fake gh: serves $T/N.json for the Nth call, the last file thereafter.
+  cat > "$T/gh" <<'GH'
+#!/usr/bin/env bash
+d="$(dirname "$0")"; n=$(( $(cat "$d/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$d/n"
+echo "$*" >> "$d/calls"
+[[ -e "$d/fail" ]] && exit 1
+# a call for reviews/comments reuses the current snapshot (the call counter moves only on light polls)
+case "$*" in *reviews,comments*) n=$((n - 1)); echo "$n" > "$d/n" ;; esac
+f="$d/$n.json"; [[ -e "$f" ]] || f="$(ls "$d"/[0-9]*.json | sort -V | tail -1)"; cat "$f"
+GH
+  chmod +x "$T/gh"
+  mk() { # state draft ci reviews comments [bot-comments]
+    local ci="$3" roll='[]'
+    case "$ci" in
+      success) roll='[{"status":"COMPLETED","conclusion":"SUCCESS"}]' ;;
+      failure) roll='[{"status":"COMPLETED","conclusion":"FAILURE"}]' ;;
+      pending) roll='[{"status":"IN_PROGRESS","conclusion":""}]' ;;
+    esac
+    jq -n --arg s "$1" --argjson d "$2" --argjson r "$roll" --argjson rv "$4" --argjson cm "$5" --argjson bt "${6:-0}" \
+      '{state:$s,isDraft:$d,updatedAt:("u\($rv)-\($cm)-\($bt)-\($s)"),url:"https://github.com/o/r/pull/7",statusCheckRollup:$r,reviews:[range($rv)|{}],
+        comments:([range($cm)|{author:{login:"someone"}}] + [range($bt)|{author:{login:"github-actions"}}])}'
+  }
+  t() { # name expected-event files... (state draft ci reviews comments per call)
+    local name="$1" want="$2"; shift 2
+    rm -f "$T"/[0-9]*.json "$T/n" "$T/fail"
+    local i=1; for spec in "$@"; do mk $spec > "$T/$i.json"; i=$((i + 1)); done
+    rc=0; out="$(cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.05 PR_WATCH_CAP=${CAP_T:-600} timeout 20 "$SELF" 7 2>&1)" || rc=$?
+    [[ "$rc" == 0 && "$out" == "EVENT: $want https://github.com/o/r/pull/7" ]] || bad+=("$name: rc=$rc out=$out")
+    [[ ! -e "$T/.claude/watch.json" ]] || bad+=("$name: watch.json left behind")
+  }
+  t merged-at-start merged "MERGED false success 0 0"
+  t closed-at-start closed "CLOSED false none 0 0"
+  t ready ready "OPEN true pending 0 0" "OPEN true pending 0 0" "OPEN false pending 0 0"
+  t ci-passed ci-passed "OPEN true pending 0 0" "OPEN true success 0 0"
+  t ci-failed ci-failed "OPEN false pending 0 0" "OPEN false failure 0 0"
+  t review review "OPEN false success 0 0" "OPEN false success 1 0"
+  t comment comment "OPEN false success 0 0" "OPEN false success 0 2"
+  t bot-comments-ignored merged "OPEN false success 0 0" "OPEN false success 0 0 3" "MERGED false success 0 0"
+  t merged-later merged "OPEN false pending 0 0" "OPEN false pending 0 0" "MERGED false success 0 0"
+  rm -f "$T/calls"; t merged-light merged "OPEN false success 0 0" "OPEN false success 0 0" "OPEN false success 0 0" "MERGED false success 0 0"
+  [[ "$(grep -c 'reviews,comments' "$T/calls")" == 1 ]] || bad+=("reviews and comments are fetched only when updatedAt moves: $(grep -c 'reviews,comments' "$T/calls") calls")
+  CAP_T=1 t cap cap "OPEN true pending 0 0"
+  # watch.json exists while running, with pr/start/pid
+  rm -f "$T"/[0-9]*.json "$T/n"; mk OPEN true pending 0 0 > "$T/1.json"
+  (cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.2 "$SELF" 7 >/dev/null 2>&1 &) ; sleep 0.8
+  if [[ -e "$T/.claude/watch.json" ]]; then
+    jq -e '.pr == 7 and (.start|type=="number") and (.pid|type=="number")' "$T/.claude/watch.json" >/dev/null || bad+=("watch.json keys")
+    kill "$(jq -r .pid "$T/.claude/watch.json")" 2>/dev/null || true; sleep 0.5
+    [[ ! -e "$T/.claude/watch.json" ]] || bad+=("watch.json not removed on kill")
+  else bad+=("watch.json missing while running"); fi
+  # a live foreign pid in watch.json: refuse with exit 3 and leave the file alone
+  rm -f "$T"/[0-9]*.json "$T/n"; mk OPEN true pending 0 0 > "$T/1.json"
+  sleep 30 & local fp=$!
+  mkdir -p "$T/.claude"; jq -n --argjson pid "$fp" '{pr:9,start:1,pid:$pid}' > "$T/.claude/watch.json"
+  rc=0; out="$(cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.05 timeout 20 "$SELF" 7 2>&1)" || rc=$?
+  [[ "$rc" == 3 && "$out" == *"another watcher"* ]] || bad+=("foreign-live: rc=$rc out=$out")
+  [[ "$(jq -r .pid "$T/.claude/watch.json" 2>/dev/null)" == "$fp" ]] || bad+=("foreign-live: watch.json was touched")
+  kill "$fp" 2>/dev/null || true; wait "$fp" 2>/dev/null || true
+  # a dead pid is stale: the watcher starts (and cleans up)
+  mk MERGED false success 0 0 > "$T/1.json"
+  jq -n --argjson pid "$fp" '{pr:9,start:1,pid:$pid}' > "$T/.claude/watch.json"
+  rc=0; out="$(cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.05 timeout 20 "$SELF" 7 2>&1)" || rc=$?
+  [[ "$rc" == 0 && "$out" == "EVENT: merged "* && ! -e "$T/.claude/watch.json" ]] || bad+=("stale-pid: rc=$rc out=$out")
+  if ((${#bad[@]})); then printf 'pr-watch self-test: FAILED: %s\n' "$(IFS=';'; echo "${bad[*]}")"; return 1; fi
+  echo "pr-watch self-test: ok"
+}
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+PR="" REPO_ARGS=()
+while (($#)); do
+  case "$1" in
+    --self-test) self_test; exit $? ;;
+    -h|--help) usage 0 ;;
+    -R) [[ $# -ge 2 ]] || die "-R needs owner/repo"; REPO_ARGS=(-R "$2"); shift ;;
+    -*) die "unknown flag $1" ;;
+    *) [[ -z "$PR" ]] || die "one PR only"; PR="$1" ;;
+  esac
+  shift
+done
+[[ -n "$PR" ]] || usage
+PR_NUM="${PR#\#}"; PR_NUM="${PR_NUM##*/}"
+[[ "$PR_NUM" =~ ^[0-9]+$ ]] || die "PR must be a number: $PR"
+PR="$PR_NUM"
+command -v jq >/dev/null || die "jq is required"
+run

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# busybody <cmd> [args]: runs engine/bin/<cmd>. One entry point for the engine's tools (rooms, role, team, status, room-cost,
+# room-cost-timer, land, pr-watch, init); each tool finds the workspace itself (BUSYBODY_WORKSPACE, else office.json above the cwd).
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+cmd="${1:-}"
+if [[ -z "$cmd" || "$cmd" == -h || "$cmd" == --help || "$cmd" == help ]]; then
+  echo "usage: busybody <cmd> [args]"; echo "commands:"
+  for f in "$here"/*; do [[ -x "$f" && -f "$f" && "$(basename "$f")" != busybody ]] && echo "  $(basename "$f")"; done
+  exit 0
+fi
+shift
+[[ "$cmd" =~ ^[a-z][a-z-]*$ && -f "$here/$cmd" && -x "$here/$cmd" ]] || { echo "busybody: no such command: $cmd (try: busybody help)" >&2; exit 2; }
+exec "$here/$cmd" "$@"

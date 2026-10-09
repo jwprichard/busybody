@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# busybody role-memory pre-commit guard
+# Installed as .git/hooks/pre-commit by `bin/role install-hook`. Runs the tracked checker from the
+# checkout being committed (so worktrees use their own copy), then chains to pre-commit.chained.
+top="$(git rev-parse --show-toplevel)"
+for check in "$top/engine/bin/lib/role-memory-check" "$top/bin/lib/role-memory-check"; do
+  if [[ -x "$check" ]]; then "$check" || exit 1; break; fi
+done
+chained="$(dirname "$0")/pre-commit.chained"
+if [[ -x "$chained" ]]; then
+  exec "$chained" "$@"
+fi
+exit 0

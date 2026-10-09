@@ -1,0 +1,525 @@
+#!/usr/bin/python3 -I
+"""Estimate what each project room has spent, from Claude Code transcripts.
+
+  bin/room-cost room-<slug>      one room
+  bin/room-cost --all            every session named room-* (add --any for every session)
+  bin/room-cost --file X.jsonl   one transcript (+ its <session-id>/subagents/agent-*.jsonl)
+  --json                         machine-readable
+  --enforce [--dry-run]          stop rooms over the hard cap today (for the 5-minute timer); also the
+                                 WAITING backstop: post one NOTE per PR change when the watcher is dead (no model turns)
+                                 The cap holds while GitHub fails: it stops from `claude agents` and the transcripts, using each room's
+                                 cap from the last good issue read (.cache/room-issues.json, else the default); the capped label and
+                                 BLOCKED comment queue in .cache/room-cap-pending.json and post when GitHub answers
+  --self-test                    check the summing against fixtures/room-cost/
+
+Sums message.usage per message.model, de-duplicated by requestId, at LIST prices
+(templates/prices.json). It is an estimate, not an invoice: see limitations/lead-cost-is-estimated.md.
+"Today" is the NZ calendar date (Pacific/Auckland) of each message.
+"""
+import glob, json, os, re, subprocess, sys
+from datetime import datetime
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+import officeconfig  # noqa: E402
+import prcache  # noqa: E402
+OFFICE = officeconfig.load_or_exit(WORKSPACE_ROOT, "room-cost")
+from costlib import NZ, PROJECTS, load_prices, price_for, encode_cwd, transcript_files, collect, row_cost, nz_date, summarise  # noqa: E402,F401
+REPO = OFFICE.minutes_repo
+SOFT, HARD = 15.0, 40.0
+LABEL = "list-price estimate"
+
+
+def agents():
+    try:
+        out = subprocess.run(["claude", "agents", "--json", "--all"], capture_output=True, text=True, timeout=60)
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        sys.exit("room-cost: could not read `claude agents --json --all`")
+
+
+def files_for_name(name, ags):
+    files = []
+    for a in ags:
+        if a.get("name") == name and a.get("sessionId") and a.get("cwd"):
+            files += transcript_files(a["sessionId"], a["cwd"])
+    return files
+
+
+def caps_from_body(body):
+    """(soft, hard) dollars a day from an issue body's Room block (`- caps: soft $45/day, hard $60/day (…)`); None for one that is absent."""
+    sm = re.search(r"soft[^$\n]*\$\s*(\d+(?:\.\d+)?)", body or "")
+    hm = re.search(r"hard[^$\n]*\$\s*(\d+(?:\.\d+)?)", body or "")
+    return (float(sm.group(1)) if sm else None, float(hm.group(1)) if hm else None)
+
+
+def fmt_line(name, s, soft=None, hard=None):
+    soft, hard = soft or SOFT, hard or HARD
+    mix_total = sum(s["mix"].values()) or 1
+    mix = " ".join(f"{k} {round(100 * v / mix_total)}%" for k, v in sorted(s["mix"].items(), key=lambda kv: -kv[1])) or "-"
+    last = "-"
+    if s["last_activity"]:
+        last = datetime.fromisoformat(s["last_activity"].replace("Z", "+00:00")).astimezone(NZ).strftime("%d %b %H:%M NZ")
+    note = f"  UNPRICED: {','.join(s['unpriced'])}" if s["unpriced"] else ""
+    return (f"{name:<28} ${s['today']:>7.2f} today  ${s['total']:>8.2f} total  [{mix}]  last {last}  "
+            f"{round(100 * s['today'] / soft)}% of soft cap, {round(100 * s['today'] / hard)}% of hard cap{note}")
+
+
+def gh(*args, check=True):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if check and r.returncode:
+        sys.exit(f"room-cost: gh {' '.join(args[:3])} failed: {r.stderr.strip()[:200]}")
+    return r
+
+
+CTRL_RE = re.compile(r"^(?:\*\*(NOTE|RECORD|ANSWER)\*\*|(NOTE|RECORD|ANSWER)\b)")
+TYPE_RE = re.compile(r"^(?:\*\*([A-Z]+)\*\*|([A-Z]+)\b)")
+KNOWN = ("PROGRESS", "DECISION", "BLOCKED", "DONE", "ANSWER", "WAITING", "NOTE", "RECORD")
+
+
+def minute_type(body):
+    first = (body or "").lstrip().split("\n", 1)[0].strip()
+    m = TYPE_RE.match(first)
+    t = (m.group(1) or m.group(2)) if m else None
+    return t if t in KNOWN else None
+
+
+def is_waiting(comments):
+    """True when the room's own latest minute is WAITING (`**WAITING** · who · where` or old `WAITING:`).
+    Same rule as bin/rooms room_state: controller/cap-timer NOTE, RECORD and ANSWER don't count,
+    so the backstop's own NOTE does not end its watch. Takes a list of comment bodies (or one)."""
+    if isinstance(comments, str) or comments is None:
+        comments = [comments or ""]
+    own = [t for t in map(minute_type, comments) if t and t not in ("NOTE", "RECORD", "ANSWER")]
+    return bool(own) and own[-1] == "WAITING"
+
+
+def watcher_alive(worktree):
+    """The room's .claude/watch.json names a pid that is running."""
+    try:
+        pid = int(json.load(open(os.path.join(worktree, ".claude", "watch.json")))["pid"])
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def backstop_decision(comments, alive, pr, last_sig):
+    """Pure. -> ("none"|"nudge", reason). pr is {"number","state","sig"} or None;
+    last_sig is the PR signature already noted (so a NOTE is posted once per change)."""
+    if not is_waiting(comments):
+        return "none", "last minute is not WAITING"
+    if alive:
+        return "none", "watcher alive"
+    if not pr:
+        return "none", "no PR found for the room branch"
+    if pr["sig"] == last_sig:
+        return "none", "PR unchanged since last note"
+    return "nudge", f"PR #{pr['number']} is {pr['state'].lower()}" if pr["state"] != "OPEN" else f"PR #{pr['number']} changed"
+
+
+def room_block(body, key):
+    m = re.search(r"^## Room\b(.*?)(?=^## |\Z)", body or "", re.S | re.M)
+    k = re.search(rf"^[-*]\s*{key}:\s*`?([^`\s]+)`?", m.group(1), re.M) if m else None
+    return k.group(1) if k else None
+
+
+def room_worktree(repo, room):
+    root = data_root(WORKSPACE_ROOT)   # the clones and room worktrees belong to the workspace, not to one of its worktrees
+    base = root if repo is None or OFFICE.is_workspace(repo) else os.path.join(root, repo)
+    return os.path.join(base, ".claude", "worktrees", room)
+
+
+REPOS = OFFICE.repos
+ROOM_RE = re.compile(r"^room-[A-Za-z0-9._-]+$")
+
+
+def valid_target(repo, room):
+    """Allow-listed repo and a plain room name, before any path is built from issue text."""
+    return (repo is None or repo in REPOS) and bool(ROOM_RE.match(room or "")) and ".." not in room
+
+
+def backstop(iss, room, dry):
+    repo, branch = room_block(iss["body"], "repo"), room_block(iss["body"], "branch")
+    if not valid_target(repo, room):
+        print(f"  backstop {room}: skipped (invalid repo or room name)")
+        return
+    comments = iss.get("comments") or []
+    if not branch or not comments:
+        return
+    wt = room_worktree(repo, room)
+    gh_repo = OFFICE.github(repo)
+    # the PR comes from the shared PR cache (at most one gh call per branch per ten minutes, none without a GitHub remote)
+    root = data_root(WORKSPACE_ROOT)
+    found, _, _ = prcache.lookup(root if repo is None or OFFICE.is_workspace(repo) else os.path.join(root, repo), gh_repo, branch, os.path.join(root, ".cache"))
+    pr = {"number": found["number"], "state": found["state"], "sig": f"{found['state']}@{found.get('updatedAt', '')}"} if found else None
+    cache = os.path.join(data_root(WORKSPACE_ROOT), ".cache", "room-backstop.json")
+    try:
+        seen = json.load(open(cache))
+    except (OSError, ValueError):
+        seen = {}
+    act, why = backstop_decision([c.get("body") for c in comments], watcher_alive(wt), pr, seen.get(room))
+    if act == "none":
+        return
+    print(f"  backstop {room}: {act} ({why})")
+    if dry:
+        return
+    # Nothing run from cron can address a live session (limitations/backstop-cannot-wake-a-session.md):
+    # one NOTE per PR state change, a record for the controller/office, not a wake-up.
+    gh("issue", "comment", str(iss["number"]), "-R", REPO, "--body",
+       f"**NOTE** · cap-timer · #{iss['number']}\n\nRoom is WAITING with no live watcher: {why}. The PR changed; resume the role.", check=False)
+    if pr:
+        seen[room] = pr["sig"]
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        json.dump(seen, open(cache, "w"))
+
+
+CACHE_DIR = os.path.join(data_root(WORKSPACE_ROOT), ".cache")
+ROOMS_CACHE, CAPPED_MARK, PENDING = "room-issues.json", "room-capped.json", "room-cap-pending.json"
+
+
+def jload(name, default):
+    try:
+        with open(os.path.join(CACHE_DIR, name)) as f:
+            d = json.load(f)
+        return d if isinstance(d, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def jsave(name, data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = os.path.join(CACHE_DIR, f"{name}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, os.path.join(CACHE_DIR, name))
+
+
+def fetch_initiatives():
+    """Open initiative issues, or None when GitHub fails (rate limit, outage, auth): the caller carries on from the cache."""
+    r = gh("issue", "list", "-R", REPO, "--label", "initiative", "--state", "open",
+           "--json", "number,body,labels,comments", "-L", "100", check=False)
+    try:
+        if r.returncode:
+            raise ValueError(r.stderr.strip()[:200] or f"exit {r.returncode}")
+        d = json.loads(r.stdout)
+        if not isinstance(d, list):
+            raise ValueError("not a list")
+        return d
+    except ValueError as e:
+        print(f"room-cost: gh issue list failed ({e}); enforcing from local transcripts and the cached room list")
+        return None
+
+
+def stop_sessions(ids, required=True):
+    """`claude stop` each id. True only when every one exited 0 within the timeout; with required=False (a name-only fallback,
+    nothing known to be live) the attempt is best effort and counts as stopped."""
+    ok = True
+    for i in ids:
+        try:
+            ok = subprocess.run(["claude", "stop", i], check=False, timeout=60, capture_output=True).returncode == 0 and ok
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+    return ok or not required
+
+
+def post_cap(number, room, st):
+    """The label and the BLOCKED comment, each retried until it lands. st = {"labeled", "commented"}; True when both are done."""
+    if number is None:
+        return False
+    if not st.get("labeled"):
+        gh("label", "create", "capped", "-R", REPO, "--color", "B60205", "--description", "Room hit its hard daily cost cap", check=False)
+        st["labeled"] = gh("issue", "edit", str(number), "-R", REPO, "--add-label", "capped", check=False).returncode == 0
+    if not st.get("commented"):
+        st["commented"] = gh("issue", "comment", str(number), "-R", REPO, "--body", "BLOCKED: hard cap reached (bin/room-cost)", check=False).returncode == 0
+    return bool(st["labeled"] and st["commented"])
+
+
+def enforce(prices, dry):
+    """One enforcement at a time: it reads and rewrites the marks and the pending queue, so a second one (a slow tick overlapping
+    the next, a manual run) skips rather than interleave."""
+    import fcntl
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, "room-enforce.lock"), "w") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("room-cost: another --enforce is running; skipping this tick")
+            return
+        _enforce(prices, dry)
+
+
+def _enforce(prices, dry):
+    """The hard cap is enforced from local data first: the sessions (`claude agents`) and their transcripts. GitHub only supplies each
+    room's own cap and issue number (cached from the last good read) and receives the label and comment, which are queued in
+    .cache/ and retried when it fails. A GitHub failure never skips or aborts the stop."""
+    ags = agents()
+    today = datetime.now(NZ).date().isoformat()
+    issues = fetch_initiatives()
+    rooms, iss_by_room = {}, {}
+    if issues is None:
+        rooms = jload(ROOMS_CACHE, {}).get("rooms") or {}
+    else:
+        for iss in issues:
+            m = re.search(r"^## Room\b.*?^[-*]\s*room:\s*`?(room-[A-Za-z0-9._-]+)`?", iss["body"] or "", re.S | re.M)
+            if not m:
+                continue
+            soft, hard = caps_from_body(iss["body"])
+            rooms[m.group(1)] = {"issue": iss["number"], "soft": soft, "hard": hard or HARD,
+                                 "capped": any(l["name"] == "capped" for l in iss["labels"])}
+            iss_by_room[m.group(1)] = iss
+        if not dry:
+            jsave(ROOMS_CACHE, {"rooms": rooms})
+    for a in ags:   # a live room session with no known issue is still a room: it gets the default cap
+        n = a.get("name") or ""
+        if ROOM_RE.match(n) and n not in rooms and a.get("state") != "done":
+            rooms[n] = {"issue": None, "hard": HARD, "capped": False}
+    marks = {k: v for k, v in jload(CAPPED_MARK, {}).items() if isinstance(v, dict) and v.get("date") == today}
+    landed = set()   # rooms whose capped label was posted during this run (the list we read predates it)
+    pending = jload(PENDING, {})
+    if issues is not None and pending and not dry:   # GitHub is reachable: land the queued label and comments
+        for room, st in list(pending.items()):
+            if st.get("issue") is None:
+                st["issue"] = (rooms.get(room) or {}).get("issue")
+            if post_cap(st.get("issue"), room, st):
+                del pending[room]
+                landed.add(room)
+                print(f"{room}: posted the queued cap label and comment")
+        jsave(PENDING, pending)
+    for room, info in sorted(rooms.items()):
+        hard = info.get("hard") or HARD
+        s = summarise(files_for_name(room, ags), prices)
+        if room in iss_by_room:
+            backstop(iss_by_room[room], room, dry)
+        # A local mark says "stopped today at this cap". It holds only while the cap is unchanged, and once GitHub has been
+        # read the label is the truth: an owner who removed it un-capped the room, so a room still over its cap is stopped again.
+        mk = marks.get(room) or {}
+        mark_ok = mk.get("hard") == hard
+        if room in iss_by_room:
+            capped = bool(info.get("capped")) or room in landed or (mark_ok and room in pending)
+        else:
+            capped = bool(info.get("capped")) or mark_ok
+        print(f"{room}: ${s['today']:.2f} today of ${hard:.0f} hard cap{' (already capped)' if capped else ''}")
+        if s["today"] < hard or capped:
+            continue
+        if dry:
+            print(f"  would stop {room}, label #{info.get('issue')} capped, comment")
+            continue
+        ids = [a["id"] for a in ags if a.get("name") == room and a.get("state") not in ("done",) and a.get("id")]
+        if not stop_sessions(ids or [room], required=bool(ids)):
+            print(f"  {room}: `claude stop` did not succeed; nothing is marked or posted, so the next tick stops it again")
+            continue
+        marks[room] = {"date": today, "hard": hard}
+        jsave(CAPPED_MARK, marks)
+        st = {}
+        if not post_cap(info.get("issue"), room, st):
+            pending[room] = dict(st, issue=info.get("issue"))
+            jsave(PENDING, pending)
+            print(f"  {room} stopped; the label and comment are queued in .cache/{PENDING} until GitHub answers")
+
+
+def enforce_self_test():
+    """--enforce end to end with stub gh and claude: the cap holds while GitHub fails, and the label and comment land later."""
+    import tempfile, shutil
+    bad = []
+    t = tempfile.mkdtemp()
+    try:
+        stub, ws, proj = os.path.join(t, "stub"), os.path.join(t, "ws"), os.path.join(t, "projects")
+        os.makedirs(stub)
+        os.makedirs(ws)
+        def sh(name, body):
+            with open(os.path.join(stub, name), "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(os.path.join(stub, name), 0o755)
+        sh("claude", 'case "$1" in agents) cat "$STUB_DIR/agents.json" ;; stop) echo "$2" >> "$STUB_DIR/stops"; if [ -f "$STUB_DIR/stop-fails" ]; then exit 1; fi ;; esac\n')
+        sh("gh", 'echo "$*" >> "$STUB_DIR/gh.log"\n[ -f "$STUB_DIR/gh-down" ] && { echo "API rate limit exceeded" >&2; exit 1; }\n'
+                 'case "$1 $2" in "issue list") cat "$STUB_DIR/issues.json" ;; *) exit 0 ;; esac\n')
+        ts = datetime.now(NZ).astimezone().isoformat()
+        def session(sid, cwd, out_tokens):
+            d = os.path.join(proj, encode_cwd(cwd))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, sid + ".jsonl"), "w") as f:
+                f.write(json.dumps({"type": "assistant", "requestId": sid, "timestamp": ts, "message": {"model": "claude-sonnet-5-5",
+                        "usage": {"input_tokens": 0, "output_tokens": out_tokens, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}) + "\n")
+        session("s1", "/fx/one", 5_000_000)    # $50 today: over the default $40 cap
+        session("s2", "/fx/two", 300_000)      # $3 today: over a cached $1 cap, under the default
+        session("s3", "/fx/three", 300_000)    # $3 today, default cap: fine
+        agents_ = [{"name": "room-one", "sessionId": "s1", "cwd": "/fx/one", "id": "id1", "state": "busy"},
+                   {"name": "room-two", "sessionId": "s2", "cwd": "/fx/two", "id": "id2", "state": "busy"},
+                   {"name": "room-three", "sessionId": "s3", "cwd": "/fx/three", "id": "id3", "state": "busy"}]
+        json.dump(agents_, open(os.path.join(stub, "agents.json"), "w"))
+        def run():
+            env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"], STUB_DIR=stub, BUSYBODY_CLAUDE_PROJECTS=proj,
+                       BUSYBODY_WORKSPACE=ws, BUSYBODY_CONFIG=os.path.join(ENGINE_ROOT, "fixtures", "office.json"))
+            return subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "room-cost"), "--enforce"], capture_output=True, text=True, env=env)
+        def read(name):
+            try:
+                return open(os.path.join(stub, name)).read()
+            except OSError:
+                return ""
+        cache = os.path.join(ws, ".cache")
+        # 0. `claude stop` fails: nothing is marked or posted, and the next tick tries again; it works once stop does
+        open(os.path.join(stub, "stop-fails"), "w").close()
+        open(os.path.join(stub, "gh-down"), "w").close()
+        run()
+        run()
+        if read("stops").split() != ["id1", "id1"] or os.path.exists(os.path.join(cache, "room-capped.json")) \
+                or os.path.exists(os.path.join(cache, "room-cap-pending.json")):
+            bad.append(f"stop fails: want id1 stopped twice (retried), no capped mark, no queued post; stops {read('stops').split()}")
+        os.remove(os.path.join(stub, "stop-fails"))
+        open(os.path.join(stub, "stops"), "w").close()
+        # 1. GitHub down, nothing cached: room-one is still stopped, the post is queued, the run does not fail
+        open(os.path.join(stub, "gh-down"), "w").close()
+        r = run()
+        if r.returncode != 0 or read("stops").split() != ["id1"] or "rate limit" not in r.stdout:
+            bad.append(f"gh down: wanted exit 0, one stop of id1 and the error logged; got rc {r.returncode} stops {read('stops').split()} out {r.stdout!r} err {r.stderr!r}")
+        pend = json.load(open(os.path.join(cache, "room-cap-pending.json"))) if os.path.exists(os.path.join(cache, "room-cap-pending.json")) else {}
+        if "room-one" not in pend:
+            bad.append("gh down: the label and comment must be queued in .cache/room-cap-pending.json")
+        # 2. still down, a second tick: not stopped again (local capped marker)
+        run()
+        if read("stops").split() != ["id1"]:
+            bad.append(f"gh down, second tick: room-one must not be stopped twice, stops {read('stops').split()}")
+        # 3. GitHub back: the queued label and comment land and the queue empties; the issue list gives room-two a $1 cap
+        os.remove(os.path.join(stub, "gh-down"))
+        issues = [{"number": 5, "labels": [], "comments": [], "body": "## Room\n- room: room-one\n- caps: soft $15/day, hard $40/day\n"},
+                  {"number": 6, "labels": [], "comments": [], "body": "## Room\n- room: room-two\n- caps: soft $1/day, hard $1/day\n"}]
+        json.dump(issues, open(os.path.join(stub, "issues.json"), "w"))
+        r = run()
+        log = read("gh.log")
+        if "issue edit 5 -R" not in log or "issue comment 5 -R" not in log or "BLOCKED: hard cap reached" not in log:
+            bad.append(f"gh back: the queued label and comment on #5 must be posted; gh log {log!r}")
+        pf = os.path.join(cache, "room-cap-pending.json")
+        if (json.load(open(pf)) if os.path.exists(pf) else None) != {} or read("stops").split() != ["id1", "id2"]:
+            bad.append(f"gh back: queue must empty and room-two (cap $1) be stopped; stops {read('stops').split()} out {r.stdout!r}")
+        # 4. GitHub down again: room-two's own cap comes from the cache, so a fresh over-cap room is still stopped from local data
+        os.remove(os.path.join(cache, "room-capped.json"))
+        open(os.path.join(stub, "gh-down"), "w").close()
+        open(os.path.join(stub, "stops"), "w").close()
+        r = run()
+        if sorted(read("stops").split()) != ["id1", "id2"] or "room-three" not in r.stdout or "id3" in read("stops"):
+            bad.append(f"gh down with a cache: want id1 and id2 stopped (cached $1 cap for room-two), not id3; stops {read('stops').split()}")
+        # a second --enforce while one holds the lock skips instead of interleaving
+        import fcntl
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, "room-enforce.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            r = run()
+        if "another --enforce is running" not in r.stdout or r.returncode != 0:
+            bad.append(f"overlapping enforce must skip with exit 0; got rc {r.returncode} out {r.stdout!r}")
+        # 5. GitHub back with the label on both issues: nothing is stopped again, the queued posts land
+        def issue_list(one_hard, labeled):
+            lab = [{"name": "capped"}] if labeled else []
+            return [{"number": 5, "labels": lab, "comments": [], "body": f"## Room\n- room: room-one\n- caps: soft $15/day, hard ${one_hard}/day\n"},
+                    {"number": 6, "labels": lab, "comments": [], "body": "## Room\n- room: room-two\n- caps: soft $1/day, hard $1/day\n"}]
+        os.remove(os.path.join(stub, "gh-down"))
+        json.dump(issue_list(40, True), open(os.path.join(stub, "issues.json"), "w"))
+        open(os.path.join(stub, "stops"), "w").close()
+        run()
+        if read("stops").split():
+            bad.append(f"label present: nothing may be stopped again, stops {read('stops').split()}")
+        # 6. the owner removes the label, the cost is still over: stopped again the same day
+        json.dump(issue_list(40, False), open(os.path.join(stub, "issues.json"), "w"))
+        run()
+        if sorted(read("stops").split()) != ["id1", "id2"]:
+            bad.append(f"label removed: both over-cap rooms are stopped again, stops {read('stops').split()}")
+        # 7. the owner raises room-one's cap above its cost: the old mark no longer applies and it is not stopped
+        json.dump(issue_list(100, False), open(os.path.join(stub, "issues.json"), "w"))
+        open(os.path.join(stub, "stops"), "w").close()
+        run()
+        if read("stops").split() != ["id2"]:
+            bad.append(f"cap raised: room-one ($50 of $100) is left running, room-two ($3 of $1) is stopped; stops {read('stops').split()}")
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+    return bad
+
+
+def self_test(prices):
+    d = os.path.join(ENGINE_ROOT, "fixtures", "room-cost")
+    exp = json.load(open(os.path.join(d, "expected.json")))
+    today = datetime.fromisoformat(exp["today"]).date()
+    s = summarise([os.path.join(d, "lead.jsonl"), os.path.join(d, "lead", "subagents", "agent-a1.jsonl")], prices, today)
+    ok = abs(s["total"] - exp["total"]) < 1e-6 and abs(s["today"] - exp["today_cost"]) < 1e-6 \
+        and s["requests"] == exp["requests"]
+    print(f"self-test: total ${s['total']:.6f} (expect {exp['total']}), today ${s['today']:.6f} (expect {exp['today_cost']}), "
+          f"requests {s['requests']} (expect {exp['requests']})")
+    # backstop decision table (pure, offline): fixtures/room-cost/backstop.json
+    cases = json.load(open(os.path.join(d, "backstop.json")))
+    bad = 0
+    for c in cases:
+        got = backstop_decision(c.get("comments") or c["comment"], c["alive"], c["pr"], c.get("last_sig"))[0]
+        if got != c["expect"]:
+            bad += 1
+            print(f"self-test: backstop case {c['name']!r}: got {got}, expect {c['expect']}")
+    for repo, room, want in (("acme-web", "room-a.b_c-1", True), (None, "room-x", True), ("evil", "room-x", False),
+                             ("acme-api", "room-../x", False), ("acme-api", "room-a/b", False), ("acme-api", "x-room", False)):
+        if valid_target(repo, room) != want:
+            bad += 1
+            print(f"self-test: valid_target({repo!r}, {room!r}) != {want}")
+    print(f"self-test: backstop {len(cases) - bad}/{len(cases)} cases")
+    # the display reads each room's caps from the Room block (soft and hard), and falls back to the constants
+    cb = "## Room\n- room: room-x\n- caps: soft $45/day, hard $60/day (list-price estimate)\n- prod-read: no"
+    cap_cases = [(caps_from_body(cb), (45.0, 60.0)), (caps_from_body("## Room\n- caps: soft $7.50/day, hard $9/day"), (7.5, 9.0)),
+                 (caps_from_body("no caps here"), (None, None)), (caps_from_body(None), (None, None))]
+    fs = {"today": 15.0, "total": 15.0, "mix": {}, "last_activity": None, "unpriced": []}
+    cap_cases += [("33% of soft cap, 25% of hard cap" in fmt_line("room-x", fs, 45.0, 60.0), True),
+                  ("100% of soft cap, 38% of hard cap" in fmt_line("room-x", fs), True),
+                  ("100% of soft cap, 38% of hard cap" in fmt_line("room-x", fs, None, None), True)]
+    for i, (got, want) in enumerate(cap_cases):
+        if got != want:
+            bad += 1
+            print(f"self-test: caps case {i}: got {got}, expect {want}")
+    print(f"self-test: caps {len(cap_cases) - sum(1 for g, w in cap_cases if g != w)}/{len(cap_cases)} cases")
+    eb = enforce_self_test()
+    for m in eb:
+        print(f"self-test: enforce: {m}")
+    bad += len(eb)
+    print(f"self-test: enforce {'ok' if not eb else 'FAILED'} (hard cap holds while gh fails)")
+    ok = ok and not bad
+    print("self-test: " + ("PASS" if ok else "FAIL"))
+    sys.exit(0 if ok else 1)
+
+
+def main(argv):
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__)
+        return
+    prices = load_prices()
+    if "--self-test" in argv:
+        self_test(prices)
+    if "--enforce" in argv:
+        enforce(prices, "--dry-run" in argv)
+        return
+    as_json = "--json" in argv
+    results = {}
+    if "--file" in argv:
+        p = argv[argv.index("--file") + 1]
+        sid = os.path.basename(p)[:-6]
+        files = [p] + sorted(glob.glob(os.path.join(os.path.dirname(p), sid, "subagents", "agent-*.jsonl")))
+        results[os.path.basename(p)[:8]] = summarise(files, prices)
+    else:
+        ags = agents()
+        if "--all" in argv:
+            names = sorted({a["name"] for a in ags if a.get("name", "").startswith("room-")} if "--any" not in argv
+                           else {a["name"] for a in ags if a.get("name")})
+        else:
+            names = [a for a in argv if a.startswith("room-")]
+            if not names:
+                sys.exit(__doc__)
+        for n in names:
+            results[n] = summarise(files_for_name(n, ags), prices)
+    cached = jload(ROOMS_CACHE, {}).get("rooms") or {}   # each room's own caps, from the last good issue read (enforce writes it)
+    if as_json:
+        print(json.dumps({"label": LABEL, "caps": {"soft": SOFT, "hard": HARD}, "rooms": results}, indent=2))
+        return
+    if not results:
+        print("no rooms found (no session named room-*)")
+    for n, s in sorted(results.items(), key=lambda kv: -kv[1]["total"]):
+        print(fmt_line(n, s, (cached.get(n) or {}).get("soft"), (cached.get(n) or {}).get("hard")))
+    print(f"({LABEL}: list prices from templates/prices.json, not an invoice)")
+
+
+main(sys.argv[1:])

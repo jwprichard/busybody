@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Start a room lead in its own project room (worktree). Steps are SKILL.md §1, in order.
+#
+#   engine/bin/lead-start <repo> <slug> --controller NAME [--model sonnet|opus] [--issue N] [--base REF] [--prod-read] [--team NAME] [--land] [--dry-run]
+#
+# --controller (alias --liaison) names the control room session; defaults to $BUSYBODY_CONTROLLER (the old $SCH_LIAISON_SESSION is read too).
+# Per-repo rules come from office.json: branchPrefix (required), noPush (main is always protected), merge (pr | land), doneNote.
+# room.env, room.deny, room.prodRead and room.portBase shape the room settings. A missing field stops the launch with one line.
+# --base REF branches the room from REF (default origin/main; main for a repo with no remote).
+# --team NAME (default dev-team) names the recipe in teams/: its powers go into the brief (bin/team powers), its caps and flags
+# into the room settings (given explicitly: the draft-PR allow follows draftPr, the bin/land allows follow land). A repo whose merge
+# is "land" has no PRs: its room lands with bin/land instead of opening draft PRs. --land still works and must agree with the config.
+# --dry-run mutates nothing: it prints the plan and the launch command, then stops.
+# Never modifies ~/.claude.json and never answers a trust or permission prompt.
+
+set -euo pipefail
+
+ENGINE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ENGINE_ROOT/bin/lib/officeroot.sh"
+. "$ENGINE_ROOT/bin/lib/officeconfig.sh"
+WS="$WORKSPACE_ROOT"   # child repo clones and teams/; bin/ and templates/ come from $ENGINE_ROOT
+SOFT=15 HARD=40
+
+die() { printf 'lead-start: %s\n' "$*" >&2; exit 1; }
+WS_REPO="$(office_minutes_repo 2>&1)" || die "$WS_REPO"                  # "no minutesRepo: run `busybody init`"
+PORT_BASE_START="$(office_port_base 2>&1)" || die "$PORT_BASE_START"     # room.portBase, default 41000
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+MODEL=sonnet ISSUE="" BASE="" PROD_READ=no DRY=0 TEAM="" LAND=0 LIAISON="$(bb_env CONTROLLER SCH_LIAISON_SESSION)"
+POS=()
+while (($#)); do
+  case "$1" in
+    --model) MODEL="${2:?}"; shift 2 ;;
+    --issue) ISSUE="${2:?}"; shift 2 ;;
+    --base) BASE="${2:?}"; shift 2 ;;
+    --controller|--liaison) LIAISON="${2:?}"; shift 2 ;;
+    --team) TEAM="${2:?}"; shift 2 ;;
+    --land) LAND=1; shift ;;
+    --prod-read) PROD_READ=yes; shift ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag $1" ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+((${#POS[@]} == 2)) || usage
+REPO="${POS[0]}" SLUG="${POS[1]}"
+SLUG="${SLUG#room-}"   # the room is always room-<slug>: a slug given as room-x must not become room-room-x
+
+for c in gh git jq python3 claude; do command -v "$c" >/dev/null || die "$c not installed"; done
+[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "slug must be lowercase letters, digits, dashes (<=41 chars)"
+[[ "$MODEL" == sonnet || "$MODEL" == opus ]] || die "--model must be sonnet or opus"
+[[ -n "$LIAISON" ]] || die "controller session name required: --controller NAME or BUSYBODY_CONTROLLER"
+[[ "$ISSUE" =~ ^[0-9]*$ ]] || die "--issue must be a number"
+# Settings follow the recipe's flags only when --team is given; without it the template is used as it is.
+TEAM_EXPLICIT=0; [[ -z "$TEAM" ]] || TEAM_EXPLICIT=1
+[[ -n "$TEAM" ]] || TEAM=dev-team
+[[ "$TEAM" =~ ^[a-z0-9][a-z0-9-]*$ && -f "$WS/teams/$TEAM/team.json" ]] || die "no recipe teams/$TEAM/team.json"
+read -r SOFT HARD < <(python3 -I -c '
+import json,sys
+c=json.load(open(sys.argv[1]))["caps"]
+print("%g %g"%(c["softUsdPerDay"],c["hardUsdPerDay"]))' "$WS/teams/$TEAM/team.json") || die "cannot read the caps of recipe $TEAM"
+
+# 1. repo -----------------------------------------------------------------------------------
+# Every per-repo rule comes from office.json. A repo that is not listed, or lacks a field, stops the launch here.
+WS_NAME="$(office_workspace_repo)"
+BRANCH_PREFIX="$(office_branch_prefix "$REPO" 2>&1)" || die "$BRANCH_PREFIX"
+NO_PUSH="$(office_no_push "$REPO" 2>&1)" || die "$NO_PUSH"          # one branch per line, main first
+MERGE="$(office_merge "$REPO" 2>&1)" || die "$MERGE"                # pr | land
+DONE_NOTE="$(office_done_note "$REPO" 2>&1)" || die "$DONE_NOTE"
+ROOM_JSON="$(office_room_json 2>&1)" || die "$ROOM_JSON"            # {env, deny, prodRead, portBase}
+OWNER_ONLY="$(office_owner_only 2>&1)" || die "$OWNER_ONLY"         # one item per line
+if [[ "$MERGE" == land ]]; then LAND=1; elif ((LAND)); then die "--land, but office.json says repo $REPO merges by PR"; fi
+if [[ "$REPO" == "$WS_NAME" ]]; then
+  REPO_DIR="$WS"   # the workspace repo itself
+else
+  [[ "$REPO" != */* && "$REPO" != .* ]] || die "repo is a directory name under $WS, or $WS_NAME"
+  REPO_DIR="$WS/$REPO"
+fi
+[[ -e "$REPO_DIR/.git" ]] || die "$REPO_DIR is not a git repo (office.json lists: $(office_repos | paste -sd, | sed 's/,/, /g'))"
+[[ "$(git -C "$REPO_DIR" rev-parse --show-toplevel)" == "$REPO_DIR" ]] || die "$REPO_DIR is not a repo root"
+GIT_COMMON="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir)"
+
+# 2. trust (read-only) ----------------------------------------------------------------------
+TRUSTED="$(python3 -I -c '
+import json,os,sys
+try: d=json.load(open(os.path.expanduser("~/.claude.json")))
+except Exception: d={}
+print("yes" if d.get("projects",{}).get(sys.argv[1],{}).get("hasTrustDialogAccepted") is True else "no")' "$REPO_DIR")"
+if [[ "$TRUSTED" != yes ]]; then
+  cat >&2 <<EOT
+lead-start: $REPO_DIR is not trusted by Claude Code yet (trust is keyed on the git root).
+Ask the user to run this once and accept the trust dialog, then re-run:
+
+    cd $REPO_DIR && claude
+
+lead-start never edits ~/.claude.json and never answers the prompt.
+EOT
+  exit 1
+fi
+
+ROOM="room-$SLUG"
+WORKTREE="$REPO_DIR/.claude/worktrees/$ROOM"
+BRANCH="$BRANCH_PREFIX$SLUG"
+SETTINGS="$WORKTREE/.claude/room-settings.json"
+[[ -e "$WORKTREE" ]] && die "$WORKTREE already exists (resume it with: claude attach $ROOM)"
+git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch $BRANCH already exists in $REPO"
+
+# Ports: first free block of 10 from $PORT_BASE_START, skipping blocks in other open issues' Room blocks
+USED="$(gh issue list -R "$WS_REPO" --label initiative --state open -L 100 --json body -q '.[].body' 2>/dev/null \
+  | grep -oE '^[-*] ports:[^0-9]*[0-9]+' | grep -oE '[0-9]+$' || true)"
+PORT_BASE=$PORT_BASE_START
+while grep -qx "$PORT_BASE" <<<"$USED"; do PORT_BASE=$((PORT_BASE + 10)); done
+PORTS="$PORT_BASE-$((PORT_BASE + 9))"
+
+ENV_NOTE="env: $(jq -r '.env | keys | join(", ") | if . == "" then "none" else . end' <<<"$ROOM_JSON") (room.env)"
+
+ROOM_BLOCK="## Room
+- room: $ROOM
+- team: $TEAM
+- repo: $REPO
+- worktree: $WORKTREE
+- branch: $BRANCH
+- model: $MODEL
+- ports: $PORTS
+- compose: $ROOM
+- caps: soft \$$SOFT/day, hard \$$HARD/day
+- prod-read: $PROD_READ"
+
+HAS_REMOTE=0; git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1 && HAS_REMOTE=1
+[[ -n "$BASE" ]] || { ((HAS_REMOTE)) && BASE=origin/main || BASE=main; }
+git -C "$REPO_DIR" rev-parse -q --verify "$BASE^{commit}" >/dev/null || ((HAS_REMOTE)) || die "--base $BASE is not a commit in $REPO_DIR"
+FETCH_NOTE=$( ((HAS_REMOTE)) && echo "git -C $REPO_DIR fetch; " || echo "(no remote: no fetch) " )
+if ((DRY)); then
+  say "DRY RUN: nothing is created, written or launched."
+  say "repo:      $REPO ($REPO_DIR), trusted: yes"
+  if [[ -n "$ISSUE" ]]; then say "issue:     link #$ISSUE in $WS_REPO (Room block inserted or replaced)"
+  else say "issue:     create in $WS_REPO, label initiative, assignee $(gh api user -q .login), with:"; fi
+  say "$ROOM_BLOCK" | sed 's/^/              /'
+  say "worktree:  ${FETCH_NOTE}git -C $REPO_DIR worktree add --no-track $WORKTREE -b $BRANCH $BASE"
+  say "exclude:   .claude/worktrees/ -> $GIT_COMMON/info/exclude"
+  say "hook:      $GIT_COMMON/hooks/pre-push (rejects $(paste -sd' ' <<<"$NO_PUSH"); merge: $MERGE; existing hook: $([[ -e $GIT_COMMON/hooks/pre-push ]] && echo 'present, will be chained' || echo none))"
+  say "settings:  $SETTINGS (prod-read: $PROD_READ; $ENV_NOTE; team: $TEAM, flags applied: $( ((TEAM_EXPLICIT)) && echo yes || echo no )$( ((LAND)) && echo ", land override: yes"))"
+  say "powers:    (team $TEAM; goes into the brief)"
+  "$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ) | sed 's/^/              /' 
+  say "launch:    cd $WORKTREE && claude --bg -n $ROOM --model $MODEL --permission-mode auto --settings $SETTINGS '<brief from templates/lead-brief.md; controller=$LIAISON>'"
+  say "check:     poll the issue up to 180s for a PROGRESS: comment, else claude logs $ROOM tail and exit 2"
+  exit 0
+fi
+
+# 3. issue ----------------------------------------------------------------------------------
+if [[ -z "$ISSUE" ]]; then
+  ME="$(gh api user -q .login)"
+  TITLE="$(sed 's/-/ /g; s/^./\U&/' <<<"$SLUG")"
+  BODY="Goal: <the controller fills this in from the user's request>
+
+Trello: none yet
+
+## Steps
+1. $REPO — $TITLE: no PR yet
+
+$ROOM_BLOCK"
+  URL="$(gh issue create -R "$WS_REPO" --title "$TITLE" --label initiative --assignee "$ME" --body "$BODY")"
+  ISSUE="${URL##*/}"
+else
+  OLD="$(gh issue view "$ISSUE" -R "$WS_REPO" --json body -q .body)"
+  NEW="$(ROOM_BLOCK="$ROOM_BLOCK" python3 -I -c '
+import os,re,sys
+body=sys.stdin.read().rstrip("\n")
+body=re.sub(r"(?ms)^## Room\b.*?(?=^## |\Z)","",body).rstrip("\n")
+print(body+"\n\n"+os.environ["ROOM_BLOCK"])' <<<"$OLD")"
+  gh issue edit "$ISSUE" -R "$WS_REPO" --body "$NEW" >/dev/null
+fi
+ISSUE_URL="https://github.com/$WS_REPO/issues/$ISSUE"
+say "issue: $ISSUE_URL"
+
+# 4. worktree -------------------------------------------------------------------------------
+((HAS_REMOTE)) && git -C "$REPO_DIR" fetch -q origin
+git -C "$REPO_DIR" worktree add --no-track "$WORKTREE" -b "$BRANCH" "$BASE"
+say "worktree: $WORKTREE ($BRANCH)"
+
+# 5. local exclude --------------------------------------------------------------------------
+mkdir -p "$GIT_COMMON/info"
+grep -qxF '.claude/worktrees/' "$GIT_COMMON/info/exclude" 2>/dev/null || echo '.claude/worktrees/' >> "$GIT_COMMON/info/exclude"
+
+# 6. pre-push hook (shared by all worktrees of the clone) -----------------------------------
+[[ -z "$(git -C "$REPO_DIR" config --get core.hooksPath || true)" ]] \
+  || die "core.hooksPath is set in $REPO, so the pre-push seatbelt would not run (room already created: $WORKTREE)"
+HOOK="$GIT_COMMON/hooks/pre-push"
+mkdir -p "$GIT_COMMON/hooks"
+# the marker is now "busybody ..."; a hook with the old marker is still ours (and is overwritten below)
+if [[ -e "$HOOK" ]] && ! grep -qF -e "busybody lead-start pre-push seatbelt" -e "sch-workspace lead-start pre-push seatbelt" "$HOOK"; then
+  [[ ! -e "$HOOK.chained" ]] || die "$HOOK and $HOOK.chained both exist; resolve by hand"
+  mv "$HOOK" "$HOOK.chained"
+  say "NOTE: existing pre-push hook moved to $HOOK.chained; the seatbelt chains to it"
+fi
+# the hook runs alone inside the clone, so this repo's protected branches and merge mode are written into it
+sed -e "s|@PROTECTED@|$(paste -sd' ' <<<"$NO_PUSH")|" -e "s|@MERGE@|$MERGE|" "$ENGINE_ROOT/bin/lib/pre-push-seatbelt" > "$HOOK"
+chmod +x "$HOOK"
+
+# 7. settings -------------------------------------------------------------------------------
+mkdir -p "$(dirname "$SETTINGS")"
+TEAM_JSON=""; ((TEAM_EXPLICIT)) && TEAM_JSON="$WS/teams/$TEAM/team.json"
+python3 -I - "$ENGINE_ROOT/templates/room-settings.json" "$SETTINGS" "$ROOM" "$PORT_BASE" "$PROD_READ" "$ROOM_JSON" "$NO_PUSH" "$TEAM_JSON" "$LAND" <<'PY'
+import json, sys
+tpl, out, room, base, prod, room_json, no_push, team_json, land_override = sys.argv[1:10]
+d = json.load(open(tpl))
+d.pop("_comment", None)
+cfg = json.loads(room_json)
+d["env"]["COMPOSE_PROJECT_NAME"] = room
+d["env"]["ROOM_PORT_BASE"] = base
+d["env"].update(cfg["env"])                    # room.env: set in every room (may be empty)
+deny = d["permissions"]["deny"]
+for b in no_push.split():                      # this repo's protected branches; main is universal and stays in the template
+    if b != "main":
+        deny += [f"Bash(git push * {b})", f"Bash(git push * {b} *)", f"Bash(git push *:{b})",
+                 f"Bash(git push *:{b} *)", f"Bash(git push *refs/heads/{b}*)"]
+deny += cfg["deny"]                            # room.deny: patterns tied to the workspace's own tools
+if prod != "yes":
+    deny += cfg["prodRead"]                    # room.prodRead: lifted only by --prod-read
+if team_json:
+    t = json.load(open(team_json))
+    draft = t["draftPr"] and land_override != "1"
+    land = t["land"] or land_override == "1"
+    allow = d["permissions"]["allow"]
+    if not draft:
+        allow = [a for a in allow if not a.startswith("Bash(gh pr create --draft")]
+        deny.append("Bash(gh pr create*)")
+    if not land:
+        allow = [a for a in allow if "bin/land" not in a]
+        deny.append("Bash(*bin/land*)")
+    d["permissions"]["allow"] = allow
+json.dump(d, open(out, "w"), indent=2)
+PY
+python3 -I -c 'import json,sys;json.load(open(sys.argv[1]))' "$SETTINGS" || die "generated settings are not valid JSON"
+say "settings: $SETTINGS"
+
+# 8. brief ----------------------------------------------------------------------------------
+DONE_TEXT="Done means: the work in the issue body is complete on branch $BRANCH, the repo's checks pass, and the branch is pushed. The evidence bin/status needs (merge, release tag, deploy run) comes only after the user merges and deploys; list what is still outstanding."
+[[ -z "$DONE_NOTE" ]] || DONE_TEXT="$DONE_TEXT $DONE_NOTE"
+TEAM_POWERS="$("$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ))" || die "cannot render the powers of recipe $TEAM"
+LANDFLAG=""; ((LAND)) && LANDFLAG=--land
+TEAM_COMMIT="$("$ENGINE_ROOT/bin/team" brief "$TEAM" commit $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
+TEAM_COMMIT="${TEAM_COMMIT//@BRANCH@/$BRANCH}"
+TEAM_PRS="$("$ENGINE_ROOT/bin/team" brief "$TEAM" prs $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
+TEAM_PR_LIMIT="$("$ENGINE_ROOT/bin/team" brief "$TEAM" prlimit $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
+OWNER_ONLY_LIST="$(sed 's/^/- /' <<<"$OWNER_ONLY")"
+BRIEF="$(WORKSPACE="$WS" NO_PUSH="$(paste -sd" " <<<"$NO_PUSH")" OWNER_ONLY="$OWNER_ONLY_LIST" CONTROLLER_VAR=BUSYBODY_CONTROLLER TEAM_COMMIT="$TEAM_COMMIT" TEAM_PRS="$TEAM_PRS" TEAM_PR_LIMIT="$TEAM_PR_LIMIT" TEAM_NAME="$TEAM" TEAM_POWERS="$TEAM_POWERS" ROOM="$ROOM" ISSUE_URL="$ISSUE_URL" ISSUE_NUM="$ISSUE" ISSUE_REPO="$WS_REPO" REPO="$REPO" REPO_DIR="$REPO_DIR" \
+  WORKTREE="$WORKTREE" BRANCH="$BRANCH" PORTS="$PORTS" PROD_READ="$PROD_READ" LIAISON="$LIAISON" SOFT="$SOFT" HARD="$HARD" \
+  DONE_TEXT="$DONE_TEXT" python3 -I -c '
+import os,re,sys
+t=open(sys.argv[1]).read()
+t=re.sub(r"\{\{([A-Z_]+)\}\}",lambda m:os.environ[m.group(1)],t)
+print(t)' "$ENGINE_ROOT/templates/lead-brief.md")"
+
+# 9. launch ---------------------------------------------------------------------------------
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+say "launching $ROOM ($MODEL, auto mode)"
+(cd "$WORKTREE" && claude --bg -n "$ROOM" --model "$MODEL" --permission-mode auto --settings "$SETTINGS" "$BRIEF")
+
+# 10. launch check: the room lead's first act is a PROGRESS: comment -----------------------------
+# The room lead posts as the same GitHub user, so match on text and time, not author.
+# One small REST call every 10 s (not GraphQL, and never the whole comment list): only comments created or edited since the launch.
+for _ in $(seq 1 18); do
+  sleep 10
+  if gh api "repos/$WS_REPO/issues/$ISSUE/comments?since=$STAMP&per_page=10" 2>/dev/null \
+      | jq -e '[.[] | select(.body | startswith("PROGRESS:"))] | length > 0' >/dev/null; then
+    say "room lead online: first PROGRESS: comment seen on $ISSUE_URL"
+    exit 0
+  fi
+done
+cat >&2 <<EOT
+
+!!! lead-start: NO PROGRESS: comment from $ROOM within 180s on $ISSUE_URL
+!!! The room lead may be waiting on a trust or permission prompt. Do NOT answer it for the user: report it.
+--- claude logs $ROOM (tail) ---
+EOT
+claude logs "$ROOM" 2>&1 | tail -n 40 >&2 || true
+exit 2

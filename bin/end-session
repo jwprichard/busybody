@@ -1,0 +1,31 @@
+#!/usr/bin/python3 -I
+"""busybody end-session <room-or-role-session-name> [--grace SECONDS]
+
+Ends a room's or role's Claude session by matching its process (the claude binary with `-n <name>`, the exact name), SIGTERM first,
+SIGKILL only if it ignores TERM past the grace period (default 10 s; the output says so). Use it when `claude stop` reports no
+job for a session that is still running, or for a session whose issue is closed (`rooms --leftovers` lists those).
+"""
+import os, sys
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+import sessions  # noqa: E402
+
+args = sys.argv[1:]
+grace = 10.0
+if "--grace" in args:
+    i = args.index("--grace")
+    try:
+        grace = float(args[i + 1])
+    except (IndexError, ValueError):
+        sys.exit("end-session: --grace needs a number of seconds")
+    del args[i:i + 2]
+if len(args) != 1 or args[0].startswith("-"):
+    print(__doc__, file=sys.stderr)
+    sys.exit(2)
+try:
+    ok, lines = sessions.end(args[0], grace=grace)
+except ValueError as e:
+    sys.exit(f"end-session: {e}")
+print("\n".join(lines))
+sys.exit(0 if ok else 1)

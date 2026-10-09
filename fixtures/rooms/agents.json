@@ -1,0 +1,1 @@
+[{"name": "room-alpha", "status": "busy", "state": "working"}, {"name": "other", "status": "idle"}, {"name": "role-scribe-tidy-notes", "status": "busy", "state": "working", "sessionId": "sess-scribe", "id": "ab12cd34"}, {"name": "role-scribe-old-pass", "status": "idle", "state": "done", "sessionId": "sess-old", "id": "ee00ff11"}]

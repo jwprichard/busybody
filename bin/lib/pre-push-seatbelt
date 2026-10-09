@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# busybody lead-start pre-push seatbelt
+# From a room worktree (.claude/worktrees/room-*), rejects any pushed remote ref in PROTECTED. Not a security boundary.
+# lead-start writes this repo's values in place of the two @...@ tokens when it installs the hook (the hook runs alone in the clone).
+PROTECTED="@PROTECTED@"   # space-separated branch names from office.json noPush; main is always first
+MERGE="@MERGE@"           # pr | land
+[[ "$PROTECTED" == @* ]] && PROTECTED="main"   # an unsubstituted copy (still starting with @) protects main
+# Stdin lines: <local ref> <local sha> <remote ref> <remote sha>. Chains to pre-push.chained if present.
+input="$(cat)"
+# Only rooms are held back: the user's and the controller's own checkouts push as normal
+# (the workspace repo commits straight to main by design).
+top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+case "$top" in
+  */.claude/worktrees/room-*) is_room=1 ;;
+  *) is_room=0 ;;
+esac
+while read -r _lref _lsha rref _rsha; do
+  b="${rref#refs/heads/}"; [[ "$rref" == "refs/heads/$b" ]] || continue
+  for p in $PROTECTED; do
+    [[ "$b" == "$p" ]] || continue
+    [[ $is_room == 1 ]] || continue
+    # a repo that lands (merge "land": no PRs) lets bin/land push main, and only that
+    [[ "$MERGE" == land && "$b" == main && "${BUSYBODY_LAND:-}" == 1 ]] && continue
+    echo "pre-push seatbelt: refusing to push to $b (rooms never push: $PROTECTED)" >&2
+    exit 1
+  done
+done <<<"$input"
+chained="$(dirname "$0")/pre-push.chained"
+if [[ -x "$chained" ]]; then
+  printf '%s\n' "$input" | "$chained" "$@"
+  exit $?
+fi
+exit 0

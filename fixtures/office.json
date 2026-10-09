@@ -1,0 +1,19 @@
+{
+  "minutesRepo": "acme-co/acme-office",
+  "workspaceRepo": "acme-office",
+  "displayName": "Acme",
+  "repos": {
+    "acme-office": {"path": ".", "github": "acme-co/acme-office", "branchPrefix": "feat/", "merge": "land"},
+    "acme-web": {"path": "web", "github": "acme-co/web-app", "branchPrefix": "work/", "noPush": ["release", "main"], "merge": "pr", "doneNote": "Done also means the preview deploy is green."},
+    "acme-api": {"path": "api", "branchPrefix": "feature/", "merge": "pr"},
+    "acme-bot": {"path": "bot"}
+  },
+  "room": {
+    "env": {"ACME_ENV": "dev"},
+    "deny": ["Bash(acme-cli deploy*)"],
+    "prodRead": ["mcp__acme-prod__*"],
+    "portBase": 42000
+  },
+  "ownerOnly": ["deploying to acme-prod"],
+  "tracker": {"type": "none"}
+}
