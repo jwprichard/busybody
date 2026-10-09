@@ -146,7 +146,7 @@ EOS
   run() { rc=0; out="$("$SELF" "$@" 2>&1)" || rc=$?; }
   snap() { (cd "$1" && find . -path ./.git -prune -o -path ./busybody -prune -o -type f -print0 | sort -z | xargs -0 cksum; cksum .git/hooks/pre-push .git/config 2>/dev/null); }
   # a scratch workspace folder holding a clone of the engine (a copy with its own .git), as a real install does
-  ws() { W="$T/$1"; mkdir -p "$W"; cp -a "$ENGINE_ROOT" "$W/busybody"; git -C "$W/busybody" init -q -b main; }
+  ws() { W="$T/$1"; mkdir -p "$W"; cp -a "$ENGINE_ROOT" "$W/busybody"; rm -rf "$W/busybody/.git"; git -C "$W/busybody" init -q -b main; }
 
   # issues off: refuses, writes nothing
   ws off; GH_STUB=false run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
