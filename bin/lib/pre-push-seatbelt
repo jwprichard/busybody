@@ -14,13 +14,23 @@ case "$top" in
   */.claude/worktrees/room-*) is_room=1 ;;
   *) is_room=0 ;;
 esac
+# The lander (bin/land) writes <token> <sha> to $GIT_COMMON_DIR/busybody-land-grant, exports the token as BUSYBODY_LAND and removes the
+# file when its push ends. A push is the lander's only if the environment token matches the file and the pushed commit is the one the
+# lander verified. A bare BUSYBODY_LAND=1, a stale token or any other commit is refused.
+land_granted() {
+  local grant tok sha
+  grant="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/busybody-land-grant"
+  [[ -n "${BUSYBODY_LAND:-}" && -r "$grant" ]] || return 1
+  read -r tok sha < "$grant" || true
+  [[ -n "$tok" && "$tok" == "$BUSYBODY_LAND" && -n "$sha" && "$sha" == "$1" ]]
+}
 while read -r _lref _lsha rref _rsha; do
   b="${rref#refs/heads/}"; [[ "$rref" == "refs/heads/$b" ]] || continue
   for p in $PROTECTED; do
     [[ "$b" == "$p" ]] || continue
     [[ $is_room == 1 ]] || continue
-    # a repo that lands (merge "land": no PRs) lets bin/land push main, and only that
-    [[ "$MERGE" == land && "$b" == main && "${BUSYBODY_LAND:-}" == 1 ]] && continue
+    # a repo that lands (merge "land": no PRs) lets the lander push main: only that commit, only while its one-shot grant exists
+    [[ "$MERGE" == land && "$b" == main ]] && land_granted "$_lsha" && continue
     echo "pre-push seatbelt: refusing to push to $b (rooms never push: $PROTECTED)" >&2
     exit 1
   done
