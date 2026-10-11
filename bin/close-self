@@ -1,0 +1,105 @@
+#!/usr/bin/python3 -I
+"""busybody close-self [--delay SECONDS] [--grace SECONDS]
+busybody close-self --self-test
+
+A room or role session ends its own session: the last step after posting DONE, then end your turn. It takes no target and can only
+end the session it runs in, which is why a room's settings allow it while `end-session` stays denied.
+
+A session cannot end its own process from inside its own tool call (it is its own ancestor), so this finds the session it runs in (the
+nearest claude ancestor named room-* or role-*, by the background-session list or its `-n` name), starts a detached helper and returns at
+once. After --delay seconds (default 5) the helper ends that pid by id (SIGTERM, then SIGKILL past --grace, default 10 s) and writes
+the outcome to the log this prints. `team resolve --close` and `rooms --leftovers` (the controller's checks) catch a session that
+still went on. Outside a room or role session it refuses.
+"""
+import os, subprocess, sys, tempfile, time
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+import sessions  # noqa: E402
+
+
+def number(args, flag, default):
+    if flag not in args:
+        return default
+    i = args.index(flag)
+    try:
+        v = float(args[i + 1])
+    except (IndexError, ValueError):
+        sys.exit(f"close-self: {flag} needs a number of seconds")
+    del args[i:i + 2]
+    return v
+
+
+def self_test():
+    import json
+    bad = []
+    with tempfile.TemporaryDirectory() as d:
+        agents = os.path.join(d, "agents.json")
+        json.dump([], open(agents, "w"))
+        os.makedirs(os.path.join(d, "tmp"))
+        env = dict(os.environ, BUSYBODY_AGENTS_JSON=agents, CLAUDE_JOB_DIR=d)
+        me = os.path.realpath(__file__)
+        # a bash standing in for a room's claude process (argv0 claude, -n <name>) runs close-self, which returns at once; the helper
+        # then ends that process by pid. Without the helper's delay the stand-in would sleep far longer than the test waits.
+        room = subprocess.Popen(["bash", "-c", f"exec -a claude bash -c '{me} --delay 0.3 --grace 5 > {d}/said; sleep 20; :' claude -n room-selftest-self"], env=env)
+        t0 = time.time()
+        while room.poll() is None and time.time() - t0 < 15:
+            time.sleep(0.1)
+        if room.poll() is None:
+            room.kill()
+            bad.append("the session was not ended")
+        said = open(os.path.join(d, "said")).read() if os.path.exists(os.path.join(d, "said")) else ""
+        if "will be ended" not in said or "room-selftest-self" not in said:
+            bad.append(f"it did not say what it did: {said!r}")
+        log = os.path.join(d, "tmp", "end-session-room-selftest-self.log")
+        for _ in range(50):   # the helper logs just after the process is gone
+            if os.path.exists(log) and "ended pid" in open(log).read():
+                break
+            time.sleep(0.1)
+        else:
+            bad.append(f"the helper did not log the outcome: {open(log).read() if os.path.exists(log) else 'no log'!r}")
+        # outside a room or role session it refuses
+        r = subprocess.run([sys.executable, "-I", me], env=env, capture_output=True, text=True)
+        if r.returncode == 0 or "not running inside" not in r.stderr:
+            bad.append(f"outside a session: rc={r.returncode} {r.stderr!r}")
+    if bad:
+        print("close-self self-test: FAILED: " + "; ".join(bad))
+        return 1
+    print("close-self self-test: ok")
+    return 0
+
+
+args = sys.argv[1:]
+if args == ["--self-test"]:
+    sys.exit(self_test())
+grace = number(args, "--grace", 10.0)
+delay = number(args, "--delay", 5.0)
+helper = None
+if "--helper" in args:   # internal: the detached half, given the pid to end
+    i = args.index("--helper")
+    helper = args[i + 1] if i + 1 < len(args) else ""
+    del args[i:i + 2]
+if args:
+    print(__doc__, file=sys.stderr)
+    sys.exit(2)
+
+if helper is not None:
+    time.sleep(delay)
+    try:
+        ok, lines = sessions.end_target(helper, grace=grace)
+    except ValueError as e:
+        print(f"close-self: {e}")
+        sys.exit(1)
+    print("\n".join(lines))
+    sys.exit(0 if ok else 1)
+
+own = sessions.own_session()
+if not own:
+    sys.exit("close-self: not running inside a room or role session (no claude ancestor named room-* or role-*)")
+name, pid = own
+logdir = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if os.environ.get("CLAUDE_JOB_DIR") else tempfile.gettempdir()
+log = os.path.join(logdir, f"end-session-{name}.log") if os.path.isdir(logdir) else os.devnull
+with open(log, "w") as out:
+    subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--helper", str(pid), "--delay", str(delay), "--grace", str(grace)],
+                     stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+print(f"{name}: pid {pid} will be ended in {delay:g}s by a detached helper (log: {log}); end your turn now")
