@@ -2,8 +2,8 @@
 """Team recipes: validate, launch and resolve (docs/team-recipes.md is the spec).
 
   bin/team check [name…]    validate teams/*/ (all by default); one line per recipe; non-zero on any failure
-  bin/team powers <recipe> [--land]
-                            the powers text for a launch brief, from the recipe's flags
+  bin/team powers <recipe> [--land] [--desks]
+                            the powers text for a launch brief, from the recipe's flags (--desks: name each desk's `desks:<team>-<desk>` agent type)
   bin/team brief <recipe> commit|prs|prlimit [--land]
                             the recipe-dependent lines of the room lead's brief (@BRANCH@ stands for the room's branch)
   bin/team start <recipe> <initiative|"task"> [--repo R] [--base REF] [--controller NAME] [--dry-run]
@@ -381,6 +381,11 @@ def self_test():
     c = pw(draftPr=False, land=True, output="landed-branch")
     if not ("bin/land <branch>" in c and "never `--no-checks`" in c and "may not open a PR" in c):
         bad.append(f"powers land: {c}")
+    e = powers_text(_base(), False, True)
+    if not ('`subagent_type: "desks:x-impl"`' in e and '`subagent_type: "desks:x-rev"`' in e and "pass no `model`" in e):
+        bad.append(f"powers --desks: {e}")
+    if "subagent_type" in a or "subagent_type" in powers_text(dict(_base(), desks=[]), False, True):
+        bad.append("powers without --desks (or with no desks) names no agent type")
     d = powers_text(_base(), True)
     if not ("bin/land <branch>" in d and "gh pr create --draft" not in d):
         bad.append(f"powers land override: {d}")
@@ -723,9 +728,10 @@ def _or_list(names):
     return q[0] if len(q) == 1 else ", ".join(q[:-1]) + " or " + q[-1]
 
 
-def powers_text(t, land_override=False):
+def powers_text(t, land_override=False, desks=False):
     """The bullets the launch brief states, from the recipe's flags. `land_override` is for a repo without
-    PRs: the room lands with bin/land instead of opening draft PRs."""
+    PRs: the room lands with bin/land instead of opening draft PRs. `desks` is for a workspace with a generated
+    desks/ plugin (bin/kit): the Desks bullet is then followed by one naming each desk's agent type."""
     draft = t["draftPr"] and not land_override
     land = t["land"] or land_override
     head = t["head"]
@@ -734,6 +740,10 @@ def powers_text(t, land_override=False):
     if t["desks"]:
         ds = "; ".join(f"{d['name']} up to {d['max']} on {d['model']}" + (" (read-only)" if d.get("readOnly") else "") for d in t["desks"])
         out.append(f"- Desks (a maximum, never a quota: leave desks empty for small work): {ds}. You head the room on {head['model']}.")
+        if desks:
+            types = ", ".join(f'{d["name"]} = `subagent_type: "desks:{t["name"]}-{d["name"]}"`' for d in t["desks"])
+            out.append(f"- Spawn each desk with its agent type ({types}). The agent type fixes the desk's model and its tools, "
+                       "so pass no `model` and do not use a general-purpose agent for desk work.")
     else:
         out.append(f"- Desks: none. You work alone on {head['model']}.")
     out.append("- Worktree: this room has a worktree, and you may edit and commit in it." if t["worktree"] else
@@ -1207,8 +1217,8 @@ def main(argv):
     if argv[0] == "powers":
         names = [a for a in argv[1:] if not a.startswith("--")]
         if len(names) != 1:
-            die("usage: bin/team powers <recipe> [--land]")
-        print(powers_text(load_recipe(names[0]), "--land" in argv))
+            die("usage: bin/team powers <recipe> [--land] [--desks]")
+        print(powers_text(load_recipe(names[0]), "--land" in argv, "--desks" in argv))
         return 0
     die(f"unknown command {argv[0]}; see bin/team --help")
 
