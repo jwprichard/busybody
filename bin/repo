@@ -1,0 +1,383 @@
+#!/usr/bin/python3 -I
+"""Import a child repo into the workspace: the mechanics, deterministic. The judgement (what the repo is, its evidence rule) is the controller's, in the busybody:repo-onboard skill.
+
+  bin/repo add <owner/name> [flags]    clone it, gitignore the clone, add one entry to office.json, add a stub to the workspace CLAUDE.md
+  bin/repo --self-test                 offline: stub gh, scratch workspace, a local bare repo as the remote
+
+Flags for add (each overrides what is read from GitHub):
+  --name N             the repo's name in office.json (default: the repo's name)
+  --path P             the clone's folder, relative to the workspace (default: the name)
+  --branch-prefix X    a room's branch prefix ("" is allowed); default: the commonest prefix of recent PR branches, else feat/
+  --commit-style S     conventional | plain (written in the CLAUDE.md stub only); default: guessed from recent commit subjects
+  --merge pr|land      default: pr
+  --no-push B[,B...]   branches rooms may never push (main is always one); default: the protected branches, plus the default branch
+  --dry-run            read from GitHub and print what would be written, writing and cloning nothing
+  --no-clone           write the entry and stub but do not clone (the folder must already hold the clone)
+
+It reads GitHub through `gh` (default branch, protected branches, allowed merge methods, recent history). The office.json entry
+is inserted as text, so the rest of the file keeps its formatting. It refuses a repo already listed, or a folder that exists
+(unless --no-clone). The one step it cannot do is printed last: trust the repo in Claude Code.
+"""
+import contextlib, io, json, os, re, shutil, subprocess, sys, tempfile
+from collections import Counter
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import bb_env, data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+from officeconfig import Office, ConfigError  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+
+CONVENTIONAL = re.compile(r"^(feat|fix|docs|chore|refactor|test|perf|build|ci|style|revert)(\([^)]*\))?!?: ")
+
+
+class Stop(Exception):
+    """One line a person can act on."""
+
+
+def gh_json(path):
+    try:
+        r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Stop(f"gh is not usable: {e}")
+    if r.returncode:
+        raise Stop(f"gh api {path} failed: {(r.stderr.strip().splitlines() or ['no output'])[-1]}")
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        raise Stop(f"gh api {path}: not JSON")
+
+
+def read_github(slug):
+    """Facts about the repo from GitHub: default branch, protected branches, merge methods, branch prefix and commit style guesses."""
+    meta = gh_json(f"repos/{slug}")
+    default = meta.get("default_branch") or "main"
+    protected = [b["name"] for b in gh_json(f"repos/{slug}/branches?protected=true&per_page=100")]
+    methods = [m for m, k in (("merge", "allow_merge_commit"), ("squash", "allow_squash_merge"), ("rebase", "allow_rebase_merge")) if meta.get(k)]
+    heads = [p["head"]["ref"] for p in gh_json(f"repos/{slug}/pulls?state=closed&per_page=30")]
+    prefixes = Counter(h.split("/")[0] + "/" for h in heads if "/" in h)
+    subjects = [c["commit"]["message"].splitlines()[0] for c in gh_json(f"repos/{slug}/commits?per_page=30")]
+    real = [s for s in subjects if not s.startswith("Merge ")]
+    conventional = bool(real) and sum(1 for s in real if CONVENTIONAL.match(s)) * 10 >= len(real) * 6
+    return {"default": default, "protected": protected, "methods": methods,
+            "prefix": prefixes.most_common(1)[0][0] if prefixes else None, "style": "conventional" if conventional else "plain"}
+
+
+# --- office.json: insert one entry as text, leaving the rest of the file as it is ---------------------------------------------
+def _skip_string(t, i):
+    i += 1
+    while t[i] != '"':
+        i += 2 if t[i] == "\\" else 1
+    return i + 1
+
+
+def _skip_value_end(t, i):
+    """Index just past the object/array that starts at t[i]."""
+    depth = 0
+    while True:
+        c = t[i]
+        if c == '"':
+            i = _skip_string(t, i)
+            continue
+        depth += c in "{[" and 1 or 0
+        depth -= c in "}]" and 1 or 0
+        i += 1
+        if depth == 0:
+            return i
+
+
+def _top_level_key(t, key):
+    """Index of the first character of the value of top-level `key`, or -1."""
+    i, depth = 0, 0
+    while i < len(t):
+        c = t[i]
+        if c == '"':
+            j = _skip_string(t, i)
+            if depth == 1 and json.loads(t[i:j]) == key:
+                m = re.compile(r"\s*:\s*").match(t, j)
+                if m:
+                    return m.end()
+            i = j
+            continue
+        depth += c in "{[" and 1 or 0
+        depth -= c in "}]" and 1 or 0
+        i += 1
+    return -1
+
+
+def insert_entry(text, name, entry):
+    """`text` with repos.<name> = entry added; the rest of the text is untouched. The result is checked to parse."""
+    body = json.dumps(entry, separators=(", ", ": "))
+    start = _top_level_key(text, "repos")
+    if start >= 0:
+        if text[start] != "{":
+            raise Stop("office.json: `repos` is not an object")
+        end = _skip_value_end(text, start) - 1                     # the closing brace
+        m = re.search(r"\n([ \t]*)\"", text[start:end])
+        ind = m.group(1) if m else "    "
+        close_ind = ind[: max(len(ind) // 2, 0)] if not m else ind[: len(ind) // 2 if len(ind) >= 4 else 0]
+        last = len(text[:end].rstrip())
+        if text[last - 1] == "{":                                   # empty object
+            out = text[:last] + f'\n{ind}"{name}": {body}\n{close_ind}' + text[end:]
+        else:
+            out = text[:last] + f',\n{ind}"{name}": {body}' + text[last:]
+    else:
+        end = text.rstrip().rfind("}")
+        if end < 0:
+            raise Stop("office.json: not a JSON object")
+        m = re.search(r"\n([ \t]*)\"", text)
+        ind = m.group(1) if m else "  "
+        last = len(text[:end].rstrip())
+        sep = "" if text[last - 1] == "{" else ","
+        out = text[:last] + f'{sep}\n{ind}"repos": {{\n{ind}{ind}"{name}": {body}\n{ind}}}' + text[last:]
+    try:
+        cfg = json.loads(out)
+    except ValueError as e:
+        raise Stop(f"office.json: the edit would not parse ({e}); nothing written")
+    if cfg.get("repos", {}).get(name) != entry:
+        raise Stop("office.json: the edit did not land as expected; nothing written")
+    return out
+
+
+# --- the workspace CLAUDE.md stub ----------------------------------------------------------------------------------------------
+def stub_block(name, slug, path, g, a):
+    methods = ", ".join(g["methods"]) or "unknown"
+    return (f"### {name}\n\n"
+            f"TODO(controller): fill in from the repo's own `CLAUDE.md`, CI and deploy workflows (the `busybody:repo-onboard` skill).\n\n"
+            f"- Repo: `{slug}`, cloned at `{path}/` (gitignored here). Default branch `{g['default']}`.\n"
+            f"- Commits: {a['style']} (guessed from recent history). Branches: `{a['prefix']}`. Merge: {methods} (allowed on GitHub).\n"
+            f"- Environments: TODO. Deploy trigger: TODO. Checks: TODO. Connects to: TODO. Evidence rule: TODO.\n")
+
+
+def add_stub(text, name, block):
+    if re.search(rf"^### {re.escape(name)}\s*$", text, re.M):
+        raise Stop(f"CLAUDE.md already has a '### {name}' section")
+    m = re.search(r"^## Your repos[^\n]*\n", text, re.M)
+    if not m:
+        return text.rstrip("\n") + f"\n\n## Your repos (yours)\n\n{block}"
+    nxt = re.search(r"^## ", text[m.end():], re.M)
+    at = m.end() + nxt.start() if nxt else len(text)
+    return text[:at].rstrip("\n") + f"\n\n{block}\n" + text[at:]
+
+
+def add_gitignore(text, path):
+    line = "/" + path.strip("/") + "/"
+    if line in text.splitlines() or path.strip("/") in text.splitlines():
+        return text, False
+    return text + ("" if text.endswith("\n") or not text else "\n") + line + "\n", True
+
+
+# --- add --------------------------------------------------------------------------------------------------------------------
+def parse_flags(argv):
+    opts = {"dry": False, "clone": True}
+    args, i = [], 0
+    valued = {"--name": "name", "--path": "path", "--branch-prefix": "prefix", "--commit-style": "style", "--merge": "merge", "--no-push": "nopush"}
+    while i < len(argv):
+        a = argv[i]
+        if a == "--dry-run":
+            opts["dry"] = True
+        elif a == "--no-clone":
+            opts["clone"] = False
+        elif a in valued:
+            if i + 1 >= len(argv):
+                raise Stop(f"{a} needs a value")
+            opts[valued[a]] = argv[i + 1]
+            i += 1
+        elif a.startswith("-"):
+            raise Stop(f"unknown flag {a} (see: busybody repo --help)")
+        else:
+            args.append(a)
+        i += 1
+    if len(args) != 1 or not re.fullmatch(r"[\w.-]+/[\w.-]+", args[0]):
+        raise Stop("usage: busybody repo add <owner/name> [flags]")
+    opts["slug"] = args[0]
+    return opts
+
+
+def cmd_add(argv, ws):
+    o = parse_flags(argv)
+    slug = o["slug"]
+    name = o.get("name") or slug.split("/")[1]
+    path = o.get("path") or name
+    if not re.fullmatch(r"[\w.-]+", name):
+        raise Stop(f"name {name!r}: letters, digits, . _ - only")
+    if os.path.isabs(path) or ".." in path.split("/") or path.strip("/") in ("", "."):
+        raise Stop(f"path {path!r}: must be a folder inside the workspace")
+    if o.get("merge") not in (None, "pr", "land"):
+        raise Stop("--merge: pr or land")
+    if o.get("style") not in (None, "conventional", "plain"):
+        raise Stop("--commit-style: conventional or plain")
+    root = data_root(ws)
+    cfg_file = bb_env(None, "CONFIG") or os.path.join(ws, "office.json")
+    if not os.path.isfile(cfg_file):
+        raise Stop(f"no office.json at {cfg_file}: run `busybody init`")
+    text = open(cfg_file).read()
+    try:
+        cfg = json.loads(text)
+        office = Office(cfg, workspace=ws)
+        listed = office._repo_cfgs()
+    except (ValueError, ConfigError) as e:
+        raise Stop(f"office.json: {e}")
+    if name in listed or name == cfg.get("workspaceRepo"):
+        raise Stop(f"{name} is already listed in office.json repos")
+    for k, v in listed.items():
+        if v.get("github") == slug or v.get("path") == path:
+            raise Stop(f"{slug} / {path} is already used by the repo {k} in office.json")
+    dest = os.path.join(root, path)
+    if o["clone"] and os.path.exists(dest):
+        raise Stop(f"{dest} already exists (use --no-clone if it already holds the clone)")
+    if not o["clone"] and not os.path.exists(os.path.join(dest, ".git")):
+        raise Stop(f"--no-clone: {dest} holds no clone")
+
+    g = read_github(slug)
+    nopush = [b for b in (o["nopush"].split(",") if "nopush" in o else g["protected"] + [g["default"]]) if b and b != "main"]
+    nopush = list(dict.fromkeys(nopush))
+    a = {"prefix": o["prefix"] if "prefix" in o else (g["prefix"] or "feat/"), "style": o.get("style") or g["style"]}
+    entry = {"path": path, "github": slug, "branchPrefix": a["prefix"]}
+    if nopush:
+        entry["noPush"] = nopush
+    entry["merge"] = o.get("merge") or "pr"
+    new_cfg = insert_entry(text, name, entry)
+
+    claude_md = os.path.join(ws, "CLAUDE.md")
+    cm = open(claude_md).read() if os.path.isfile(claude_md) else ""
+    new_cm = add_stub(cm, name, stub_block(name, slug, path, g, a))
+    gi_file = os.path.join(root, ".gitignore")
+    gi = open(gi_file).read() if os.path.isfile(gi_file) else ""
+    new_gi, gi_changed = add_gitignore(gi, path)
+
+    print(f"{'would add' if o['dry'] else 'adding'} {slug} as '{name}' (default branch {g['default']}; merge methods: {', '.join(g['methods']) or 'unknown'})")
+    print(f"  office.json   repos.{name} = {json.dumps(entry, separators=(', ', ': '))}")
+    print(f"  CLAUDE.md     a '### {name}' stub under 'Your repos', every field a TODO")
+    print(f"  .gitignore    {'/' + path.strip('/') + '/' if gi_changed else 'already ignored'}")
+    print(f"  clone         {dest if o['clone'] else 'skipped (--no-clone)'}")
+    if not o["dry"]:
+        if o["clone"]:
+            r = subprocess.run(["gh", "repo", "clone", slug, dest], capture_output=True, text=True)
+            if r.returncode:
+                raise Stop(f"clone failed, nothing written: {(r.stderr.strip().splitlines() or ['no output'])[-1]}")
+        for f, content in ((cfg_file, new_cfg), (claude_md, new_cm), (gi_file, new_gi)):
+            if content != (text if f == cfg_file else cm if f == claude_md else gi):
+                open(f, "w").write(content)
+    print()
+    print(f"Next, which only you can do: trust the repo in Claude Code. Run `claude` once in {path}/ and accept the trust prompt.")
+    print("Then run the `busybody:repo-onboard` skill to fill in the TODOs and propose the evidence rule." + (" (Nothing was written: this was a dry run.)" if o["dry"] else ""))
+
+
+# --- self-test ---------------------------------------------------------------------------------------------------------------
+STUB_GH = r"""#!/bin/sh
+# stub gh: `api` answers canned JSON by path; `repo clone` clones from $STUB_REMOTE; everything is logged
+echo "$*" >> "$STUB_LOG"
+set -- "$1" "$(echo "$2" | sed s/shop2/shop/)" "$3" "$4"
+case "$1 $2" in
+  "api repos/acme-co/shop") echo '{"default_branch": "trunk", "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": false}';;
+  "api repos/acme-co/shop/branches?protected=true&per_page=100") echo '[{"name": "trunk"}, {"name": "release"}]';;
+  "api repos/acme-co/shop/pulls?state=closed&per_page=30") echo '[{"head": {"ref": "work/a"}}, {"head": {"ref": "work/b"}}, {"head": {"ref": "fix/c"}}]';;
+  "api repos/acme-co/shop/commits?per_page=30") echo '[{"commit": {"message": "feat(cart): add totals"}}, {"commit": {"message": "fix: rounding"}}, {"commit": {"message": "Merge pull request #3"}}]';;
+  "api repos/acme-co/gone"*) echo "gh: Not Found (HTTP 404)" >&2; exit 1;;
+  "repo clone") git clone -q "$STUB_REMOTE" "$4";;
+  *) echo "stub gh: unexpected: $*" >&2; exit 1;;
+esac
+"""
+
+
+def self_test():
+    d = tempfile.mkdtemp()
+    results = []
+
+    def check(name, ok):
+        results.append((name, bool(ok)))
+
+    def run(*argv):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_add(list(argv), ws)
+            return None
+        except Stop as e:
+            return str(e)
+    try:
+        ws = os.path.join(d, "ws")
+        os.makedirs(ws)
+        stubdir = os.path.join(d, "stub")
+        os.makedirs(stubdir)
+        open(os.path.join(stubdir, "gh"), "w").write(STUB_GH)
+        os.chmod(os.path.join(stubdir, "gh"), 0o755)
+        remote = os.path.join(d, "remote")
+        subprocess.run(["git", "init", "-q", remote], check=True)
+        subprocess.run(["git", "-C", remote, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        os.environ.update(PATH=stubdir + os.pathsep + os.environ["PATH"], STUB_REMOTE=remote, STUB_LOG=os.path.join(d, "gh.log"),
+                          BUSYBODY_WORKSPACE=ws, BUSYBODY_CONFIG=os.path.join(ws, "office.json"))
+        original = '{\n  "minutesRepo": "acme-co/acme-office",\n  "workspaceRepo": "acme-office",\n  "repos": {\n    "acme-office": {"path": ".", "merge": "land", "branchPrefix": "feat/"}\n  },\n  "tracker": {"type": "none"}\n}\n'
+        claude = "# Acme\n\n## Your repos (yours)\n\nTable.\n\n## How your repos connect (yours)\n\nNothing.\n"
+        open(os.path.join(ws, "office.json"), "w").write(original)
+        open(os.path.join(ws, "CLAUDE.md"), "w").write(claude)
+        open(os.path.join(ws, ".gitignore"), "w").write("node_modules/\n")
+
+        g = read_github("acme-co/shop")
+        check("reads GitHub: default, protected, methods", g["default"] == "trunk" and g["protected"] == ["trunk", "release"] and g["methods"] == ["merge", "squash"])
+        check("guesses the commonest branch prefix and the commit style", g["prefix"] == "work/" and g["style"] == "conventional")
+
+        out = run("acme-co/shop", "--dry-run")
+        check("dry run succeeds", out is None)
+        check("dry run writes and clones nothing", open(os.path.join(ws, "office.json")).read() == original and open(os.path.join(ws, "CLAUDE.md")).read() == claude
+              and open(os.path.join(ws, ".gitignore")).read() == "node_modules/\n" and not os.path.exists(os.path.join(ws, "shop")))
+
+        check("add succeeds", run("acme-co/shop") is None)
+        new = open(os.path.join(ws, "office.json")).read()
+        cfg = json.loads(new)
+        check("office.json: the entry holds what was read", cfg["repos"]["shop"] == {"path": "shop", "github": "acme-co/shop", "branchPrefix": "work/", "noPush": ["trunk", "release"], "merge": "pr"})
+        check("office.json: the rest of the file is byte for byte as it was", new.replace(new[new.index(',\n    "shop"'):new.index('\n  },\n  "tracker"')], "") == original)
+        o = Office(cfg, workspace=ws)
+        check("the config reads back through officeconfig", o.branch_prefix("shop") == "work/" and o.no_push("shop") == ["main", "trunk", "release"] and o.merge("shop") == "pr")
+        cm = open(os.path.join(ws, "CLAUDE.md")).read()
+        check("CLAUDE.md: a stub under Your repos, before the next section", cm.index("### shop") < cm.index("## How your repos connect") and "TODO" in cm)
+        check(".gitignore gains the clone", open(os.path.join(ws, ".gitignore")).read() == "node_modules/\n/shop/\n")
+        check("cloned", os.path.isdir(os.path.join(ws, "shop", ".git")))
+
+        check("a repo already listed is refused", "already listed" in (run("acme-co/shop") or ""))
+        os.makedirs(os.path.join(ws, "other"))
+        check("an existing folder is refused", "already exists" in (run("acme-co/shop2", "--name", "other", "--path", "other") or ""))
+        check("a path outside the workspace is refused", "inside the workspace" in (run("acme-co/shop", "--name", "x", "--path", "../x") or ""))
+        check("a repo gh cannot read stops cleanly", "failed" in (run("acme-co/gone") or ""))
+        check("a bad argument is refused", "usage" in (run("shop") or ""))
+
+        check("flags override the guesses", run("acme-co/shop2", "--name", "shop-web", "--path", "web", "--branch-prefix", "", "--no-push", "main,live", "--merge", "land", "--commit-style", "plain") is None)
+        e = json.loads(open(os.path.join(ws, "office.json")).read())["repos"]["shop-web"]
+        check("an empty prefix, noPush and merge come from the flags", e["branchPrefix"] == "" and e["noPush"] == ["live"] and e["merge"] == "land")
+
+        bare = '{"minutesRepo": "acme-co/acme-office"}\n'
+        check("insert: no repos key", json.loads(insert_entry(bare, "x", {"path": "x"}))["repos"] == {"x": {"path": "x"}})
+        check("insert: an empty repos object", json.loads(insert_entry('{\n  "repos": {}\n}\n', "x", {"path": "x"}))["repos"] == {"x": {"path": "x"}})
+        check("insert: a `repos` inside a string is not the key", json.loads(insert_entry('{"note": "\\"repos\\": {", "repos": {"a": {}}}', "x", {"path": "x"}))["repos"].keys() == {"a", "x"})
+        bad = bool(run("acme-co/shop", "--name", "n", "--path", "n", "--no-clone"))
+        check("--no-clone on a folder without a clone is refused", bad)
+        bad = [n for n, ok in results if not ok]
+        for n, ok in results:
+            print(("ok   " if ok else "FAIL ") + n)
+        if bad:
+            sys.exit(1)
+        print("repo self-test: ok")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "--self-test":
+        self_test()
+        return 0
+    if argv[0] != "add":
+        print(f"repo: unknown command {argv[0]!r} (add, --self-test)", file=sys.stderr)
+        return 2
+    ws = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+    try:
+        cmd_add(argv[1:], ws)
+    except Stop as e:
+        print(f"repo: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

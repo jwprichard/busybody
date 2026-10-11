@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # busybody <cmd> [args]: runs bin/<cmd> of the engine. One entry point for the engine's tools (rooms, role, team, status, room-cost,
-# room-cost-timer, land, pr-watch, init); each tool finds the workspace itself (BUSYBODY_WORKSPACE, else office.json above the cwd).
+# room-cost-timer, land, pr-watch, init, repo); each tool finds the workspace itself (BUSYBODY_WORKSPACE, else office.json above the cwd).
 set -euo pipefail
 here="$(dirname "$(readlink -f "$0")")"
 cmd="${1:-}"
