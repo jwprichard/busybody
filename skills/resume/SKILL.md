@@ -5,8 +5,8 @@ description: The controller's first move after a compaction. Reads the handoff f
 
 # Resume
 
-After a compaction a `SessionStart` hook (matcher `compact`) has already put the handoff file, a `status` summary and a
-`rooms --json` summary into context, capped at about 9,000 characters (Claude Code truncates hook output at 10,000). If it
+After a compaction a `SessionStart` hook (matcher `compact`) has already put the handoff file and a
+`rooms --json` summary into context (the existing hook on that event already runs `status`), capped at about 9,000 characters (Claude Code truncates hook output at 10,000). If it
 was cut, or you are resuming without a compaction, run `busybody handoff resume`: the same material in full, plus the check below.
 
 1. **Read the handoff.** `busybody handoff resume` prints it and checks each bullet under In flight against the live sessions (`rooms --json` `live_sessions`) and the watcher processes (`pr-watch`). Each is `still running` or `LOST`.
