@@ -10,6 +10,9 @@
 # --team NAME (default dev-team) names the recipe in teams/: its powers go into the brief (bin/team powers), its caps and flags
 # into the room settings (given explicitly: the draft-PR allow follows draftPr, the bin/land allows follow land). A repo whose merge
 # is "land" has no PRs: its room lands with bin/land instead of opening draft PRs. --land still works and must agree with the config.
+# When <workspace>/desks exists (bin/kit build) the room loads it as the `desks` plugin: `claude --plugin-dir <workspace>/desks`, the
+# desks' agent types (`desks:<team>-<desk>`) named in the brief, and the room may not edit it. Before launch desks/ must hold only
+# .claude-plugin/plugin.json and agents/*.md and have no uncommitted changes (hooks/ or .mcp.json would run outside the deny rules).
 # --dry-run mutates nothing: it prints the plan and the launch command, then stops.
 # Never modifies ~/.claude.json and never answers a trust or permission prompt.
 
@@ -25,7 +28,7 @@ die() { printf 'lead-start: %s\n' "$*" >&2; exit 1; }
 WS_REPO="$(office_minutes_repo 2>&1)" || die "$WS_REPO"                  # "no minutesRepo: run `busybody init`"
 PORT_BASE_START="$(office_port_base 2>&1)" || die "$PORT_BASE_START"     # room.portBase, default 41000
 say() { printf '%s\n' "$*"; }
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 MODEL=sonnet ISSUE="" BASE="" PROD_READ=no DRY=0 TEAM="" LAND=0 LIAISON="$(bb_env CONTROLLER SCH_LIAISON_SESSION)"
 POS=()
@@ -100,6 +103,18 @@ EOT
   exit 1
 fi
 
+# 2b. desks (optional): the generated agent types, loaded as a plugin ----------------------
+# Only when <workspace>/desks exists; without it nothing below changes. A plugin dir runs outside the room's deny rules, so its shape is
+# checked here (no hooks/, no .mcp.json, nothing but plugin.json and agents/*.md) and so is that the owner has seen every change (clean in git).
+DESKS_DIR="$WS/desks"; HAS_DESKS=0
+if [[ -d "$DESKS_DIR" ]]; then
+  HAS_DESKS=1
+  SHAPE_ERR="$("$ENGINE_ROOT/bin/kit" shape "$DESKS_DIR" 2>&1)" || die "${SHAPE_ERR#kit: }"
+  if [[ "$(git -C "$WS" rev-parse --show-toplevel 2>/dev/null || true)" == "$WS" && -n "$(git -C "$WS" status --porcelain -- desks)" ]]; then
+    die "$DESKS_DIR has uncommitted changes: commit them (after \`busybody kit build\` and a review) before opening a room"
+  fi
+fi
+
 ROOM="room-$SLUG"
 WORKTREE="$REPO_DIR/.claude/worktrees/$ROOM"
 BRANCH="$BRANCH_PREFIX$SLUG"
@@ -142,9 +157,11 @@ if ((DRY)); then
   say "exclude:   .claude/worktrees/ -> $GIT_COMMON/info/exclude"
   say "hook:      $GIT_COMMON/hooks/pre-push (rejects $(paste -sd' ' <<<"$NO_PUSH"); merge: $MERGE; existing hook: $([[ -e $GIT_COMMON/hooks/pre-push ]] && echo 'present, will be chained' || echo none))"
   say "settings:  $SETTINGS (prod-read: $PROD_READ; $ENV_NOTE; team: $TEAM, flags applied: $( ((TEAM_EXPLICIT)) && echo yes || echo no )$( ((LAND)) && echo ", land override: yes"))"
+  if ((HAS_DESKS)); then say "desks:     $DESKS_DIR (shape ok, clean in git): --plugin-dir; deny Edit/Write on //${DESKS_DIR#/}/**"
+  else say "desks:     none ($DESKS_DIR does not exist)"; fi
   say "powers:    (team $TEAM; goes into the brief)"
-  "$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ) | sed 's/^/              /' 
-  say "launch:    cd $WORKTREE && claude --bg -n $ROOM --model $MODEL --permission-mode auto --settings $SETTINGS '<brief from templates/lead-brief.md; controller=$LIAISON>'"
+  "$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ) $( ((HAS_DESKS)) && echo --desks ) | sed 's/^/              /' 
+  say "launch:    cd $WORKTREE && claude --bg -n $ROOM --model $MODEL --permission-mode auto$( ((HAS_DESKS)) && echo " --plugin-dir $DESKS_DIR") --settings $SETTINGS '<brief from templates/lead-brief.md; controller=$LIAISON>'"
   say "check:     poll the issue up to 180s for a PROGRESS: comment, else claude logs $ROOM tail and exit 2"
   exit 0
 fi
@@ -202,9 +219,9 @@ chmod +x "$HOOK"
 # 7. settings -------------------------------------------------------------------------------
 mkdir -p "$(dirname "$SETTINGS")"
 TEAM_JSON=""; ((TEAM_EXPLICIT)) && TEAM_JSON="$WS/teams/$TEAM/team.json"
-python3 -I - "$ENGINE_ROOT/templates/room-settings.json" "$SETTINGS" "$ROOM" "$PORT_BASE" "$PROD_READ" "$ROOM_JSON" "$NO_PUSH" "$TEAM_JSON" "$LAND" <<'PY'
+python3 -I - "$ENGINE_ROOT/templates/room-settings.json" "$SETTINGS" "$ROOM" "$PORT_BASE" "$PROD_READ" "$ROOM_JSON" "$NO_PUSH" "$TEAM_JSON" "$LAND" "$( ((HAS_DESKS)) && echo "$DESKS_DIR" || true )" <<'PY'
 import json, sys
-tpl, out, room, base, prod, room_json, no_push, team_json, land_override = sys.argv[1:10]
+tpl, out, room, base, prod, room_json, no_push, team_json, land_override, desks = sys.argv[1:11]
 d = json.load(open(tpl))
 d.pop("_comment", None)
 cfg = json.loads(room_json)
@@ -216,6 +233,8 @@ for b in no_push.split():                      # this repo's protected branches;
     if b != "main":
         deny += [f"Bash(git push * {b})", f"Bash(git push * {b} *)", f"Bash(git push *:{b})",
                  f"Bash(git push *:{b} *)", f"Bash(git push *refs/heads/{b}*)"]
+if desks:                                      # the desks plugin runs outside the deny rules: the room may not rewrite it (// = absolute path)
+    deny += [f"Edit(/{desks}/**)", f"Write(/{desks}/**)"]
 deny += cfg["deny"]                            # room.deny: patterns tied to the workspace's own tools
 if prod != "yes":
     deny += cfg["prodRead"]                    # room.prodRead: lifted only by --prod-read
@@ -239,7 +258,7 @@ say "settings: $SETTINGS"
 # 8. brief ----------------------------------------------------------------------------------
 DONE_TEXT="Done means: the work in the issue body is complete on branch $BRANCH, the repo's checks pass, and the branch is pushed. The evidence bin/status needs (merge, release tag, deploy run) comes only after the user merges and deploys; list what is still outstanding."
 [[ -z "$DONE_NOTE" ]] || DONE_TEXT="$DONE_TEXT $DONE_NOTE"
-TEAM_POWERS="$("$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ))" || die "cannot render the powers of recipe $TEAM"
+TEAM_POWERS="$("$ENGINE_ROOT/bin/team" powers "$TEAM" $( ((LAND)) && echo --land ) $( ((HAS_DESKS)) && echo --desks ))" || die "cannot render the powers of recipe $TEAM"
 LANDFLAG=""; ((LAND)) && LANDFLAG=--land
 TEAM_COMMIT="$("$ENGINE_ROOT/bin/team" brief "$TEAM" commit $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
 TEAM_COMMIT="${TEAM_COMMIT//@BRANCH@/$BRANCH}"
@@ -257,7 +276,8 @@ print(t)' "$ENGINE_ROOT/templates/lead-brief.md")"
 # 9. launch ---------------------------------------------------------------------------------
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 say "launching $ROOM ($MODEL, auto mode)"
-(cd "$WORKTREE" && claude --bg -n "$ROOM" --model "$MODEL" --permission-mode auto --settings "$SETTINGS" "$BRIEF")
+PLUGIN_ARGS=(); ((HAS_DESKS)) && PLUGIN_ARGS=(--plugin-dir "$DESKS_DIR")
+(cd "$WORKTREE" && claude --bg -n "$ROOM" --model "$MODEL" --permission-mode auto ${PLUGIN_ARGS[@]+"${PLUGIN_ARGS[@]}"} --settings "$SETTINGS" "$BRIEF")
 
 # 10. launch check: the room lead's first act is a PROGRESS: comment -----------------------------
 # The room lead posts as the same GitHub user, so match on text and time, not author.
