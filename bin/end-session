@@ -1,9 +1,11 @@
 #!/usr/bin/python3 -I
-"""busybody end-session <room-or-role-session-name> [--grace SECONDS]
+"""busybody end-session <room-or-role-session-name | pid> [--grace SECONDS]
 
-Ends a room's or role's Claude session by matching its process (the claude binary with `-n <name>`, the exact name), SIGTERM first,
-SIGKILL only if it ignores TERM past the grace period (default 10 s; the output says so). Use it when `claude stop` reports no
-job for a session that is still running, or for a session whose issue is closed (`rooms --leftovers` lists those).
+Ends a room's or role's Claude session by its process: the pid the background-session list gives for the name (the claude binary
+with `-n <name>`, the exact name, is the fallback), SIGTERM first, SIGKILL only if it ignores TERM past the grace period (default
+10 s; the output says so). A pid is accepted only when it is a claude process of a room-* or role-* session, never any other process.
+Use it when `claude stop` reports no job for a session that is still running, or for a session whose issue is closed
+(`rooms --leftovers` lists those). Controller only: a room's settings deny it, and a room closes itself with `busybody close-self`.
 """
 import os, sys
 
@@ -24,7 +26,7 @@ if len(args) != 1 or args[0].startswith("-"):
     print(__doc__, file=sys.stderr)
     sys.exit(2)
 try:
-    ok, lines = sessions.end(args[0], grace=grace)
+    ok, lines = sessions.end_target(args[0], grace=grace)
 except ValueError as e:
     sys.exit(f"end-session: {e}")
 print("\n".join(lines))
