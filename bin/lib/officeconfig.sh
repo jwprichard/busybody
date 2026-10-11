@@ -36,3 +36,4 @@ office_owner_only() { _office_py owner-only; }
 office_repos() { _office_py repos; }
 office_sources() { _office_py sources; }                        # the pinned source names, one per line (none when unset)
 office_source_field() { _office_py source "$1" "$2"; }         # $1 = source name, $2 = url|ref|sha|dir|licence|vetted; a null ref prints nothing
+office_source_check() { _office_py source-check "$1"; }       # "ok", or one line on stderr and rc 1: clone missing, HEAD moved off the pinned sha, or dirty

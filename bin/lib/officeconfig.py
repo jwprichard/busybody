@@ -251,6 +251,30 @@ class Office:
             raise ConfigError(f"source {name}: not listed in office.json sources")
         return srcs[name]
 
+    def check_source(self, name):
+        """"ok", or one line saying what is wrong with a source's clone: the dir is missing or not its own git repo,
+        HEAD is not the pinned sha, or the work tree is dirty. Reads git locally only; it never touches the network."""
+        s = self.source(name)
+        if not self.workspace:
+            raise ConfigError(f"source {name}: no workspace folder to find {s['dir']} in")
+        path = os.path.join(self.workspace, s["dir"])
+        if not os.path.isdir(path):
+            return f"source {name}: {s['dir']} is missing: clone it and check out {s['sha']}"
+
+        def git(*args):
+            return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                                  env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+        top = git("rev-parse", "--show-toplevel")
+        if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(path):
+            return f"source {name}: {s['dir']} is not a git clone"
+        head = git("rev-parse", "HEAD")
+        if head.returncode != 0 or head.stdout.strip() != s["sha"]:
+            return f"source {name}: HEAD is {head.stdout.strip()[:12] or 'unreadable'}, not the pinned {s['sha'][:12]}: check out {s['sha']} in {s['dir']}"
+        dirty = git("status", "--porcelain")
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return f"source {name}: {s['dir']} has local changes: restore it to the pinned commit"
+        return "ok"
+
     def room_json(self):
         return {"env": self.room_env, "deny": self.room_deny, "prodRead": self.room_prod_read, "portBase": self.port_base}
 
@@ -394,6 +418,35 @@ def self_test():
     err("sources must be an object", lambda: Office({"sources": []}, {}).sources, "sources: must be an object of source name -> settings")
     err("unknown source", lambda: acme.source("nope"), "source nope: not listed in office.json sources")
     eq("validate reports a bad source", Office({"sources": {"y": dict(src, sha="x")}}, {}, "/w/acme-office").validate(), ["source y: sha must be 40 lowercase hex characters"])
+    with tempfile.TemporaryDirectory() as ws:
+        clone = os.path.join(ws, "sources", "y")
+
+        def git(*a):
+            return subprocess.run(["git", "-C", clone, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *a],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        def check(**kw):
+            return Office({"sources": {"y": dict(src, **kw)}}, {}, ws).check_source("y")
+        eq("source clone missing", check(), "source y: sources/y is missing: clone it and check out " + sha)
+        os.makedirs(clone)
+        git("init", "-q")
+        with open(os.path.join(clone, "f"), "w") as f:
+            f.write("1\n")
+        git("add", "f")
+        git("commit", "-q", "-m", "one")
+        head1 = git("rev-parse", "HEAD")
+        eq("source clone ok", check(sha=head1), "ok")
+        eq("source clone with HEAD moved", check(sha=sha), f"source y: HEAD is {head1[:12]}, not the pinned {sha[:12]}: check out {sha} in sources/y")
+        with open(os.path.join(clone, "f"), "a") as f:
+            f.write("2\n")
+        eq("source clone dirty", check(sha=head1), "source y: sources/y has local changes: restore it to the pinned commit")
+        git("commit", "-q", "-am", "two")
+        eq("source clone moved after a commit", check(sha=head1).startswith("source y: HEAD is "), True)
+        with open(os.path.join(clone, "untracked"), "w") as f:
+            f.write("x")
+        eq("source clone with an untracked file is dirty", check(sha=git("rev-parse", "HEAD")), "source y: sources/y has local changes: restore it to the pinned commit")
+        plain = os.path.join(ws, "sources", "plain")
+        os.makedirs(plain)
+        eq("source dir that is not a clone", Office({"sources": {"p": dict(src, dir="sources/plain")}}, {}, ws).check_source("p"), "source p: sources/plain is not a git clone")
     eq("fixture ownerOnly", acme.owner_only, ["deploying to acme-prod"])
     eq("room defaults", (Office({}, {}).room_json(), Office({}, {}).owner_only),
        ({"env": {}, "deny": [], "prodRead": [], "portBase": 41000}, list(DEFAULT_OWNER_ONLY)))
@@ -447,6 +500,8 @@ def self_test():
     eq("sh no sources", bash({"BUSYBODY_CONFIG": "/nonexistent"}, 'echo "[$(office_sources)]"'), "[]")
     eq("sh unknown source fails", bash({"BUSYBODY_CONFIG": fx}, 'office_source_field nope sha 2>&1; echo "rc=$?"'),
        "officeconfig: source nope: not listed in office.json sources\nrc=1")
+    eq("sh source check names a missing clone", bash({"BUSYBODY_CONFIG": fx, "BUSYBODY_WORKSPACE": "/nonexistent"}, 'WORKSPACE_ROOT=/nonexistent; office_source_check tagless 2>&1; echo "rc=$?"'),
+       "source tagless: sources/tagless is missing: clone it and check out fedcba9876543210fedcba9876543210fedcba98\nrc=1")
     eq("sh missing branchPrefix fails", bash({"BUSYBODY_CONFIG": fx}, 'office_branch_prefix acme-bot 2>&1; echo "rc=$?"'),
        'officeconfig: repo acme-bot: no branchPrefix (a string, "" for none)\nrc=1')
     with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
@@ -474,6 +529,7 @@ USAGE = """usage: officeconfig.py [--config FILE] [--workspace DIR] COMMAND
   room-json              {env, deny, prodRead, portBase} as JSON
   sources                the pinned source names, one per line
   source NAME url|ref|sha|dir|licence|vetted   one field of a source (a null ref prints nothing)
+  source-check NAME      "ok", or the one line that is wrong with the clone (exit 1): missing, not a clone, HEAD moved, dirty
   display-name           the workspace's name for people (displayName, else the workspace repo's name)
   owner-only             what only the owner may do, one item per line
   check                  every problem in the config, one line each; exit 1 when there is any
@@ -528,6 +584,11 @@ def cli(argv, env=None):
         elif cmd == "source" and len(args) == 2 and args[1] in SOURCE_KEYS:
             v = o.source(args[0])[args[1]]
             out = "" if v is None else v
+        elif cmd == "source-check" and len(args) == 1:
+            out = o.check_source(args[0])
+            if out != "ok":
+                print(out, file=sys.stderr)
+                return 1
         elif cmd == "owner-only" and not args:
             out = "\n".join(o.owner_only)
         elif cmd == "check" and not args:
