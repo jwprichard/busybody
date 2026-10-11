@@ -18,6 +18,8 @@ class ConfigError(Exception):
 DEFAULT_PORT_BASE = 41000
 DEFAULT_OWNER_ONLY = ("anything touching prod", "merging, ever", "spending over the cap")
 MERGE_MODES = ("pr", "land")
+SOURCE_KEYS = ("url", "ref", "sha", "dir", "licence", "vetted")
+SOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def _str_list(value, what):
@@ -203,6 +205,52 @@ class Office:
         v = self.cfg.get("ownerOnly")
         return list(DEFAULT_OWNER_ONLY) if v is None else _str_list(v, "ownerOnly")
 
+    @property
+    def sources(self):
+        """The pinned sources as {name: {url, ref, sha, dir, licence, vetted}}; empty when none are configured.
+        Each is a third-party repo cloned (gitignored) at `dir` and pinned to a commit; `ref` is its tag, or None."""
+        raw = self.cfg.get("sources")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ConfigError("sources: must be an object of source name -> settings")
+        return {name: self._source(name, raw[name]) for name in raw}
+
+    @staticmethod
+    def _source(name, s):
+        if not (isinstance(name, str) and SOURCE_NAME.fullmatch(name)):
+            raise ConfigError(f"source {name}: name must match [a-z0-9][a-z0-9-]*")
+        if not isinstance(s, dict):
+            raise ConfigError(f"source {name}: must be an object")
+        for k in s:
+            if k not in SOURCE_KEYS:
+                raise ConfigError(f"source {name}: unknown key {k} (allowed: {', '.join(SOURCE_KEYS)})")
+        for k in SOURCE_KEYS:
+            if k not in s:
+                raise ConfigError(f"source {name}: no {k}" + (" (a tag, or null for a repo with no tags)" if k == "ref" else ""))
+        for k in ("url", "vetted"):
+            v = s[k]
+            if not (isinstance(v, str) and re.fullmatch(r"https://[^\s/]+\S*", v)):
+                raise ConfigError(f"source {name}: {k} must be an https URL")
+        if not (s["ref"] is None or (isinstance(s["ref"], str) and s["ref"].strip())):
+            raise ConfigError(f"source {name}: ref must be a tag, or null for a repo with no tags")
+        if not (isinstance(s["sha"], str) and re.fullmatch(r"[0-9a-f]{40}", s["sha"])):
+            raise ConfigError(f"source {name}: sha must be 40 lowercase hex characters")
+        d = s["dir"]
+        if not (isinstance(d, str) and d and not d.startswith("/") and not re.match(r"[A-Za-z]:", d)
+                and ".." not in d.replace("\\", "/").split("/")):
+            raise ConfigError(f"source {name}: dir must be a relative path inside the workspace (no `..`)")
+        if not (isinstance(s["licence"], str) and s["licence"].strip()):
+            raise ConfigError(f"source {name}: licence must be a non-empty string")
+        return dict(s)
+
+    def source(self, name):
+        """One source's settings; a name that is not configured is an error."""
+        srcs = self.sources
+        if name not in srcs:
+            raise ConfigError(f"source {name}: not listed in office.json sources")
+        return srcs[name]
+
     def room_json(self):
         return {"env": self.room_env, "deny": self.room_deny, "prodRead": self.room_prod_read, "portBase": self.port_base}
 
@@ -210,7 +258,7 @@ class Office:
         """Every problem in the config, one line each (empty when it is sound)."""
         errs = []
         checks = [(lambda r=r, f=f: f(r)) for r in self._repo_cfgs() for f in (self.branch_prefix, self.no_push, self.merge, self.done_note)]
-        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.display_name, lambda: self.tracker]:
+        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.display_name, lambda: self.tracker, lambda: self.sources]:
             try:
                 fn()
             except ConfigError as e:
@@ -263,6 +311,7 @@ def load_or_exit(workspace, prog, env=None):
 
 
 def self_test():
+    _GONE = object()   # marks a source key to leave out
     here = os.path.dirname(os.path.abspath(__file__))
     engine = os.path.dirname(os.path.dirname(here))
     fx = os.path.join(engine, "fixtures", "office.json")
@@ -320,6 +369,31 @@ def self_test():
     eq("fixture protected branches and draftNote", (acme.protected_branches(), acme.draft_note, Office({}, {}).protected_branches()), (["main", "release"], "", ["main"]))
     eq("draftNote", Office({"room": {"draftNote": "x."}}, {}).draft_note, "x.")
     eq("displayName defaults to the workspace repo's name", (Office({"workspaceRepo": "w"}, {}).display_name, Office({"displayName": "Acme", "workspaceRepo": "w"}, {}).display_name), ("w", "Acme"))
+    sha = "a" * 40
+    src = {"url": "https://example.com/x/y", "ref": "v1.0", "sha": sha, "dir": "sources/y", "licence": "MIT", "vetted": "https://example.com/minutes/1"}
+    eq("fixture sources", acme.sources, {"widget-kit": {"url": "https://example.com/widgets/kit", "ref": "v2.1.0", "sha": "0123456789abcdef0123456789abcdef01234567", "dir": "sources/widget-kit", "licence": "MIT", "vetted": "https://example.com/acme-office/issues/7#issuecomment-1"},
+                                         "tagless": {"url": "https://example.com/widgets/tagless", "ref": None, "sha": "fedcba9876543210fedcba9876543210fedcba98", "dir": "sources/tagless", "licence": "Apache-2.0", "vetted": "https://example.com/acme-office/issues/7#issuecomment-2"}})
+    eq("fixture source(name), none configured", (acme.source("tagless")["ref"], Office({}, {}).sources), (None, {}))
+    eq("a valid source", Office({"sources": {"y": src}}, {}).source("y"), src)
+    eq("ref null is fine", Office({"sources": {"y": dict(src, ref=None)}}, {}).source("y")["ref"], None)
+    def src_err(label, want, **kw):
+        s = {k: v for k, v in dict(src, **kw).items() if v is not _GONE}
+        err(label, lambda: Office({"sources": {"y": s}}, {}).sources, want)
+    src_err("source without sha", "source y: no sha", sha=_GONE)
+    src_err("source without ref", "source y: no ref (a tag, or null for a repo with no tags)", ref=_GONE)
+    src_err("short sha", "source y: sha must be 40 lowercase hex characters", sha="abc123")
+    src_err("upper-case sha", "source y: sha must be 40 lowercase hex characters", sha="A" * 40)
+    src_err("absolute dir", "source y: dir must be a relative path inside the workspace (no `..`)", dir="/etc/y")
+    src_err("dir with ..", "source y: dir must be a relative path inside the workspace (no `..`)", dir="sources/../../y")
+    src_err("http url", "source y: url must be an https URL", url="http://example.com/x/y")
+    src_err("non-https vetted", "source y: vetted must be an https URL", vetted="minute 3")
+    src_err("unknown key", "source y: unknown key branch (allowed: url, ref, sha, dir, licence, vetted)", branch="main")
+    src_err("empty licence", "source y: licence must be a non-empty string", licence="")
+    src_err("numeric ref", "source y: ref must be a tag, or null for a repo with no tags", ref=3)
+    err("bad source name", lambda: Office({"sources": {"Y_1": src}}, {}).sources, "source Y_1: name must match [a-z0-9][a-z0-9-]*")
+    err("sources must be an object", lambda: Office({"sources": []}, {}).sources, "sources: must be an object of source name -> settings")
+    err("unknown source", lambda: acme.source("nope"), "source nope: not listed in office.json sources")
+    eq("validate reports a bad source", Office({"sources": {"y": dict(src, sha="x")}}, {}, "/w/acme-office").validate(), ["source y: sha must be 40 lowercase hex characters"])
     eq("fixture ownerOnly", acme.owner_only, ["deploying to acme-prod"])
     eq("room defaults", (Office({}, {}).room_json(), Office({}, {}).owner_only),
        ({"env": {}, "deny": [], "prodRead": [], "portBase": 41000}, list(DEFAULT_OWNER_ONLY)))
