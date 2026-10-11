@@ -108,6 +108,11 @@ Fields the launcher and the briefs read, from the config:
 - `room`: `env` (set in every room, may be empty), `deny` (patterns tied to the workspace's own tools), `prodRead` (lifted only by
   `--prod-read`), `portBase` (default 41000), optional `draftNote` (closes the powers' draft-PR line).
 - `ownerOnly`: what only the owner may do (default: anything touching prod, merging, spending over the cap).
+- `sources` (optional): third-party repos pinned to a commit, keyed by name (`[a-z0-9][a-z0-9-]*`). Each has `url` (https), `ref` (a tag,
+  or `null` for a repo with no tags), `sha` (40 hex), `dir` (a relative path inside the workspace, gitignored, e.g. `sources/<name>`),
+  `licence` and `vetted` (an https link to the vetting minute). Nothing is fetched by the config: `Office.check_source(name)` reads
+  git locally and says whether the clone exists, sits on `sha` and is clean. Bash: `office_sources`, `office_source_field NAME FIELD`,
+  `office_source_check NAME`; CLI: `sources`, `source NAME FIELD`, `source-check NAME`.
 - CLI for launchers: `python3 -I bin/lib/officeconfig.py get <repo> branchPrefix|noPush|merge|doneNote|github`, `room-json`,
   `owner-only`, `repos`, `check`. Bash twins: `office_branch_prefix`, `office_no_push`, `office_merge`, `office_done_note`,
   `office_room_json`, `office_port_base`, `office_owner_only`, `office_repos`.
