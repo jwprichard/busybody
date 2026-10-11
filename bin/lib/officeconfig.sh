@@ -34,3 +34,5 @@ office_room_json() { _office_py room-json; }                   # {env, deny, pro
 office_port_base() { office_room_json | jq -r .portBase; }
 office_owner_only() { _office_py owner-only; }
 office_repos() { _office_py repos; }
+office_sources() { _office_py sources; }                        # the pinned source names, one per line (none when unset)
+office_source_field() { _office_py source "$1" "$2"; }         # $1 = source name, $2 = url|ref|sha|dir|licence|vetted; a null ref prints nothing

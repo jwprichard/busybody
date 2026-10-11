@@ -442,6 +442,11 @@ def self_test():
        "work/|main,release|land|Done also means the preview deploy is green.")
     eq("sh room and ownerOnly", bash({"BUSYBODY_CONFIG": fx}, 'echo "$(office_port_base)|$(office_room_json | jq -c .prodRead)|$(office_owner_only)|$(office_repos | paste -sd,)"'),
        '42000|["mcp__acme-prod__*"]|deploying to acme-prod|acme-office,acme-web,acme-api,acme-bot')
+    eq("sh sources", bash({"BUSYBODY_CONFIG": fx}, 'echo "$(office_sources | paste -sd,)|$(office_source_field widget-kit ref)|[$(office_source_field tagless ref)]|$(office_source_field tagless dir)"'),
+       "widget-kit,tagless|v2.1.0|[]|sources/tagless")
+    eq("sh no sources", bash({"BUSYBODY_CONFIG": "/nonexistent"}, 'echo "[$(office_sources)]"'), "[]")
+    eq("sh unknown source fails", bash({"BUSYBODY_CONFIG": fx}, 'office_source_field nope sha 2>&1; echo "rc=$?"'),
+       "officeconfig: source nope: not listed in office.json sources\nrc=1")
     eq("sh missing branchPrefix fails", bash({"BUSYBODY_CONFIG": fx}, 'office_branch_prefix acme-bot 2>&1; echo "rc=$?"'),
        'officeconfig: repo acme-bot: no branchPrefix (a string, "" for none)\nrc=1')
     with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
@@ -467,6 +472,8 @@ USAGE = """usage: officeconfig.py [--config FILE] [--workspace DIR] COMMAND
   get REPO branchPrefix|noPush|merge|doneNote|github|path|evidence   one value (noPush: one branch per line)
   repos                  the repo names, one per line
   room-json              {env, deny, prodRead, portBase} as JSON
+  sources                the pinned source names, one per line
+  source NAME url|ref|sha|dir|licence|vetted   one field of a source (a null ref prints nothing)
   display-name           the workspace's name for people (displayName, else the workspace repo's name)
   owner-only             what only the owner may do, one item per line
   check                  every problem in the config, one line each; exit 1 when there is any
@@ -516,6 +523,11 @@ def cli(argv, env=None):
             out = json.dumps(o.room_json())
         elif cmd == "display-name" and not args:
             out = o.display_name
+        elif cmd == "sources" and not args:
+            out = "\n".join(o.sources)
+        elif cmd == "source" and len(args) == 2 and args[1] in SOURCE_KEYS:
+            v = o.source(args[0])[args[1]]
+            out = "" if v is None else v
         elif cmd == "owner-only" and not args:
             out = "\n".join(o.owner_only)
         elif cmd == "check" and not args:
