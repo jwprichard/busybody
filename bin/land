@@ -62,7 +62,7 @@ run_checks() {
 
 land() {
   repo="" tmp=""
-  local bpath branch="$1" dry="$2" nochecks="$3" main_sha br_sha remote="" sha c total i=0 mpath
+  local bpath branch="$1" dry="$2" nochecks="$3" main_sha br_sha remote="" sha c total i=0 mpath grant tok rc
   repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repo"
   cd "$repo"
   git rev-parse --verify -q "refs/heads/$branch" >/dev/null || die "no local branch '$branch'"
@@ -115,8 +115,13 @@ land() {
   fi
   say "land: main is now $(git rev-parse --short main)"
   if [[ -n "$remote" ]]; then
-    export BUSYBODY_LAND=1   # tells a repo's pre-push hook this is the lander, not a room
-    git push -q origin main || die "push failed; main is fast-forwarded locally, nothing was forced"
+    # a one-shot grant for the repo's pre-push hook: a token bound to the commit just verified, removed as soon as the push ends
+    grant="$(git rev-parse --path-format=absolute --git-common-dir)/busybody-land-grant"
+    tok="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    (umask 077; printf '%s %s\n' "$tok" "$br_sha" > "$grant")
+    rc=0; BUSYBODY_LAND="$tok" git push -q origin main || rc=$?
+    rm -f "$grant"
+    ((rc == 0)) || die "push failed; main is fast-forwarded locally, nothing was forced"
     say "land: pushed origin main"
   else say "land: no remote: fast-forward only"; fi
 }
@@ -183,6 +188,17 @@ self_test() {
   [[ $rc != 0 && "$out" == *"no checks defined"* ]] || bad+=("nochecks: rc=$rc $out")
   # the temporary worktrees are cleaned up
   [[ "$(g worktree list | wc -l)" == 1 ]] || bad+=("temporary worktrees left behind")
+  # the pre-push seatbelt: from a room worktree, a repo that lands lets the lander push main (and leaves no grant behind); a repo that
+  # merges by PR refuses it; the same push by hand with the old static BUSYBODY_LAND=1 is refused
+  hook() { sed -e "s|@PROTECTED@|main|" -e "s|@MERGE@|$1|" "$(dirname "$SELF")/lib/pre-push-seatbelt" > "$R/.git/hooks/pre-push"; chmod +x "$R/.git/hooks/pre-push"; }
+  room() { g checkout -q main; g worktree add -q "$R/.claude/worktrees/room-t" feat; }
+  fresh; commit a 1; hook land; room; rc=0; out="$(cd "$R/.claude/worktrees/room-t" && BUSYBODY_LAND=1 git push origin feat:main 2>&1)" || rc=$?
+  [[ $rc != 0 && "$out" == *"pre-push seatbelt"* ]] || bad+=("seatbelt let a hand push with BUSYBODY_LAND=1: rc=$rc $out")
+  R_ROOM="$R/.claude/worktrees/room-t"
+  rc=0; out="$(cd "$R_ROOM" && "$SELF" feat 2>&1)" || rc=$?
+  [[ $rc == 0 && "$(git -C "$T/bare.git" rev-parse main)" == "$(g rev-parse feat)" && ! -e "$R/.git/busybody-land-grant" ]] || bad+=("land from a room in a land repo: rc=$rc $out")
+  fresh; commit a 1; hook pr; room; rc=0; out="$(cd "$R/.claude/worktrees/room-t" && "$SELF" feat 2>&1)" || rc=$?
+  [[ $rc != 0 && "$out" == *"push failed"* && "$(git -C "$T/bare.git" rev-parse main)" != "$(g rev-parse feat)" && ! -e "$R/.git/busybody-land-grant" ]] || bad+=("land from a room in a PR repo: rc=$rc $out")
   if ((${#bad[@]})); then printf 'land self-test: FAILED: %s\n' "$(IFS=';'; echo "${bad[*]}")"; return 1; fi
   echo "land self-test: ok"
 }

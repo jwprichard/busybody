@@ -216,7 +216,7 @@ PY
   before="$(snap "$W")"; run "$W" --minutes-repo acme-co/acme-office --name "$NAME_Q" --engine "$W/busybody"; after="$(snap "$W")"
   [[ $rc == 0 && "$out" == *"nothing to change"* && "$before" == "$after" ]] || bad+=("second run: rc=$rc $out")
 
-  # the hook: a room worktree may not push main, may push its own branch; the lander (BUSYBODY_LAND=1) may push main
+  # the hook: a room worktree may not push main, may push its own branch; the lander, holding its one-shot grant, may push main
   git init -q --bare -b main "$T/bare.git"
   git -C "$W" remote set-url origin "$T/bare.git" 2>/dev/null || git -C "$W" remote add origin "$T/bare.git"
   git -C "$W" add -A; git -C "$W" commit -q -m base
@@ -225,8 +225,21 @@ PY
   [[ $rc != 0 && "$out" == *"pre-push seatbelt"* ]] || bad+=("hook let a room push main: rc=$rc $out")
   rc=0; out="$(git -C "$W/.claude/worktrees/room-x" push origin HEAD:feat/x 2>&1)" || rc=$?
   [[ $rc == 0 ]] || bad+=("hook blocked a room's own branch: rc=$rc $out")
-  rc=0; out="$(BUSYBODY_LAND=1 git -C "$W/.claude/worktrees/room-x" push origin HEAD:main 2>&1)" || rc=$?
-  [[ $rc == 0 ]] || bad+=("hook blocked the lander: rc=$rc $out")
+  # a bare BUSYBODY_LAND=1, a token with no grant file, or a token for another commit is not the lander
+  rx="$W/.claude/worktrees/room-x"; grant="$W/.git/busybody-land-grant"; head_sha="$(git -C "$rx" rev-parse HEAD)"
+  rc=0; out="$(BUSYBODY_LAND=1 git -C "$rx" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc != 0 && "$out" == *"pre-push seatbelt"* ]] || bad+=("hook let a bare BUSYBODY_LAND=1 push main: rc=$rc $out")
+  rc=0; out="$(BUSYBODY_LAND=tok1 git -C "$rx" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc != 0 ]] || bad+=("hook let a token with no grant push main: rc=$rc $out")
+  printf 'tok1 %s\n' "0000000000000000000000000000000000000000" > "$grant"
+  rc=0; out="$(BUSYBODY_LAND=tok1 git -C "$rx" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc != 0 ]] || bad+=("hook let the lander push a commit it did not verify: rc=$rc $out")
+  printf 'tok1 %s\n' "$head_sha" > "$grant"
+  rc=0; out="$(BUSYBODY_LAND=wrong git -C "$rx" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc != 0 ]] || bad+=("hook let a wrong token push main: rc=$rc $out")
+  rc=0; out="$(BUSYBODY_LAND=tok1 git -C "$rx" push origin HEAD:main 2>&1)" || rc=$?
+  [[ $rc == 0 ]] || bad+=("hook blocked the lander's granted push: rc=$rc $out")
+  rm -f "$grant"
 
   # an existing office.json is never overwritten
   ws adopt; printf '{"minutesRepo": "acme-co/acme-office", "workspaceRepo": "adopt", "extra": 1}\n' > "$W/office.json"
