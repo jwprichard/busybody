@@ -66,7 +66,7 @@ It prints one `EVENT: <name> <PR url>` line and exits when something happens: `r
 - `merged`: go to Close (section 9). `closed` unmerged or `cap`: post `BLOCKED` and say why.
 
 ## 8. Cost
-Soft cap ${{SOFT}} per day: post a DECISION before going past it. Hard cap ${{HARD}} per day: a timer stops this session at the cap. Check spend with `{{WORKSPACE}}/engine/bin/room-cost {{ROOM}}` and quote that output, never your own estimate.
+Soft cap ${{SOFT}} per day: post a DECISION before going past it. Hard cap ${{HARD}} per day: a timer stops this session at the cap. Check spend with `busybody room-cost {{ROOM}}` and quote that output, never your own estimate.
 
 ## 9. Done and self-close
 {{DONE_TEXT}}

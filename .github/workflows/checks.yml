@@ -1,0 +1,29 @@
+name: checks
+
+# Runs .land-checks, the same script `bin/land` runs at every commit. It needs no secrets.
+# The Claude Code CLI is not installed here, so `.land-checks` skips `claude plugin validate`
+# and `claude plugin test` (the bun tests under tests/ import Claude Code's testing module).
+# Run those two locally before opening a PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Set a git identity for the self-tests
+        run: |
+          git config --global user.name "busybody-ci"
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global init.defaultBranch main
+      - name: .land-checks
+        run: ./.land-checks
