@@ -83,10 +83,10 @@ Then type `/office`. The band finds the workspace by walking up from the
 session's directory to the first folder with `office.json` (or `$BUSYBODY_WORKSPACE`), falling back to the
 folder above the plugin. With none found it shows a warning and runs nothing.
 
-Checks, from a clone of this repo (they are what `bin/land` runs; see `.land-checks`):
+Checks, from a clone of this repo (`.land-checks` is what CI runs on every PR, and what `bin/land` runs in a workspace that lands without PRs):
 
 ```sh
-./.land-checks
+./.land-checks   # CI runs this; it has no Claude Code CLI, so the next two run only locally
 claude plugin validate .
 claude plugin test .
 tsc -p .   # needs .claude-plugin/types/, which the engine lays at load (gitignored)
@@ -268,3 +268,8 @@ tests/fixture.ts             a made-up bin/rooms document (issues 9001-9003, rol
 
 The tests mock every host command beneath the mod: nothing real runs, and no
 test can post to a real issue or stop a real room.
+
+## Contributing
+
+This repo takes pull requests: branch `feat/`, `fix/` or `docs/` off `main`, atomic Conventional Commits, merge-commit merges, no force-pushes. The `checks` workflow runs `.land-checks` on each PR.
+`bin/land` remains for workspaces that land without PRs.

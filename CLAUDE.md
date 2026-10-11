@@ -72,7 +72,8 @@ claude plugin test .                    # bun tests in tests/ (the band's logic)
 
 ## Landing a change
 
-The engine repo has no PRs: a branch lands with `bin/land <branch>`, which runs `.land-checks`. It needs the branch directly on `main` (no merge commits), runs the
-checks at every commit oldest first in a temporary worktree, stops at the first failure, then fast-forwards `main` and pushes. `--dry-run` runs the checks only.
-Never force-push, and never push `main` by hand from a room (the pre-push seatbelt refuses). Edits hot-reload in a workspace that loads the plugin in place (`/reload-plugins`).
+The engine repo takes pull requests (owner, 2026-10-10). Branch `feat/`, `fix/` or `docs/` off `main`, atomic Conventional Commits, and open a PR; run `./.land-checks`,
+`claude plugin validate .` and `claude plugin test .` first. The `checks` workflow (`.github/workflows/checks.yml`) runs `.land-checks` on every PR and push to `main`; it
+has no Claude Code CLI, so the two plugin checks run only locally. The owner (or the controller on their say-so) merges with a merge commit. Never force-push or rewrite pushed history, and never push `main` by hand from a room (the pre-push seatbelt refuses).
+`bin/land` stays as a tool for workspaces that use the `land` merge mode; the engine itself no longer changes that way. Edits hot-reload in a workspace that loads the plugin in place (`/reload-plugins`).
 When a change touches how a workspace is set up (`office.json` fields, `init`, `templates/workspace-CLAUDE.md`), say so in the commit body: existing workspaces do not update themselves.
