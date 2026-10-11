@@ -1,0 +1,233 @@
+#!/usr/bin/python3 -I
+"""Controller handoff and resume: carry what GitHub cannot show across a compaction.
+
+  bin/handoff path             where the handoff file lives: <workspace>/.cache/handoff.md
+  bin/handoff template         print templates/handoff.md (the skill fills it in and writes it to that path)
+  bin/handoff context          the SessionStart (compact) hook: print the hook JSON whose additionalContext holds the
+                               handoff file and a `bin/rooms --json` summary (capped, see below; no status: the SessionStart hook already runs it)
+  bin/handoff resume           the same material as plain text, plus which in-flight items still have a running session
+                               or watcher and which are lost (what /busybody:resume prints)
+  bin/handoff --self-test      against stub status and rooms output; offline
+
+The handoff file has fixed sections (templates/handoff.md); its "## In flight" bullets start `- <name>: ...`, and <name> is
+what resume looks for among running sessions (rooms --json `live_sessions`) and watcher processes. Nothing is parsed
+for state beyond that.
+
+Hook output: {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}. Claude Code truncates
+hook output over 10,000 characters, so the context is capped at BUSYBODY_HANDOFF_MAX (default 9000) characters, the handoff
+file first, then rooms, then status, each cut with a marker saying so. Always exits 0: it runs from a hook, and a failing
+hook is worse than none.
+
+Test hooks: BUSYBODY_HANDOFF_STATUS_CMD and BUSYBODY_HANDOFF_ROOMS_CMD replace the commands run for status and rooms --json;
+BUSYBODY_HANDOFF_PS_CMD replaces the process listing used to find watchers.
+"""
+import json, os, re, shlex, subprocess, sys, tempfile
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import bb_env, data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+
+DEFAULT_MAX = 9000
+HOOK_ROOMS_TIMEOUT = 30  # the hook is killed at its own timeout and would lose the handoff file with it
+
+
+def run(cmd, timeout=90):
+    """stdout of a command (a list, or a string for the test hooks), '' on any failure."""
+    try:
+        argv = shlex.split(cmd) if isinstance(cmd, str) else cmd
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def handoff_path(workspace):
+    return os.path.join(data_root(workspace), ".cache", "handoff.md")
+
+
+def cut(text, limit, what):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 80, 0)].rstrip() + f"\n[... {what} cut at {limit} characters; run `busybody handoff resume` for the rest]"
+
+
+def in_flight(handoff):
+    """Names from the `## In flight` section: the text before the first colon of each bullet."""
+    names, on = [], False
+    for line in handoff.splitlines():
+        if line.startswith("## "):
+            on = line.strip().lower() == "## in flight"
+        elif on:
+            m = re.match(r"\s*[-*]\s+`?([^:`]+?)`?\s*:", line)
+            if m:
+                names.append(m.group(1).strip())
+    return names
+
+
+def rooms_doc(workspace, timeout=120):
+    cmd = bb_env(None, "HANDOFF_ROOMS_CMD") or [os.path.join(ENGINE_ROOT, "bin", "rooms"), "--json"]
+    try:
+        return json.loads(run(cmd, timeout) or "{}")
+    except ValueError:
+        return {}
+
+
+def rooms_summary(doc):
+    if not doc:
+        return "rooms: unavailable (bin/rooms --json gave nothing)"
+    lines = []
+    for r in doc.get("rooms", []):
+        latest = (r.get("latest") or {}).get("first_line", "")
+        lines.append(f"- {r.get('name')} #{r.get('issue')} [{r.get('state')}] {r.get('repo', '')}"
+                     + (f" — {latest}" if latest else "") + f" — ${r.get('cost', {}).get('today', 0):.2f} today")
+    for d in doc.get("decisions", []):
+        lines.append(f"- sticky note ({d.get('room')} #{d.get('issue')}): {d.get('first_line', '')}")
+    sessions = [s.get("name") for s in doc.get("live_sessions", [])]
+    lines.append(f"live sessions: {', '.join(sessions) if sessions else 'none'}")
+    return "\n".join(lines) if lines else "rooms: none open"
+
+
+def status_text():
+    cmd = bb_env(None, "HANDOFF_STATUS_CMD") or [os.path.join(ENGINE_ROOT, "bin", "status")]
+    return run(cmd, 120).strip() or "status: unavailable"
+
+
+def watchers():
+    cmd = bb_env(None, "HANDOFF_PS_CMD") or ["ps", "-eo", "args"]
+    return [l.strip() for l in run(cmd).splitlines() if "pr-watch" in l or "room-cost-timer" in l]
+
+
+def read_handoff(workspace):
+    try:
+        return open(handoff_path(workspace)).read()
+    except OSError:
+        return ""
+
+
+def sections(workspace, limit, full=True):
+    handoff = read_handoff(workspace)
+    parts = [("Controller handoff (.cache/handoff.md)", handoff.strip() or
+              "no handoff file: nothing was handed off before this compaction. The state below is all GitHub shows."),
+             ("Rooms (bin/rooms --json)", rooms_summary(rooms_doc(workspace, 120 if full else HOOK_ROOMS_TIMEOUT)))]
+    if full:
+        parts.append(("Status (bin/status)", status_text()))
+    # budget: the handoff gets what it needs first, then the rest share what is left
+    out, left = [], limit
+    for title, body in parts:
+        head = f"## {title}\n"
+        body = cut(body, max(left - len(head), 200), title)
+        out.append(head + body)
+        left -= len(head) + len(body) + 2
+    return "\n\n".join(out), handoff
+
+
+def hook(workspace):
+    limit = int(bb_env(None, "HANDOFF_MAX") or DEFAULT_MAX)
+    text, _ = sections(workspace, limit, full=False)
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+
+
+def resume(workspace):
+    limit = int(bb_env(None, "HANDOFF_MAX") or DEFAULT_MAX)
+    text, handoff = sections(workspace, limit * 3)
+    live = {s.get("name") for s in rooms_doc(workspace).get("live_sessions", [])}
+    procs = watchers()
+    lines = []
+    for name in in_flight(handoff):
+        running = name in live or any(name in p for p in procs)
+        lines.append(f"- {name}: {'still running' if running else 'LOST (no session or watcher found); restart it or check its result'}")
+    flight = "\n".join(lines) if lines else "nothing listed under 'In flight'"
+    return f"{text}\n\n## In flight, checked against running sessions and watchers\n{flight}\n"
+
+
+def self_test():
+    d = tempfile.mkdtemp()
+    try:
+        ws = os.path.join(d, "ws")
+        os.makedirs(os.path.join(ws, ".cache"))
+        open(os.path.join(ws, "office.json"), "w").write('{"minutesRepo": "acme-co/acme-office"}')
+        env = {"BUSYBODY_WORKSPACE": ws}
+        stub = os.path.join(d, "stub")
+        open(stub, "w").write("#!/bin/sh\ncase \"$1\" in rooms) echo '{\"rooms\":[{\"name\":\"room-a\",\"issue\":7,\"state\":\"working\",\"repo\":\"acme-web\","
+                              "\"cost\":{\"today\":1.5}}],\"decisions\":[],\"live_sessions\":[{\"name\":\"room-a\"}]}';; status) echo 'acme #7: step 1 deployed';; "
+                              "ps) echo 'bash busybody pr-watch 12 -R acme-co/acme-web';; esac\n")
+        os.chmod(stub, 0o755)
+        env.update(BUSYBODY_HANDOFF_ROOMS_CMD=f"{stub} rooms", BUSYBODY_HANDOFF_STATUS_CMD=f"{stub} status", BUSYBODY_HANDOFF_PS_CMD=f"{stub} ps")
+        os.environ.update(env)
+        results = []
+
+        def check(name, ok):
+            results.append((name, bool(ok)))
+
+        check("path is under the workspace .cache", handoff_path(ws) == os.path.join(ws, ".cache", "handoff.md"))
+        check("no file: the hook says so and carries rooms, not status",
+              all(s in hook(ws)["hookSpecificOutput"]["additionalContext"] for s in ("no handoff file", "room-a #7")) and "step 1 deployed" not in hook(ws)["hookSpecificOutput"]["additionalContext"])
+        tpl = open(os.path.join(ENGINE_ROOT, "templates", "handoff.md")).read()
+        open(handoff_path(ws), "w").write(
+            "# Handoff\n\n## In flight\n- room-a: wait for DONE, then resolve it\n- pr-watch 12: relay the merge to the owner\n- room-gone: check its PR\n\n"
+            "## Promises\n- notify the owner when X is live\n")
+        out = hook(ws)
+        check("hook shape", out["hookSpecificOutput"]["hookEventName"] == "SessionStart" and json.loads(json.dumps(out)))
+        check("hook holds the handoff", "notify the owner when X is live" in out["hookSpecificOutput"]["additionalContext"])
+        check("in-flight names", in_flight(read_handoff(ws)) == ["room-a", "pr-watch 12", "room-gone"])
+        r = resume(ws)
+        check("resume: a live session and a watcher are running", "- room-a: still running" in r and "- pr-watch 12: still running" in r)
+        check("resume carries status", "step 1 deployed" in r)
+        check("resume: a missing one is lost", "- room-gone: LOST" in r)
+        import time
+        hang = os.path.join(d, "hang")
+        open(hang, "w").write("#!/bin/sh\nsleep 30\n")
+        os.chmod(hang, 0o755)
+        global HOOK_ROOMS_TIMEOUT
+        HOOK_ROOMS_TIMEOUT, t0 = 1, time.time()
+        os.environ["BUSYBODY_HANDOFF_ROOMS_CMD"] = hang
+        slow = hook(ws)["hookSpecificOutput"]["additionalContext"]
+        check("a hanging rooms still prints the handoff, within the timeout", "notify the owner when X is live" in slow and time.time() - t0 < 10 and "rooms: unavailable" in slow)
+        os.environ["BUSYBODY_HANDOFF_ROOMS_CMD"] = f"{stub} rooms"
+        os.environ["BUSYBODY_HANDOFF_MAX"] = "400"
+        open(handoff_path(ws), "w").write("# Handoff\n\n## In flight\n" + "- room-a: pad pad pad pad pad pad\n" * 80)
+        small = hook(ws)["hookSpecificOutput"]["additionalContext"]
+        check("the cap holds and says what was cut", len(small) < 1500 and "cut at" in small)
+        check("the template has the sections the skill fills",
+              all(h in tpl for h in ("## In flight", "## Promises to the owner", "## Waiting on the owner", "## Parked", "## Gotchas", "## Candidates")))
+        bad = [n for n, ok in results if not ok]
+        for n, ok in results:
+            print(("ok   " if ok else "FAIL ") + n)
+        if bad:
+            sys.exit(1)
+        print("handoff self-test: ok")
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.split('\n\n')[0] + "\n" + "\n".join(__doc__.splitlines()[2:10]))
+        return 0
+    if argv[0] == "--self-test":
+        self_test()
+        return 0
+    workspace = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+    try:
+        if argv[0] == "path":
+            print(handoff_path(workspace))
+        elif argv[0] == "template":
+            sys.stdout.write(open(os.path.join(ENGINE_ROOT, "templates", "handoff.md")).read())
+        elif argv[0] == "context":
+            print(json.dumps(hook(workspace)))
+        elif argv[0] == "resume":
+            sys.stdout.write(resume(workspace))
+        else:
+            print(f"handoff: unknown command {argv[0]!r} (path, template, context, resume, --self-test)", file=sys.stderr)
+            return 2
+    except Exception as e:  # never break a hook
+        if argv[0] != "context":
+            print(f"handoff: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
