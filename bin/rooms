@@ -712,7 +712,9 @@ def self_test():
                ("the document is cached for 60s and shared", (first, second, third, len(calls[:3])) == ("doc1", "doc1", "doc2", 3)),
                ("a failing build serves the last document", fourth == "doc2"),
                ("the minutes client self-test passes",
-                subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "minutes.py"), "--self-test"]).returncode == 0)]
+                subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "minutes.py"), "--self-test"]).returncode == 0),
+               ("the session helper self-test passes (ending a session by pid, and itself)",
+                subprocess.run([sys.executable, "-I", os.path.join(ENGINE_ROOT, "bin", "lib", "sessions.py"), "--self-test"]).returncode == 0)]
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     bad = [n for n, c in checks if not c]
