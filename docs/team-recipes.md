@@ -79,6 +79,22 @@ first user turn, so auto mode sees it there and not only in an issue comment (a 
 of which model, whether it has a worktree, the caps, and the standing prohibitions (no `gh pr ready`, no
 merging, no opening rooms). The same flags decide the room settings' `allow` list.
 
+## Desks as agent types (`busybody kit`)
+
+A desk is a named agent type, so the room lead spawns it by name and the recipe's model and tools bind it, not the lead's memory of them.
+`busybody kit build` writes `<workspace>/desks/`, a plugin named `desks` holding only `.claude-plugin/plugin.json` and one
+`agents/<team>-<desk>.md` per desk of each project-room recipe (staff recipes and recipes with no desks are skipped). Each file has
+`name`, `description` and the desk's `model`; a `readOnly` desk also gets `disallowedTools: Edit, Write, NotebookEdit`. That is "no
+edit tools", not read-only: Bash stays, so the room's deny rules are still the real fence. The body is `templates/desk.md`.
+
+- Commit `desks/`: the output is deterministic, so every desk change shows as a diff the owner reviews. Edit the recipe, never the agent file.
+- `busybody kit check` (and `busybody team check`, whenever `desks/` exists) fails if `desks/` differs from the recipes, or holds any
+  file other than those two kinds. A workspace that never ran `kit build` is unaffected.
+- When `desks/` exists, `busybody lead-start` requires it to have that shape and to be clean in git, launches the room with
+  `claude --plugin-dir <workspace>/desks`, denies `Edit` and `Write` on it in the room settings, and the brief names each desk as
+  `subagent_type: "desks:<team>-<desk>"`. A plugin dir that grew `hooks/` or `.mcp.json` would run outside the deny rules, which is
+  why the shape is checked at every launch.
+
 ## Phase
 
 Each `PROGRESS` minute of a room may carry a `Phase: <name>` line in its body, where `<name>` is one of
