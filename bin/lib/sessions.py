@@ -74,7 +74,8 @@ def agents_pid_map(cache_dir=None, ttl=60, timeout=1.0):
 
 
 def is_claude(argv):
-    return os.path.basename(argv[0]) == "claude" or (len(argv) > 1 and os.path.basename(argv[0]) in ("node", "bun") and os.path.basename(argv[1]) == "claude")
+    # a live background session retitles itself: its whole argv is the single string "claude bg-spare", so look at the first word
+    return os.path.basename(argv[0].split(" ", 1)[0]) == "claude" or (len(argv) > 1 and os.path.basename(argv[0]) in ("node", "bun") and os.path.basename(argv[1]) == "claude")
 
 
 def names_session(argv, name):
@@ -254,6 +255,7 @@ def self_test():
               {"name": "room-e", "kind": "background", "pid": 15, "state": "working"},
               {"name": "room-f", "kind": "background", "pid": 99, "state": "done"},
               {"name": "room-b-x", "kind": "background", "pid": 12, "state": "working"}]
+    eq("a retitled process (argv[0] is the one string 'claude bg-spare') is claude; a lookalike is not", (is_claude(["claude bg-spare", "--bg-spare", "x"]), is_claude(["/home/u/.local/bin/claude daemon run"]), is_claude(["vim claude"])), (True, True, False))
     eq("the agents pid map finds a bg-spare process with no -n", find("room-a", table, agents), ([10], True))
     eq("exact names only: room-b is not room-b-x", (find("room-b", table, agents)[0], find("room-b-x", table, agents)[0]), ([11], [12]))
     eq("the -n match is the fallback for non-bg shapes, exact only", (find("room-d", table, [])[0], find("room-d-2", table, [])[0]), ([13], [14]))
