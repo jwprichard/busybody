@@ -1368,7 +1368,7 @@ def self_test():
         ws = os.path.join(tmp, "ws")
         for d in ("bin/lib", "templates"):
             os.makedirs(os.path.join(ws, "engine", d))
-        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py",
+        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py", "bin/lib/kitlib.py",
                   "templates/role-charter.md", "templates/prices.json", "templates/role-brief.md", "templates/role-settings.json",
                   "templates/room-settings.json"):
             shutil.copy2(os.path.join(HERE, f), os.path.join(ws, "engine", f))
