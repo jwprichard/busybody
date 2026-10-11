@@ -74,5 +74,5 @@ When the team's done condition is met (for a dev team, the PR **merged**), close
 1. Stop any servers and background shells you started (the watcher exits on its own at merge); push the branch if anything is unpushed.
 2. Remove your worktrees: the extra ones (`{{ROOM}}-<n>`) first, then your own room worktree last if the harness allows it (otherwise the controller removes the room worktree after `DONE`). Release any assignments.
 3. Post `DONE` (output, evidence links, the `room-cost` line, retro) and send the controller `DONE {{ROOM}}: <comment URL>`.
-4. **End your own session.** Do not wait to be told.
+4. **End your own session** with `busybody close-self` as your last tool call, then end your turn. It returns at once and a detached helper ends this session's process by id a few seconds later (`claude stop` by name is not reliable, and a room cannot run `end-session`). Do not wait to be told. If it reports an error, post a `BLOCKED` minute saying the session could not be ended.
 The controller then spot-checks the `DONE`, writes a `RECORD`, and resolves (closes) the issue. It can reopen if the check fails. Deploy evidence is tracked separately by the workspace's `status` tool.

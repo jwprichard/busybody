@@ -117,6 +117,52 @@ def find(name, table=None, agents=None):
     return sorted(pids - me), bool(entries)
 
 
+def own_session(table=None, agents=None, me=None):
+    """(name, pid) of the room or role session this process runs inside: the nearest ancestor that is a claude process and either
+    is listed by `claude agents --json` under a room-*/role-* name or carries `-n <such a name>`. None outside a session."""
+    table = table if table is not None else processes()
+    argv_of = dict(table)
+    agents = agents if agents is not None else agents_list()
+    listed = {a["pid"]: a.get("name") or "" for a in agents if isinstance(a.get("pid"), int)}
+    chain = []
+    pid = os.getppid()
+    for _ in range(30):
+        if pid <= 1:
+            break
+        chain.append(pid)
+        try:
+            pid = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    for pid in (me if me is not None else chain):
+        argv = argv_of.get(pid)
+        if not argv or not is_claude(argv):
+            continue
+        if NAME_RE.match(listed.get(pid, "")):
+            return listed[pid], pid
+        for i, a in enumerate(argv):
+            if a in ("-n", "--name") and i + 1 < len(argv) and NAME_RE.match(argv[i + 1]):
+                return argv[i + 1], pid
+    return None
+
+
+def session_of_pid(pid, table=None, agents=None):
+    """The room/role session name that claude process `pid` runs, or None when it is not a room or role session (so a pid is never a
+    way to end an arbitrary process)."""
+    table = table if table is not None else processes()
+    argv = dict(table).get(pid)
+    if not argv or not is_claude(argv):
+        return None
+    agents = agents if agents is not None else agents_list()
+    for a in agents:
+        if a.get("pid") == pid and NAME_RE.match(a.get("name") or ""):
+            return a["name"]
+    for i, a in enumerate(argv):
+        if a in ("-n", "--name") and i + 1 < len(argv) and NAME_RE.match(argv[i + 1]):
+            return argv[i + 1]
+    return None
+
+
 def alive(pid, table=None):
     if table is not None:
         return any(p == pid for p, _ in table())
@@ -141,6 +187,25 @@ def end(name, grace=10.0, poll=0.2, table_fn=None, send=None, agents=None):
         if listed:
             return False, [f"{name}: listed by `claude agents` but no claude process could be matched to end (its pid is missing, gone or not a claude process)"]
         return True, [f"{name}: not listed and no process found (already gone)"]
+    return end_pids(name, pids, grace, poll, table_fn, send)
+
+
+def end_target(target, grace=10.0, **kw):
+    """`end` for a session name, or for a pid that must be the claude process of a room or role session (never any other process)."""
+    if not str(target).isdigit():
+        return end(target, grace=grace, **kw)
+    pid = int(target)
+    name = session_of_pid(pid)
+    if not name:
+        raise ValueError(f"pid {pid} is not a claude process of a room or role session")
+    if not alive(pid):
+        return True, [f"{name}: pid {pid} already gone"]
+    return end_pids(name, [pid], grace=grace)
+
+
+def end_pids(name, pids, grace=10.0, poll=0.2, table_fn=None, send=None):
+    """TERM, wait, then KILL what ignored it, for pids already matched to the session `name`. Returns (ok, lines)."""
+    send = send or (lambda pid, sig: None if os.environ.get("BUSYBODY_NO_SIGNAL") == "1" else os.kill(pid, sig))
     lines = []
     for pid in pids:
         try:
@@ -212,6 +277,18 @@ def self_test():
     eq("TERM then KILL for the one that ignores it", (ok, (11, signal.SIGKILL) in sent, (10, signal.SIGKILL) in sent, any("SIGKILL was sent" in l for l in lines)), (True, True, False, True))
     eq("listed but nothing endable is a failure", end("room-c", table_fn=lambda: table, send=send, agents=agents)[0], False)
     eq("not listed and not running is gone (success)", end("room-zz", table_fn=lambda: table, send=send, agents=agents)[0], True)
+    # a known pid: session_of_pid refuses a pid that is not a room or role claude process
+    eq("session_of_pid: listed bg-spare", session_of_pid(10, table, agents), "room-a")
+    eq("session_of_pid: -n fallback", session_of_pid(13, table, []), "room-d")
+    eq("session_of_pid: not claude, or no session name", (session_of_pid(15, table, agents), session_of_pid(16, table, agents), session_of_pid(777, table, agents)), (None, None, None))
+    # own_session: the nearest claude ancestor that is a session (the chain is given, as /proc is not faked)
+    eq("own_session: listed ancestor", own_session(table, agents, me=[999, 11, 10]), ("room-b", 11))
+    eq("own_session: -n ancestor", own_session(table, [], me=[13]), ("room-d", 13))
+    eq("own_session: outside a session", own_session(table, agents, me=[15, 16]), None)
+    # end_pids ends a pid list directly (the self-end helper's path, where the caller is not its own ancestor any more)
+    gone = {10: False}
+    got = end_pids("room-a", [10], grace=0.3, poll=0.05, table_fn=lambda: [(p, a) for p, a in table if not (p == 10 and gone[10])], send=lambda pid, sig: gone.update({pid: True}))
+    eq("end_pids", got[0], True)
     # the agents-pid map is cached briefly
     with tempfile.TemporaryDirectory() as d:
         f = os.path.join(d, "agents.json")
@@ -232,6 +309,14 @@ def self_test():
         eq("a real bg-spare session is ended by its agents pid; another is untouched", (ok, mine.poll() is not None, other.poll() is None), (True, True, True))
         other.terminate()
         other.wait()
+        # a pid that is not a room or role session is refused and left alone
+        plain = subprocess.Popen(["sleep", "30"])
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "bin", "end-session")
+        env = dict(os.environ, BUSYBODY_AGENTS_JSON=f)
+        json.dump([], open(f, "w"))
+        r = subprocess.run([sys.executable, "-I", script, str(plain.pid)], env=env, capture_output=True, text=True)
+        eq("a pid that is not a session is refused and left alone", (r.returncode != 0, plain.poll() is None), (True, True))
+        plain.kill()
     if bad:
         print("sessions self-test: FAILED: " + "; ".join(bad))
         return 1
