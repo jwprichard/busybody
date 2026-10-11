@@ -20,7 +20,7 @@ bin/                         the tools, each executable and each with a --self-t
                              minutes.py (the cached issue reader), tracker.py, costlib.py, prcache.py, sessions.py,
                              evidencelib.sh, pre-push-seatbelt (hook template), role-memory-check, pre-commit-role-memory
 hooks/                       hooks.json (SessionStart) and the TypeScript office band (hooks/office, register.tsx)
-skills/                      debate-panel, standing-role, workstream-lead: judgement the tools cannot hold
+skills/                      debate-panel, standing-role, workstream-lead, repo-onboard: judgement the tools cannot hold
 templates/                   lead-brief.md, role-*.md, room-settings.json, prices.json, workspace-CLAUDE.md, teams/ (default recipes init seeds)
 fixtures/                    test data: office.json (a made-up "acme" workspace), roles/, rooms/, room-cost/, teams/
 tests/                       bun tests for the office band (logic.test.ts, office.test.ts)

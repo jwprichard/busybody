@@ -72,6 +72,8 @@ Ask "why not do it myself?" before every spawn: a worker costs about 4x the toke
 
 The child repos are independent clones kept in this folder and gitignored here. List them in `office.json` (`repos`) and describe them here.
 
+To import one, run `bin/busybody repo add <owner/name>` (`--dry-run` first): it clones, gitignores, writes the `office.json` entry and leaves a stub here. Then run the `busybody:repo-onboard` skill to fill the stub in and propose the evidence rule.
+
 | | repo-one | repo-two |
 | --- | --- | --- |
 | Own guidance | its `CLAUDE.md` | |
