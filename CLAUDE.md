@@ -15,7 +15,7 @@ workspace's `office.json`.
 bin/                         the tools, each executable and each with a --self-test; `busybody <cmd>` runs bin/<cmd>
   busybody                   the dispatcher (lists every executable in bin/)
   init                       sets up a workspace folder
-  rooms role status room-cost room-cost-timer team land pr-watch lead-start end-session close-self gh-usage gh-wrapper handoff repo
+  rooms role status room-cost room-cost-timer team kit land pr-watch lead-start end-session close-self gh-usage gh-wrapper handoff repo
   lib/                       shared helpers: officeroot.{sh,py} (finding roots), officeconfig.{sh,py} (office.json),
                              minutes.py (the cached issue reader), tracker.py, costlib.py, prcache.py, sessions.py,
                              evidencelib.sh, pre-push-seatbelt (hook template), role-memory-check, pre-commit-role-memory
@@ -58,7 +58,7 @@ A worktree of the workspace repo holds its own `office.json` and so counts as a 
 Each tool tests itself offline with stub `gh` and scratch repos; none of them reads the real workspace's `office.json`.
 
 ```sh
-for s in init rooms role room-cost pr-watch land status handoff repo close-self; do bin/$s --self-test; done   # per-tool self-tests (.land-checks runs them all)
+for s in init rooms role room-cost pr-watch land kit status handoff repo close-self; do bin/$s --self-test; done   # per-tool self-tests (.land-checks runs them all)
 bin/team check                          # every team recipe (team.json) is sound
 python3 -I bin/lib/officeconfig.py --self-test
 claude plugin validate .                # the manifest

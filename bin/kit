@@ -1,0 +1,227 @@
+#!/usr/bin/python3 -I
+"""Desks as named agent types: generate the `desks` plugin from the workspace's team recipes.
+
+  bin/kit build [--out DIR]   write DIR (default <workspace>/desks): .claude-plugin/plugin.json and agents/<team>-<desk>.md for every
+                              desk of every project-room recipe in teams/*/team.json (recipes with no desks are skipped).
+                              A desk's model is the recipe's. A readOnly desk gets `disallowedTools: Edit, Write, NotebookEdit`:
+                              that is "no edit tools", not read-only (Bash stays), so the room deny rules remain the real fence.
+                              The body is templates/desk.md. Output is deterministic; commit it so every desk change is a diff.
+  bin/kit check [--dir DIR]   regenerate in memory and fail (exit 1) if DIR (default <workspace>/desks) differs, is missing a file,
+                              has a stale agent, or holds any file other than plugin.json and agents/*.md
+  bin/kit shape [DIR]         only the layout rule: DIR holds nothing but .claude-plugin/plugin.json and agents/*.md (lead-start runs this)
+  bin/kit --self-test         build fixture recipes in a scratch workspace and check model, tools, names and drift
+
+The agent types are named `desks:<team>-<desk>` once the plugin is loaded with `claude --plugin-dir <workspace>/desks`
+(`bin/lead-start` adds the flag when desks/ exists). A plugin dir that grew hooks/ or .mcp.json would run outside the deny rules.
+"""
+import importlib.machinery, importlib.util, json, os, shutil, subprocess, sys, tempfile
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+import kitlib  # noqa: E402
+
+TEMPLATE = os.path.join(ENGINE_ROOT, "templates", "desk.md")
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"kit: {msg}\n")
+    sys.exit(code)
+
+
+def load_team():
+    """bin/team as a module (it owns the recipe loader and validator)."""
+    path = os.path.join(ENGINE_ROOT, "bin", "team")
+    loader = importlib.machinery.SourceFileLoader("busybody_team", path)
+    spec = importlib.util.spec_from_loader("busybody_team", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def recipes(team, root):
+    """Valid recipes of the workspace at root; stops with the problems if any recipe is invalid."""
+    out, bad = [], []
+    for n in team.recipe_names(root):
+        errs, t = team.validate(root, n)
+        if errs:
+            bad.append(f"recipe {n} is invalid: " + "; ".join(errs))
+        else:
+            out.append(t)
+    if bad:
+        die("; ".join(bad))
+    return out
+
+
+def rendered(team, root):
+    return kitlib.render(recipes(team, root), open(TEMPLATE).read())
+
+
+def build(team, root, out):
+    files = rendered(team, root)
+    for sub in ("agents", ".claude-plugin"):   # only what kit owns is cleared; anything else is left for `check` to flag
+        shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
+    for rel, text in files.items():
+        p = os.path.join(out, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(text)
+    n = sum(1 for r in files if r.startswith("agents/"))
+    print(f"kit build: {n} desk agent(s) written to {out}")
+    return 0
+
+
+def check(team, root, d):
+    if not os.path.isdir(d):
+        print(f"kit check: {d} does not exist (run `busybody kit build`)")
+        return 1
+    problems = kitlib.drift(d, rendered(team, root))
+    for p in problems:
+        print(f"kit check: {p}")
+    if problems:
+        print("kit check: desks/ is out of date; run `busybody kit build` and commit the result")
+        return 1
+    print(f"kit check: ok ({d})")
+    return 0
+
+
+def shape(d):
+    if not os.path.isdir(d):
+        die(f"{d} does not exist")
+    bad = kitlib.shape_problems(d)
+    if bad:
+        print(f"kit: {d} must hold only .claude-plugin/plugin.json and agents/*.md, found: " + ", ".join(bad), file=sys.stderr)
+        return 1
+    return 0
+
+
+def self_test():
+    import io, contextlib
+    team = load_team()
+    bad = []
+    ws = tempfile.mkdtemp()
+    try:
+        def put(name, **kw):
+            t = {"name": name, "purpose": f"purpose of {name}", "room": "project", "head": {"role": "room-lead", "model": "sonnet"},
+                 "desks": [{"name": "impl", "model": "sonnet", "max": 2}, {"name": "rev", "model": "opus", "max": 1, "readOnly": True}],
+                 "entry": ["a"], "phases": ["work"], "output": "merged-pr", "done": {"check": "pr-merged"},
+                 "worktree": True, "draftPr": True, "land": False, "caps": {"softUsdPerDay": 15, "hardUsdPerDay": 40}, "measures": ["cost"]}
+            t.update(kw)
+            d = os.path.join(ws, "teams", name)
+            os.makedirs(d, exist_ok=True)
+            json.dump(t, open(os.path.join(d, "team.json"), "w"))
+            open(os.path.join(d, "SKILL.md"), "w").write(f"---\nname: {name}\ndescription: d\n---\n")
+
+        put("alpha")
+        put("beta", desks=[{"name": "scout", "model": "haiku", "max": 3}])
+        put("nodesk", desks=[], draftPr=False, worktree=False, output="verdict", done={"check": "verdict-posted"})
+        put("staffy", room="staff", head={"role": "analyst", "model": "sonnet"}, output="report", done={"check": "report-posted"},
+            draftPr=False, worktree=False)
+        os.makedirs(os.path.join(ws, "roles", "analyst"))
+        open(os.path.join(ws, "roles", "analyst", "role.json"), "w").write("{}")
+        out = os.path.join(ws, "desks")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build(team, ws, out)
+        names = sorted(os.listdir(os.path.join(out, "agents")))
+        if names != ["alpha-impl.md", "alpha-rev.md", "beta-scout.md"]:
+            bad.append(f"agent files: {names}")
+        pj = json.load(open(os.path.join(out, ".claude-plugin", "plugin.json")))
+        if pj.get("name") != "desks" or not pj.get("version") or not pj.get("description"):
+            bad.append(f"plugin.json: {pj}")
+
+        def agent(n):
+            return open(os.path.join(out, "agents", n + ".md")).read()
+
+        impl, rev, scout = agent("alpha-impl"), agent("alpha-rev"), agent("beta-scout")
+        if not (impl.startswith("---\nname: alpha-impl\n") and "\nmodel: sonnet\n" in impl and "disallowedTools" not in impl):
+            bad.append(f"impl frontmatter: {impl[:200]}")
+        if not ("\nname: alpha-rev\n" in rev and "\nmodel: opus\n" in rev and "\ndisallowedTools: Edit, Write, NotebookEdit\n" in rev
+                and "read-only" in rev):
+            bad.append(f"reviewer frontmatter: {rev[:300]}")
+        if "\nmodel: haiku\n" not in scout:
+            bad.append("a haiku desk keeps its model")
+        if "{{" in impl + rev + scout or "`implementer`" in impl or "`impl` desk of the `alpha` team" not in impl:
+            bad.append("placeholders must be filled")
+        if not all(x.endswith("\n") and not x.endswith("\n\n") for x in (impl, rev, scout)):
+            bad.append("one trailing newline")
+        first = {r: open(os.path.join(out, r)).read() for r in ("agents/alpha-impl.md", ".claude-plugin/plugin.json")}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            build(team, ws, out)
+            if any(open(os.path.join(out, r)).read() != t for r, t in first.items()):
+                bad.append("build must be deterministic")
+            if check(team, ws, out) != 0:
+                bad.append("a fresh build must pass the drift check")
+            if shape(out) != 0:
+                bad.append("a fresh build has the right shape")
+            p = os.path.join(out, "agents", "alpha-rev.md")
+            good = open(p).read()
+            open(p, "w").write(good.replace("model: opus", "model: sonnet"))
+            if check(team, ws, out) != 1:
+                bad.append("a hand edit must fail the drift check")
+            open(p, "w").write(good)
+            os.remove(os.path.join(out, "agents", "beta-scout.md"))
+            if check(team, ws, out) != 1:
+                bad.append("a missing agent must fail the drift check")
+            build(team, ws, out)
+            open(os.path.join(out, "agents", "ghost.md"), "w").write("x\n")
+            if check(team, ws, out) != 1:
+                bad.append("a stale agent must fail the drift check")
+            os.remove(os.path.join(out, "agents", "ghost.md"))
+            os.makedirs(os.path.join(out, "hooks"))
+            open(os.path.join(out, "hooks", "hooks.json"), "w").write("{}\n")
+            if check(team, ws, out) != 1 or shape(out) != 1:
+                bad.append("a hooks/ dir must fail the drift and shape checks")
+            shutil.rmtree(os.path.join(out, "hooks"))
+            open(os.path.join(out, ".mcp.json"), "w").write("{}\n")
+            if shape(out) != 1:
+                bad.append(".mcp.json must fail the shape check")
+            os.remove(os.path.join(out, ".mcp.json"))
+            if check(team, ws, os.path.join(ws, "nope")) != 1:
+                bad.append("a missing desks dir fails kit check")
+        # --out elsewhere leaves the workspace's own desks/ alone, and an invalid recipe stops the build
+        alt = os.path.join(ws, "alt")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build(team, ws, alt)
+        if sorted(os.listdir(os.path.join(alt, "agents"))) != ["alpha-impl.md", "alpha-rev.md", "beta-scout.md"]:
+            bad.append("build --out writes there")
+        put("broken", desks=[{"name": "x", "model": "gpt", "max": 1}])
+        r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "build"], env=dict(os.environ, BUSYBODY_WORKSPACE=ws),
+                           capture_output=True, text=True)
+        if not (r.returncode != 0 and "broken" in r.stderr):
+            bad.append(f"an invalid recipe must stop the build: {r.returncode} {r.stderr}")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+    if bad:
+        print("kit self-test: FAILED: " + "; ".join(bad))
+        return 1
+    print("kit self-test: ok")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 1
+    if argv[0] == "--self-test":
+        return self_test()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "shape":
+        return shape(rest[0] if rest else die("usage: bin/kit shape DIR"))
+    if cmd not in ("build", "check"):
+        die(f"unknown command {cmd}; see bin/kit --help")
+    opt, i = {}, 0
+    while i < len(rest):
+        if rest[i] in ("--out", "--dir") and i + 1 < len(rest):
+            opt[rest[i]] = rest[i + 1]
+            i += 2
+        else:
+            die(f"unknown argument {rest[i]}")
+    team = load_team()
+    root = team.WORKSPACE_ROOT
+    if cmd == "build":
+        return build(team, root, os.path.abspath(opt.get("--out", os.path.join(root, "desks"))))
+    return check(team, root, os.path.abspath(opt.get("--dir", os.path.join(root, "desks"))))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

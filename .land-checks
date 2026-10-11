@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir "$T/teams"; cp -r templates/teams/. "$T/teams/"; echo '{"minutesRepo": "acme-co/acme-office"}' > "$T/office.json"
 export BUSYBODY_WORKSPACE="$T"
-for s in rooms role room-cost pr-watch land team init status handoff repo close-self; do
+for s in rooms role room-cost pr-watch land team kit init status handoff repo close-self; do
   [[ -x "bin/$s" ]] || continue
   echo "  check: bin/$s --self-test"; "bin/$s" --self-test
 done

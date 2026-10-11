@@ -2,7 +2,7 @@
 
 The office engine as a Claude Code plugin: the tools in `bin/` (`busybody <cmd>`), the skills in `skills/`, the templates, the docs in `docs/`, and the office band below.
 
-Commands (`busybody <cmd>`): `init` (set up a workspace), `status`, `rooms`, `role`, `room-cost`, `room-cost-timer`, `team`, `land`, `pr-watch`, `handoff` (carry what GitHub cannot show across a compaction), `close-self` (a room ends its own session as its last step), `repo add <owner/name>` (import a child repo: clone, gitignore, one `office.json` entry, a CLAUDE.md stub; `--dry-run` writes nothing), `gh-usage`
+Commands (`busybody <cmd>`): `init` (set up a workspace), `status`, `rooms`, `role`, `room-cost`, `room-cost-timer`, `team`, `kit` (generate the desk agent types from the team recipes), `land`, `pr-watch`, `handoff` (carry what GitHub cannot show across a compaction), `close-self` (a room ends its own session as its last step), `repo add <owner/name>` (import a child repo: clone, gitignore, one `office.json` entry, a CLAUDE.md stub; `--dry-run` writes nothing), `gh-usage`
 (who spent the GitHub quota; `--install-help` shows how to enable the opt-in logging shim), `end-session <room>` (end a room's
 session by its process). See `docs/design.md`; `CLAUDE.md` is the developer guide.
 
