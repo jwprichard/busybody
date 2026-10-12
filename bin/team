@@ -31,6 +31,7 @@ selftest_reexec(ENGINE_ROOT)
 WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
 import officeconfig  # noqa: E402
 import kitlib  # noqa: E402
+import deskskills  # noqa: E402
 from tracker import Tracker, TrackerError  # noqa: E402
 OFFICE = officeconfig.load_or_exit(WORKSPACE_ROOT, "team")
 TRACKER = Tracker(OFFICE.tracker)
@@ -45,7 +46,7 @@ ROOMS = ("project", "staff")
 OUTPUT_CHECK = {"verdict": "verdict-posted", "merged-pr": "pr-merged", "ready-card": "ready-card",
                 "report": "report-posted", "landed-branch": "landed",
                 "approved-design": "card-has-design-link"}
-DESK_KEYS = ("name", "model", "max", "readOnly", "phase")
+DESK_KEYS = ("name", "model", "max", "readOnly", "phase", "skills")
 
 
 def die(msg, code=1):
@@ -156,6 +157,10 @@ def validate(root, name):
                     errs.append(f"desks[{i}].readOnly must be a boolean")
                 if "phase" in dk and not (isinstance(t.get("phases"), list) and dk["phase"] in t["phases"]):
                     errs.append(f"desks[{i}].phase must be one of the recipe's phases")
+                if "skills" in dk:
+                    errs.extend(deskskills.shape_errors(dk["skills"], f"desks[{i}]"))
+            if not errs:   # the skills' sources and clones, against this workspace's office.json
+                errs.extend(deskskills.recipe_problems(officeconfig.load(root, {}), [d for d in desks if "skills" in d])[0])
     for k in ("entry", "phases"):
         if k in t and (not _strlist(t[k]) or not t[k]):
             errs.append(f"{k} must be a non-empty list of non-empty strings")
@@ -238,6 +243,8 @@ def check(root, names):
             print(f"FAIL {n}: " + "; ".join(errs))
         else:
             print(f"ok   {n:<14} {summary(t)}")
+            for w in deskskills.recipe_problems(officeconfig.load(root, {}), t["desks"])[1]:
+                print(f"warn {n}: {w}")
     if all_recipes and not bad:
         drift = desks_drift(root)   # only when desks/ exists
         for p in drift:
@@ -317,6 +324,33 @@ def self_test():
     case("canvas onePerCard not bool", lambda t: t.update(canvas={"type": "Design", "onePerCard": "yes"}), "canvas must be")
     case("desk phase in phases", lambda t: t["desks"][0].update(phase="work"), None)
     case("desk phase not in phases", lambda t: t["desks"][0].update(phase="nope"), "phase must be one of")
+    # skills: shape, then the source against this scratch workspace's office.json (a clone that is absent is only a warning)
+    src = {"url": "https://example.com/w/k", "ref": None, "sha": "0" * 40, "dir": "sources/k", "licence": "MIT", "vetted": "https://example.com/m/1"}
+    json.dump({"minutesRepo": "a/b", "sources": {"k": src}}, open(os.path.join(root, "office.json"), "w"))
+    sk = lambda *u: (lambda t: t["desks"][0].update(skills=[{"use": x} for x in u]))
+    case("skills of a listed source", sk("k:one", "k:two"), None)
+    case("skill with an at line", lambda t: t["desks"][0].update(skills=[{"use": "k:one", "at": "when stuck"}]), None)
+    case("skills not a list", lambda t: t["desks"][0].update(skills="k:one"), "skills must be a list")
+    case("skill not an object", lambda t: t["desks"][0].update(skills=["k:one"]), "skills[0] must be an object")
+    case("skill unknown key", lambda t: t["desks"][0].update(skills=[{"use": "k:one", "x": 1}]), "unknown key x")
+    case("skill without use", lambda t: t["desks"][0].update(skills=[{"at": "x"}]), "use must be <source>:<skill>")
+    case("skill use with a slash", sk("k:a/b"), "use must be <source>:<skill>")
+    case("skill use upper-case", sk("k:One"), "use must be <source>:<skill>")
+    case("skill use without source", sk("one"), "use must be <source>:<skill>")
+    case("duplicate skill", sk("k:one", "k:one"), "lists k:one twice")
+    case("empty at", lambda t: t["desks"][0].update(skills=[{"use": "k:one", "at": " "}]), "skills[0].at")
+    case("multi-line at", lambda t: t["desks"][0].update(skills=[{"use": "k:one", "at": "a\nb"}]), "skills[0].at")
+    case("unknown source", sk("nope:one"), "source nope is not listed in office.json sources")
+    os.makedirs(os.path.join(root, "sources", "k", "skills", "one"))
+    open(os.path.join(root, "sources", "k", "skills", "one", "SKILL.md"), "w").write("---\nname: one\n---\n")
+    os.makedirs(os.path.join(root, "sources", "k", "flat"))
+    open(os.path.join(root, "sources", "k", "flat", "SKILL.md"), "w").write("---\nname: flat\n---\n")
+    case("skill found under skills/", sk("k:one"), None)
+    case("skill found at the source root", sk("k:flat"), None)
+    case("skill missing from a present clone", sk("k:ghost"), "k:ghost: no SKILL.md")
+    import shutil as _sh
+    _sh.rmtree(os.path.join(root, "sources"))
+    os.remove(os.path.join(root, "office.json"))
     case("approved-design pairs with card-has-design-link", lambda t: t.update(output="approved-design", draftPr=False), "pairs with done.check card-has-design-link")
     case("bad output", lambda t: t.update(output="essay"), "output must be")
     case("draft without merged-pr", lambda t: t.update(output="verdict", done={"check": "verdict-posted"}), "draft PRs")
