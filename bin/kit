@@ -5,9 +5,10 @@
                               desk of every project-room recipe in teams/*/team.json (recipes with no desks are skipped).
                               A desk's model is the recipe's. A readOnly desk gets `disallowedTools: Edit, Write, NotebookEdit`:
                               that is "no edit tools", not read-only (Bash stays), so the room deny rules remain the real fence.
-                              The body is templates/desk.md. Output is deterministic; commit it so every desk change is a diff.
+                              The body is templates/desk.md, then each skill the desk lists (docs/team-recipes.md: Skills on a desk). Output is deterministic; commit it so every desk change is a diff.
   bin/kit check [--dir DIR]   regenerate in memory and fail (exit 1) if DIR (default <workspace>/desks) differs, is missing a file,
-                              has a stale agent, or holds any file other than plugin.json and agents/*.md
+                              has a stale agent, or holds any file other than plugin.json and agents/*.md. A skill whose source clone is absent
+                              is not compared (a warning says so).
   bin/kit shape [DIR]         only the layout rule: DIR holds nothing but .claude-plugin/plugin.json and agents/*.md (lead-start runs this)
   bin/kit --self-test         build fixture recipes in a scratch workspace and check model, tools, names and drift
 
