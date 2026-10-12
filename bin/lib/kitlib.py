@@ -18,8 +18,8 @@ def agent_name(team, desk):
     return f"{team}-{desk}"
 
 
-def render_agent(recipe, desk, template):
-    """One agent file's text. `template` is templates/desk.md."""
+def render_agent(recipe, desk, template, sections=()):
+    """One agent file's text. `template` is templates/desk.md; `sections` are the desk's skill sections, appended after the body."""
     name = agent_name(recipe["name"], desk["name"])
     ro = bool(desk.get("readOnly"))
     desc = (f"{desk['name']} desk of the {recipe['name']} team ({recipe['purpose']}). "
@@ -30,17 +30,28 @@ def render_agent(recipe, desk, template):
     fm.append("---")
     subs = {"DESK": desk["name"], "TEAM": recipe["name"], "ROLE_LINE": READONLY_LINE if ro else EDIT_LINE}
     body = re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: subs.get(m.group(1), m.group(0)), template).strip("\n")
-    return "\n".join(fm) + "\n\n" + body + "\n"
+    return "\n".join(fm) + "\n\n" + "\n\n".join([body, *sections]) + "\n"
 
 
-def render(recipes, template):
-    """{relative path: text} for every desk of every project-room recipe that has desks. Sorted by path when written."""
+def render(recipes, template, loader=None, skipped=None):
+    """{relative path: text} for every desk of every project-room recipe that has desks. Sorted by path when written.
+    `loader(use, at)` returns a skill's section text, or None when its source clone is absent (then the desk is rendered without
+    that skill and its path is added to the `skipped` list, so the drift check can leave it out). It may raise to refuse the build."""
     files = {}
     for r in sorted(recipes, key=lambda r: r["name"]):
         if r.get("room") != "project" or not r.get("desks"):
             continue
         for d in r["desks"]:
-            files[f"agents/{agent_name(r['name'], d['name'])}.md"] = render_agent(r, d, template)
+            rel = f"agents/{agent_name(r['name'], d['name'])}.md"
+            secs = []
+            for sk in d.get("skills") or []:
+                sec = loader(sk["use"], sk.get("at")) if loader else None
+                if sec is None:
+                    if skipped is not None:
+                        skipped.append(rel)
+                else:
+                    secs.append(sec)
+            files[rel] = render_agent(r, d, template, secs)
     files[".claude-plugin/plugin.json"] = json.dumps(
         {"name": PLUGIN_NAME, "version": PLUGIN_VERSION,
          "description": "Desk agent types generated from the workspace's team recipes by `busybody kit build`. Do not edit by hand."},
@@ -60,14 +71,15 @@ def shape_problems(d):
     return bad
 
 
-def drift(d, files):
-    """Problems between plugin dir `d` and the rendered `files` (empty list = no drift)."""
+def drift(d, files, skipped=()):
+    """Problems between plugin dir `d` and the rendered `files` (empty list = no drift). A path in `skipped` (an agent whose
+    skills could not be read because a source clone is absent) must exist but its text is not compared."""
     out = [f"unexpected file {p}" for p in shape_problems(d)]
     for rel, text in sorted(files.items()):
         p = os.path.join(d, rel)
         if not os.path.isfile(p):
             out.append(f"missing {rel}")
-        elif open(p).read() != text:
+        elif rel not in skipped and open(p).read() != text:
             out.append(f"{rel} differs from the recipe")
     for base, _, names in os.walk(os.path.join(d, "agents")):
         for n in sorted(names):

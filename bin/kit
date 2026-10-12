@@ -5,9 +5,10 @@
                               desk of every project-room recipe in teams/*/team.json (recipes with no desks are skipped).
                               A desk's model is the recipe's. A readOnly desk gets `disallowedTools: Edit, Write, NotebookEdit`:
                               that is "no edit tools", not read-only (Bash stays), so the room deny rules remain the real fence.
-                              The body is templates/desk.md. Output is deterministic; commit it so every desk change is a diff.
+                              The body is templates/desk.md, then each skill the desk lists (docs/team-recipes.md: Skills on a desk). Output is deterministic; commit it so every desk change is a diff.
   bin/kit check [--dir DIR]   regenerate in memory and fail (exit 1) if DIR (default <workspace>/desks) differs, is missing a file,
-                              has a stale agent, or holds any file other than plugin.json and agents/*.md
+                              has a stale agent, or holds any file other than plugin.json and agents/*.md. A skill whose source clone is absent
+                              is not compared (a warning says so).
   bin/kit shape [DIR]         only the layout rule: DIR holds nothing but .claude-plugin/plugin.json and agents/*.md (lead-start runs this)
   bin/kit --self-test         build fixture recipes in a scratch workspace and check model, tools, names and drift
 
@@ -21,6 +22,8 @@ sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
 from officeroot import selftest_reexec  # noqa: E402
 selftest_reexec(ENGINE_ROOT)
 import kitlib  # noqa: E402
+import deskskills  # noqa: E402
+import officeconfig  # noqa: E402
 
 TEMPLATE = os.path.join(ENGINE_ROOT, "templates", "desk.md")
 
@@ -54,12 +57,16 @@ def recipes(team, root):
     return out
 
 
-def rendered(team, root):
-    return kitlib.render(recipes(team, root), open(TEMPLATE).read())
+def rendered(team, root, lenient=False):
+    """(files, skipped). A refused skill stops the command with one line before anything is written."""
+    try:
+        return deskskills.render_desks(recipes(team, root), open(TEMPLATE).read(), officeconfig.load(root, {}), lenient)
+    except deskskills.SkillError as e:
+        die(str(e))
 
 
 def build(team, root, out):
-    files = rendered(team, root)
+    files, _ = rendered(team, root)
     for sub in ("agents", ".claude-plugin"):   # only what kit owns is cleared; anything else is left for `check` to flag
         shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
     for rel, text in files.items():
@@ -75,13 +82,16 @@ def check(team, root, d):
     if not os.path.isdir(d):
         print(f"kit check: {d} does not exist (run `busybody kit build`)")
         return 1
-    problems = kitlib.drift(d, rendered(team, root))
+    files, skipped = rendered(team, root, lenient=True)
+    problems = kitlib.drift(d, files, skipped)
     for p in problems:
         print(f"kit check: {p}")
     if problems:
         print("kit check: desks/ is out of date; run `busybody kit build` and commit the result")
         return 1
-    print(f"kit check: ok ({d})")
+    for rel in skipped:
+        print(f"kit check: warning: {rel} not compared: a source clone it needs is absent")
+    print(f"kit check: ok ({d})" + (f", {len(skipped)} skill-dependent agent(s) not compared" if skipped else ""))
     return 0
 
 
@@ -176,6 +186,166 @@ def lead_start_cases(bad):
             deny = st["permissions"]["deny"]
             if not (f"Edit(/{desks}/**)" in deny and f"Write(/{desks}/**)" in deny):
                 bad.append("the room settings deny Edit and Write on desks/")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def skills_cases(bad):
+    """Skills from a pinned source: a scratch source repo (real git), a scratch workspace whose office.json pins it, a recipe using it."""
+    if not shutil.which("git"):
+        print("kit self-test: NOTE: git missing, skipping the skills cases")
+        return
+    tmp = os.path.realpath(tempfile.mkdtemp())
+    try:
+        genv = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+                    GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
+        def git(cwd, *a):
+            return subprocess.run(["git", "-C", cwd] + list(a), check=True, capture_output=True, text=True, env=genv).stdout.strip()
+
+        ws = os.path.join(tmp, "ws")
+        src = os.path.join(ws, "sources", "kit")
+        sk = os.path.join(src, "skills")
+
+        def wr(rel, text):
+            p = os.path.join(src, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(text)
+
+        os.makedirs(src)
+        git(src, "init", "-q", "-b", "main")
+        wr("skills/alpha/SKILL.md", "---\nname: alpha\ndescription: the alpha skill\nlicense: MIT\n---\n# Alpha\n\nAlpha body line.\n")
+        wr("skills/alpha/references/x.md", "Reference X text.\n")
+        wr("skills/beta/SKILL.md", "---\nname: beta\ndescription: beta\n---\nBeta body line.\n")
+        git(src, "add", "-A")
+        git(src, "commit", "-q", "-m", "skills")
+        git(src, "tag", "v1.0.0")
+        sha = git(src, "rev-parse", "HEAD")
+
+        def office(**kw):
+            s = {"url": "https://example.com/w/kit", "ref": "v1.0.0", "sha": sha, "dir": "sources/kit", "licence": "MIT",
+                 "vetted": "https://example.com/m/1"}
+            s.update(kw)
+            json.dump({"minutesRepo": "a/b", "sources": {"kit": s}}, open(os.path.join(ws, "office.json"), "w"))
+
+        def recipe(*uses):
+            t = {"name": "alpha", "purpose": "p", "room": "project", "head": {"role": "room-lead", "model": "sonnet"},
+                 "desks": [{"name": "impl", "model": "sonnet", "max": 2, "skills": [dict(u) for u in uses]},
+                           {"name": "plain", "model": "sonnet", "max": 1}],
+                 "entry": ["a"], "phases": ["work"], "output": "merged-pr", "done": {"check": "pr-merged"},
+                 "worktree": True, "draftPr": True, "land": False, "caps": {"softUsdPerDay": 15, "hardUsdPerDay": 40}, "measures": ["cost"]}
+            d = os.path.join(ws, "teams", "alpha")
+            os.makedirs(d, exist_ok=True)
+            json.dump(t, open(os.path.join(d, "team.json"), "w"))
+            open(os.path.join(d, "SKILL.md"), "w").write("---\nname: alpha\ndescription: d\n---\n")
+
+        out = os.path.join(ws, "desks")
+
+        def run(*a):
+            r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__)] + list(a), env=dict(genv, BUSYBODY_WORKSPACE=ws),
+                               capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+
+        def refused(label, want, uses=({"use": "kit:alpha"},)):
+            recipe(*uses)
+            shutil.rmtree(out, ignore_errors=True)
+            rc, o, e = run("build")
+            if not (rc != 0 and want in e and len(e.strip().splitlines()) == 1 and not os.path.exists(out)):
+                bad.append(f"skills: {label}: wanted a one-line refusal with {want!r} and nothing written, got {rc} {e!r}")
+
+        office()
+        recipe({"use": "kit:alpha", "at": "Use this when stuck."}, {"use": "kit:beta"})
+        rc, o, e = run("build")
+        if rc != 0:
+            bad.append(f"skills: build failed: {e}")
+            return
+        agent = open(os.path.join(out, "agents", "alpha-impl.md")).read()
+        want = ["## Skill: alpha (kit@v1.0.0)", "Use this when stuck.", "Alpha body line.", "### x.md", "Reference X text.",
+                "## Skill: beta (kit@v1.0.0)", "Beta body line."]
+        for w in want:
+            if w not in agent:
+                bad.append(f"skills: the agent lacks {w!r}")
+        if "the alpha skill" in agent or "license: MIT" in agent:
+            bad.append("skills: SKILL.md frontmatter is dropped")
+        if not (agent.index("## Reporting") < agent.index("## Skill: alpha") < agent.index("## Skill: beta") and agent.endswith("\n")
+                and not agent.endswith("\n\n")):
+            bad.append("skills: sections follow the desk body, in order, one trailing newline")
+        if "## Skill" in open(os.path.join(out, "agents", "alpha-plain.md")).read():
+            bad.append("skills: a desk with no skills has none")
+        first = agent
+        run("build")
+        if open(os.path.join(out, "agents", "alpha-impl.md")).read() != first:
+            bad.append("skills: build is deterministic")
+        office(ref=None)
+        recipe({"use": "kit:beta"})
+        run("build")
+        if f"## Skill: beta (kit@{sha[:12]})" not in open(os.path.join(out, "agents", "alpha-impl.md")).read():
+            bad.append("skills: a tagless source is headed with the short sha")
+        office()
+        # drift: fresh passes; a hand edit fails; with the clone absent the comparison is skipped with a warning
+        recipe({"use": "kit:alpha", "at": "Use this when stuck."}, {"use": "kit:beta"})
+        run("build")
+        rc, o, e = run("check")
+        if rc != 0 or "warning" in o:
+            bad.append(f"skills: a fresh build passes the drift check: {rc} {o}")
+        p = os.path.join(out, "agents", "alpha-impl.md")
+        open(p, "a").write("hand edit\n")
+        if run("check")[0] != 1:
+            bad.append("skills: a hand edit of a skill-bearing agent fails the drift check")
+        open(p, "w").write(first)
+        open(os.path.join(out, "agents", "alpha-plain.md"), "a").write("hand edit\n")
+        if run("check")[0] != 1:
+            bad.append("skills: a hand edit of a skill-less agent still fails the drift check")
+        run("build")
+        moved = src + ".away"
+        os.rename(src, moved)
+        open(p, "a").write("hand edit\n")   # not compared while the clone is absent
+        rc, o, e = run("check")
+        if not (rc == 0 and "warning" in o and "alpha-impl.md" in o and "not compared" in o):
+            bad.append(f"skills: an absent clone skips the skill-dependent comparison with a warning: {rc} {o} {e}")
+        os.remove(os.path.join(out, "agents", "alpha-impl.md"))
+        if run("check")[0] != 1:
+            bad.append("skills: a missing skill-bearing agent still fails with the clone absent")
+        rc, o, e = run("build")
+        if not (rc != 0 and "kit:alpha" in e and "missing" in e):
+            bad.append(f"skills: build needs the clone: {rc} {e}")
+        os.rename(moved, src)
+        # refusals
+        git(src, "commit", "-q", "--allow-empty", "-m", "moved")
+        refused("moved HEAD", "HEAD is")
+        git(src, "checkout", "-q", "-f", sha)
+        wr("skills/alpha/extra.txt", "x\n")
+        refused("dirty tree", "local changes")
+        os.remove(os.path.join(src, "skills", "alpha", "extra.txt"))
+        refused("missing skill", "no SKILL.md", ({"use": "kit:ghost"},))
+        refused("unknown source", "not listed in office.json sources", ({"use": "nope:alpha"},))
+        for label, rel, text, want in (
+                ("a scripts/ dir", "skills/alpha/scripts/run.sh", "echo hi\n", "scripts is not allowed"),
+                ("a non-md file in references/", "skills/alpha/references/data.json", "{}\n", "references/data.json is not a plain .md"),
+                ("a subdirectory of references/", "skills/alpha/references/sub/y.md", "y\n", "references/sub is not a plain .md"),
+                ("a hooks dir", "skills/alpha/hooks/h.md", "h\n", "hooks is not allowed"),
+                ("allowed-tools frontmatter", "skills/alpha/SKILL.md", "---\nname: alpha\nallowed-tools: Bash\n---\nx\n", "key allowed-tools"),
+                ("hooks frontmatter", "skills/alpha/SKILL.md", "---\nname: alpha\nhooks:\n  a: b\n---\nx\n", "key hooks"),
+                ("context frontmatter", "skills/alpha/SKILL.md", "---\nname: alpha\ncontext: fork\n---\nx\n", "key context"),
+                ("no frontmatter", "skills/alpha/SKILL.md", "just text\n", "no frontmatter")):
+            wr(rel, text)   # committed and pinned: the refusal is about the content, not a dirty tree
+            git(src, "add", "-A")
+            git(src, "commit", "-q", "-m", label)
+            office(sha=git(src, "rev-parse", "HEAD"))
+            refused(label, want)
+            git(src, "checkout", "-q", "-f", sha)
+            git(src, "clean", "-qfd")
+            office()
+        shutil.rmtree(out, ignore_errors=True)
+        # the workspace's own team check: a skill in the present clone, a missing source name, and an absent clone as a warning
+        recipe({"use": "kit:alpha"})
+        r = subprocess.run([os.path.join(ENGINE_ROOT, "bin", "team"), "check"], env=dict(genv, BUSYBODY_WORKSPACE=ws), capture_output=True, text=True)
+        if r.returncode != 0 or "warn" in r.stdout:
+            bad.append(f"skills: team check with the clone present: {r.stdout} {r.stderr}")
+        os.rename(src, src + ".away")
+        r = subprocess.run([os.path.join(ENGINE_ROOT, "bin", "team"), "check"], env=dict(genv, BUSYBODY_WORKSPACE=ws), capture_output=True, text=True)
+        if r.returncode != 0 or "warn alpha: kit:alpha: clone sources/kit is absent" not in r.stdout:
+            bad.append(f"skills: team check with the clone absent warns: {r.returncode} {r.stdout} {r.stderr}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -275,6 +445,7 @@ def self_test():
         if not (r.returncode != 0 and "broken" in r.stderr):
             bad.append(f"an invalid recipe must stop the build: {r.returncode} {r.stderr}")
         lead_start_cases(bad)
+        skills_cases(bad)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
     if bad:

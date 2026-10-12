@@ -95,6 +95,23 @@ edit tools", not read-only: Bash stays, so the room's deny rules are still the r
   `subagent_type: "desks:<team>-<desk>"`. A plugin dir that grew `hooks/` or `.mcp.json` would run outside the deny rules, which is
   why the shape is checked at every launch.
 
+### Skills on a desk
+
+A desk may carry skills picked from a pinned source (`sources` in `office.json`, see `docs/design.md`). In `team.json`:
+
+```json
+{ "name": "implementer", "model": "sonnet", "max": 2,
+  "skills": [ { "use": "<source>:<skill>", "at": "optional one-line heading text" } ] }
+```
+
+- `use` is `<source>:<skill>` (lower-case letters, digits, hyphens). A desk lists a `use` once. `at` is a non-empty single line.
+- The skill is found at `<source dir>/skills/<skill>/`, else `<source dir>/<skill>/`. The folder needs a `SKILL.md`.
+- `busybody team check` fails if the source is not listed in `office.json` or, when its clone is present, the skill is not in it. An absent clone only warns, so CI without clones passes.
+- `busybody kit build` writes the skill's text into the desk's agent file, after the generic body: `## Skill: <skill> (<source>@<tag or short sha>)`, the `at` line, `SKILL.md` without its frontmatter, then each `references/*.md` under a `### <file>` heading. No plugin, hook or script is loaded: the text is all a desk gets.
+- The build refuses, with one line and nothing written: a clone whose HEAD is not the pinned sha or whose tree is dirty; a missing or unreadable skill; any file in the skill folder other than `SKILL.md` and `references/*.md` (so no scripts, hooks, binaries, other file types or other subdirectories, and no symlinks); and any `SKILL.md` frontmatter key outside `name`, `description`, `license`, `argument-hint`, `disable-model-invocation` (so no `allowed-tools`, `hooks`, `context`, `agent`).
+- `busybody kit check` regenerates the same way. When a clone it needs is absent it still requires the agent file to exist, skips only the comparison of that file's text and says so in a warning. A clone present but moved or dirty fails the check.
+- Commit the generated `desks/`: a changed skill or pin shows up as a diff the owner reviews. Desks with no `skills` generate exactly as before.
+
 ## Phase
 
 Each `PROGRESS` minute of a room may carry a `Phase: <name>` line in its body, where `<name>` is one of
