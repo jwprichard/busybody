@@ -18,6 +18,8 @@ class ConfigError(Exception):
 DEFAULT_PORT_BASE = 41000
 DEFAULT_OWNER_ONLY = ("anything touching prod", "merging, ever", "spending over the cap")
 MERGE_MODES = ("pr", "land")
+SOURCE_KEYS = ("url", "ref", "sha", "dir", "licence", "vetted")
+SOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def _str_list(value, what):
@@ -203,6 +205,76 @@ class Office:
         v = self.cfg.get("ownerOnly")
         return list(DEFAULT_OWNER_ONLY) if v is None else _str_list(v, "ownerOnly")
 
+    @property
+    def sources(self):
+        """The pinned sources as {name: {url, ref, sha, dir, licence, vetted}}; empty when none are configured.
+        Each is a third-party repo cloned (gitignored) at `dir` and pinned to a commit; `ref` is its tag, or None."""
+        raw = self.cfg.get("sources")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ConfigError("sources: must be an object of source name -> settings")
+        return {name: self._source(name, raw[name]) for name in raw}
+
+    @staticmethod
+    def _source(name, s):
+        if not (isinstance(name, str) and SOURCE_NAME.fullmatch(name)):
+            raise ConfigError(f"source {name}: name must match [a-z0-9][a-z0-9-]*")
+        if not isinstance(s, dict):
+            raise ConfigError(f"source {name}: must be an object")
+        for k in s:
+            if k not in SOURCE_KEYS:
+                raise ConfigError(f"source {name}: unknown key {k} (allowed: {', '.join(SOURCE_KEYS)})")
+        for k in SOURCE_KEYS:
+            if k not in s:
+                raise ConfigError(f"source {name}: no {k}" + (" (a tag, or null for a repo with no tags)" if k == "ref" else ""))
+        for k in ("url", "vetted"):
+            v = s[k]
+            if not (isinstance(v, str) and re.fullmatch(r"https://[^\s/]+\S*", v)):
+                raise ConfigError(f"source {name}: {k} must be an https URL")
+        if not (s["ref"] is None or (isinstance(s["ref"], str) and s["ref"].strip())):
+            raise ConfigError(f"source {name}: ref must be a tag, or null for a repo with no tags")
+        if not (isinstance(s["sha"], str) and re.fullmatch(r"[0-9a-f]{40}", s["sha"])):
+            raise ConfigError(f"source {name}: sha must be 40 lowercase hex characters")
+        d = s["dir"]
+        if not (isinstance(d, str) and d and not d.startswith("/") and not re.match(r"[A-Za-z]:", d)
+                and ".." not in d.replace("\\", "/").split("/")):
+            raise ConfigError(f"source {name}: dir must be a relative path inside the workspace (no `..`)")
+        if not (isinstance(s["licence"], str) and s["licence"].strip()):
+            raise ConfigError(f"source {name}: licence must be a non-empty string")
+        return dict(s)
+
+    def source(self, name):
+        """One source's settings; a name that is not configured is an error."""
+        srcs = self.sources
+        if name not in srcs:
+            raise ConfigError(f"source {name}: not listed in office.json sources")
+        return srcs[name]
+
+    def check_source(self, name):
+        """"ok", or one line saying what is wrong with a source's clone: the dir is missing or not its own git repo,
+        HEAD is not the pinned sha, or the work tree is dirty. Reads git locally only; it never touches the network."""
+        s = self.source(name)
+        if not self.workspace:
+            raise ConfigError(f"source {name}: no workspace folder to find {s['dir']} in")
+        path = os.path.join(self.workspace, s["dir"])
+        if not os.path.isdir(path):
+            return f"source {name}: {s['dir']} is missing: clone it and check out {s['sha']}"
+
+        def git(*args):
+            return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                                  env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+        top = git("rev-parse", "--show-toplevel")
+        if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(path):
+            return f"source {name}: {s['dir']} is not a git clone"
+        head = git("rev-parse", "HEAD")
+        if head.returncode != 0 or head.stdout.strip() != s["sha"]:
+            return f"source {name}: HEAD is {head.stdout.strip()[:12] or 'unreadable'}, not the pinned {s['sha'][:12]}: check out {s['sha']} in {s['dir']}"
+        dirty = git("status", "--porcelain")
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return f"source {name}: {s['dir']} has local changes: restore it to the pinned commit"
+        return "ok"
+
     def room_json(self):
         return {"env": self.room_env, "deny": self.room_deny, "prodRead": self.room_prod_read, "portBase": self.port_base}
 
@@ -210,7 +282,7 @@ class Office:
         """Every problem in the config, one line each (empty when it is sound)."""
         errs = []
         checks = [(lambda r=r, f=f: f(r)) for r in self._repo_cfgs() for f in (self.branch_prefix, self.no_push, self.merge, self.done_note)]
-        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.display_name, lambda: self.tracker]:
+        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.display_name, lambda: self.tracker, lambda: self.sources]:
             try:
                 fn()
             except ConfigError as e:
@@ -263,6 +335,7 @@ def load_or_exit(workspace, prog, env=None):
 
 
 def self_test():
+    _GONE = object()   # marks a source key to leave out
     here = os.path.dirname(os.path.abspath(__file__))
     engine = os.path.dirname(os.path.dirname(here))
     fx = os.path.join(engine, "fixtures", "office.json")
@@ -320,6 +393,60 @@ def self_test():
     eq("fixture protected branches and draftNote", (acme.protected_branches(), acme.draft_note, Office({}, {}).protected_branches()), (["main", "release"], "", ["main"]))
     eq("draftNote", Office({"room": {"draftNote": "x."}}, {}).draft_note, "x.")
     eq("displayName defaults to the workspace repo's name", (Office({"workspaceRepo": "w"}, {}).display_name, Office({"displayName": "Acme", "workspaceRepo": "w"}, {}).display_name), ("w", "Acme"))
+    sha = "a" * 40
+    src = {"url": "https://example.com/x/y", "ref": "v1.0", "sha": sha, "dir": "sources/y", "licence": "MIT", "vetted": "https://example.com/minutes/1"}
+    eq("fixture sources", acme.sources, {"widget-kit": {"url": "https://example.com/widgets/kit", "ref": "v2.1.0", "sha": "0123456789abcdef0123456789abcdef01234567", "dir": "sources/widget-kit", "licence": "MIT", "vetted": "https://example.com/acme-office/issues/7#issuecomment-1"},
+                                         "tagless": {"url": "https://example.com/widgets/tagless", "ref": None, "sha": "fedcba9876543210fedcba9876543210fedcba98", "dir": "sources/tagless", "licence": "Apache-2.0", "vetted": "https://example.com/acme-office/issues/7#issuecomment-2"}})
+    eq("fixture source(name), none configured", (acme.source("tagless")["ref"], Office({}, {}).sources), (None, {}))
+    eq("a valid source", Office({"sources": {"y": src}}, {}).source("y"), src)
+    eq("ref null is fine", Office({"sources": {"y": dict(src, ref=None)}}, {}).source("y")["ref"], None)
+    def src_err(label, want, **kw):
+        s = {k: v for k, v in dict(src, **kw).items() if v is not _GONE}
+        err(label, lambda: Office({"sources": {"y": s}}, {}).sources, want)
+    src_err("source without sha", "source y: no sha", sha=_GONE)
+    src_err("source without ref", "source y: no ref (a tag, or null for a repo with no tags)", ref=_GONE)
+    src_err("short sha", "source y: sha must be 40 lowercase hex characters", sha="abc123")
+    src_err("upper-case sha", "source y: sha must be 40 lowercase hex characters", sha="A" * 40)
+    src_err("absolute dir", "source y: dir must be a relative path inside the workspace (no `..`)", dir="/etc/y")
+    src_err("dir with ..", "source y: dir must be a relative path inside the workspace (no `..`)", dir="sources/../../y")
+    src_err("http url", "source y: url must be an https URL", url="http://example.com/x/y")
+    src_err("non-https vetted", "source y: vetted must be an https URL", vetted="minute 3")
+    src_err("unknown key", "source y: unknown key branch (allowed: url, ref, sha, dir, licence, vetted)", branch="main")
+    src_err("empty licence", "source y: licence must be a non-empty string", licence="")
+    src_err("numeric ref", "source y: ref must be a tag, or null for a repo with no tags", ref=3)
+    err("bad source name", lambda: Office({"sources": {"Y_1": src}}, {}).sources, "source Y_1: name must match [a-z0-9][a-z0-9-]*")
+    err("sources must be an object", lambda: Office({"sources": []}, {}).sources, "sources: must be an object of source name -> settings")
+    err("unknown source", lambda: acme.source("nope"), "source nope: not listed in office.json sources")
+    eq("validate reports a bad source", Office({"sources": {"y": dict(src, sha="x")}}, {}, "/w/acme-office").validate(), ["source y: sha must be 40 lowercase hex characters"])
+    with tempfile.TemporaryDirectory() as ws:
+        clone = os.path.join(ws, "sources", "y")
+
+        def git(*a):
+            return subprocess.run(["git", "-C", clone, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *a],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        def check(**kw):
+            return Office({"sources": {"y": dict(src, **kw)}}, {}, ws).check_source("y")
+        eq("source clone missing", check(), "source y: sources/y is missing: clone it and check out " + sha)
+        os.makedirs(clone)
+        git("init", "-q")
+        with open(os.path.join(clone, "f"), "w") as f:
+            f.write("1\n")
+        git("add", "f")
+        git("commit", "-q", "-m", "one")
+        head1 = git("rev-parse", "HEAD")
+        eq("source clone ok", check(sha=head1), "ok")
+        eq("source clone with HEAD moved", check(sha=sha), f"source y: HEAD is {head1[:12]}, not the pinned {sha[:12]}: check out {sha} in sources/y")
+        with open(os.path.join(clone, "f"), "a") as f:
+            f.write("2\n")
+        eq("source clone dirty", check(sha=head1), "source y: sources/y has local changes: restore it to the pinned commit")
+        git("commit", "-q", "-am", "two")
+        eq("source clone moved after a commit", check(sha=head1).startswith("source y: HEAD is "), True)
+        with open(os.path.join(clone, "untracked"), "w") as f:
+            f.write("x")
+        eq("source clone with an untracked file is dirty", check(sha=git("rev-parse", "HEAD")), "source y: sources/y has local changes: restore it to the pinned commit")
+        plain = os.path.join(ws, "sources", "plain")
+        os.makedirs(plain)
+        eq("source dir that is not a clone", Office({"sources": {"p": dict(src, dir="sources/plain")}}, {}, ws).check_source("p"), "source p: sources/plain is not a git clone")
     eq("fixture ownerOnly", acme.owner_only, ["deploying to acme-prod"])
     eq("room defaults", (Office({}, {}).room_json(), Office({}, {}).owner_only),
        ({"env": {}, "deny": [], "prodRead": [], "portBase": 41000}, list(DEFAULT_OWNER_ONLY)))
@@ -368,6 +495,13 @@ def self_test():
        "work/|main,release|land|Done also means the preview deploy is green.")
     eq("sh room and ownerOnly", bash({"BUSYBODY_CONFIG": fx}, 'echo "$(office_port_base)|$(office_room_json | jq -c .prodRead)|$(office_owner_only)|$(office_repos | paste -sd,)"'),
        '42000|["mcp__acme-prod__*"]|deploying to acme-prod|acme-office,acme-web,acme-api,acme-bot')
+    eq("sh sources", bash({"BUSYBODY_CONFIG": fx}, 'echo "$(office_sources | paste -sd,)|$(office_source_field widget-kit ref)|[$(office_source_field tagless ref)]|$(office_source_field tagless dir)"'),
+       "widget-kit,tagless|v2.1.0|[]|sources/tagless")
+    eq("sh no sources", bash({"BUSYBODY_CONFIG": "/nonexistent"}, 'echo "[$(office_sources)]"'), "[]")
+    eq("sh unknown source fails", bash({"BUSYBODY_CONFIG": fx}, 'office_source_field nope sha 2>&1; echo "rc=$?"'),
+       "officeconfig: source nope: not listed in office.json sources\nrc=1")
+    eq("sh source check names a missing clone", bash({"BUSYBODY_CONFIG": fx, "BUSYBODY_WORKSPACE": "/nonexistent"}, 'WORKSPACE_ROOT=/nonexistent; office_source_check tagless 2>&1; echo "rc=$?"'),
+       "source tagless: sources/tagless is missing: clone it and check out fedcba9876543210fedcba9876543210fedcba98\nrc=1")
     eq("sh missing branchPrefix fails", bash({"BUSYBODY_CONFIG": fx}, 'office_branch_prefix acme-bot 2>&1; echo "rc=$?"'),
        'officeconfig: repo acme-bot: no branchPrefix (a string, "" for none)\nrc=1')
     with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
@@ -393,6 +527,9 @@ USAGE = """usage: officeconfig.py [--config FILE] [--workspace DIR] COMMAND
   get REPO branchPrefix|noPush|merge|doneNote|github|path|evidence   one value (noPush: one branch per line)
   repos                  the repo names, one per line
   room-json              {env, deny, prodRead, portBase} as JSON
+  sources                the pinned source names, one per line
+  source NAME url|ref|sha|dir|licence|vetted   one field of a source (a null ref prints nothing)
+  source-check NAME      "ok", or the one line that is wrong with the clone (exit 1): missing, not a clone, HEAD moved, dirty
   display-name           the workspace's name for people (displayName, else the workspace repo's name)
   owner-only             what only the owner may do, one item per line
   check                  every problem in the config, one line each; exit 1 when there is any
@@ -442,6 +579,16 @@ def cli(argv, env=None):
             out = json.dumps(o.room_json())
         elif cmd == "display-name" and not args:
             out = o.display_name
+        elif cmd == "sources" and not args:
+            out = "\n".join(o.sources)
+        elif cmd == "source" and len(args) == 2 and args[1] in SOURCE_KEYS:
+            v = o.source(args[0])[args[1]]
+            out = "" if v is None else v
+        elif cmd == "source-check" and len(args) == 1:
+            out = o.check_source(args[0])
+            if out != "ok":
+                print(out, file=sys.stderr)
+                return 1
         elif cmd == "owner-only" and not args:
             out = "\n".join(o.owner_only)
         elif cmd == "check" and not args:

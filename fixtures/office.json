@@ -15,5 +15,9 @@
     "portBase": 42000
   },
   "ownerOnly": ["deploying to acme-prod"],
-  "tracker": {"type": "none"}
+  "tracker": {"type": "none"},
+  "sources": {
+    "widget-kit": {"url": "https://example.com/widgets/kit", "ref": "v2.1.0", "sha": "0123456789abcdef0123456789abcdef01234567", "dir": "sources/widget-kit", "licence": "MIT", "vetted": "https://example.com/acme-office/issues/7#issuecomment-1"},
+    "tagless": {"url": "https://example.com/widgets/tagless", "ref": null, "sha": "fedcba9876543210fedcba9876543210fedcba98", "dir": "sources/tagless", "licence": "Apache-2.0", "vetted": "https://example.com/acme-office/issues/7#issuecomment-2"}
+  }
 }
