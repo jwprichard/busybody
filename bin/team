@@ -222,7 +222,11 @@ def desks_drift(root):
             return []   # the recipe's own FAIL line says why; drift cannot be judged
         recipes.append(t)
     tpl = open(os.path.join(ENGINE_ROOT, "templates", "desk.md")).read()
-    return kitlib.drift(d, kitlib.render(recipes, tpl))
+    try:
+        files, skipped = deskskills.render_desks(recipes, tpl, officeconfig.load(root, {}), lenient=True)
+    except deskskills.SkillError as e:
+        return [str(e)]
+    return kitlib.drift(d, files, skipped)
 
 
 def check(root, names):
