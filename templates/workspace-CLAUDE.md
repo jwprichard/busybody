@@ -3,7 +3,7 @@
 This folder is {{DISPLAY_NAME}}'s workspace: a git repo that runs the Busybody office engine. A session started here is the
 **control room**, headed by the **controller**. It plans work, dispatches per-repo work to workers (subagents) and room leads, and
 sequences merges and deploys. Repo-specific conventions live in each repo's own `CLAUDE.md`, which is the authority for work inside it.
-The engine's tools run as `bin/busybody <cmd>` (the shim `init` wrote; `bin/busybody help` lists them; add this folder's `bin/` to your PATH to type `busybody`); settings are in `office.json`.
+The engine's tools run as `bin/busybody <cmd>` (the shim `init` wrote; `bin/busybody help` lists them; `busybody <cmd>` also works from any folder here when `~/.local/bin` is on your PATH); settings are in `office.json`.
 
 Sections marked **(yours)** are for you to fill in or change. Everything else is the engine's generic operating model; edit it only to tighten it for your workspace.
 
