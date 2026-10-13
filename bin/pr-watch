@@ -21,7 +21,8 @@
 # start for a PR (no entry, or no watch-seen.json at all) baselines it from the PR's current state. Later starts report at once (before polling) any review or comment
 # newer than that, so one that landed while the watcher was down is not lost. A missing file baselines silently: older unanswered
 # reviews are the sweep's to catch, not the watcher's. Entries are keyed <-R repo, else repo root>#<pr>. An event is not marked handled when printed (the
-# room may die first): after answering, run `bin/pr-watch --ack <pr>`, which marks everything now on the PR handled and exits 0.
+# room may die first), but the timestamps it reported are kept as pending. After answering, run `bin/pr-watch --ack <pr>`:
+# it moves the markers up to the pending ones only (else to the PR's current state), so a review that arrived since is still reported.
 # While it runs, <repo root>/.claude/watch.json ({pr, start, pid}) marks the room "watching"; it is
 # removed on exit, but only if it still names this process. Output is the event name and the PR URL only (link, don't paste).
 # PR_WATCH_GH overrides the gh command (tests).
@@ -60,10 +61,17 @@ seen_update() {
   jq -cn --argjson o "$old" --arg k "$KEY" --argjson c "${2:-null}" "$1" > "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; return 1; }
 }
 
-# Record the markers for this PR, never moving one backwards. $1 = {rmax, cmax}.
+# Move the markers for this PR forward, never backwards, to the pending ones (what an event reported) or, with none, to $1 = {rmax, cmax}.
 seen_write() {
   seen_update '($o[$k] // {review: "", comment: ""}) as $e
-    | $o | .[$k] = {review: ([$e.review, $c.rmax] | max), comment: ([$e.comment, $c.cmax] | max)}' "$1"
+    | ($e.pending // {review: $c.rmax, comment: $c.cmax}) as $p
+    | $o | .[$k] = {review: ([$e.review, $p.review] | max), comment: ([$e.comment, $p.comment] | max)}' "$1"
+}
+
+# An event is about to be printed: remember the newest timestamps it reported, so --ack handles only those. $1 = {rmax, cmax}.
+seen_pend() {
+  seen_update '($o[$k] // {review: "", comment: ""}) as $e
+    | $o | .[$k] = ($e | .pending = {review: ([.pending.review // "", $c.rmax] | max), comment: ([.pending.comment // "", $c.cmax] | max)})' "$1"
 }
 
 # One compact snapshot: state, draft flag, overall CI, review and comment counts, url. Two calls at most, and usually one: every
@@ -123,6 +131,7 @@ run() {
             [ (if $c.rmax > $s.review then "review" else empty end),
               (if $c.cmax > $s.comment then "comment" else empty end) ] | .[]')"
           if [[ -n "$ev" ]]; then
+            seen_pend "$cur"
             while read -r e; do echo "EVENT: $e $url"; done <<<"$ev"
             return 0
           fi
@@ -136,6 +145,7 @@ run() {
             (if $c.reviews > $p.reviews then "review" else empty end),
             (if $c.comments > $p.comments then "comment" else empty end) ] | .[]')"
         if [[ -n "$ev" ]]; then
+          seen_pend "$cur"
           while read -r e; do echo "EVENT: $e $url"; done <<<"$ev"
           return 0
         fi
@@ -230,6 +240,17 @@ GH
   SEED='{"@K#7":{"review":"zzz","comment":"zzz"}}' t other-repo-key merged "OPEN false success 2 0" "MERGED false success 0 0"
   rm -f "$T/n"; rc=0; (cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.05 timeout 20 "$SELF" 7 -R o/other >/dev/null 2>&1) || rc=$?
   [[ "$(jq -r 'keys | length' "$T/.claude/watch-seen.json")" == 2 ]] || bad+=("-R key: $(cat "$T/.claude/watch-seen.json")")
+  # a review arrives between the event and the ack: the ack covers only what the event reported
+  SEED='{"@K#7":{"review":"","comment":""}}' t pend-event review "OPEN false success 1 0"
+  [[ "$(jq -r --arg k "$K#7" '.[$k].pending.review' "$T/.claude/watch-seen.json")" == "2026-01-01T00:00:00Z" ]] || bad+=("pending not saved: $(cat "$T/.claude/watch-seen.json")")
+  mk OPEN false success 3 0 > "$T/1.json"; rm -f "$T/2.json" "$T/n"
+  (cd "$T" && PR_WATCH_GH="$T/gh" "$SELF" --ack 7) >/dev/null 2>&1 || bad+=("ack with pending failed")
+  [[ "$(jq -r --arg k "$K#7" '.[$k].review' "$T/.claude/watch-seen.json")" == "2026-01-01T00:00:00Z" ]] || bad+=("ack moved past pending: $(cat "$T/.claude/watch-seen.json")")
+  KEEP=1 t restart-after-partial-ack review "OPEN false success 3 0"
+  # ack never moves a marker backwards
+  SEED='{"@K#7":{"review":"2026-01-01T00:00:09Z","comment":""}}' t ack-keep-marker merged "OPEN false success 2 0" "MERGED false success 0 0"
+  rm -f "$T/n"; (cd "$T" && PR_WATCH_GH="$T/gh" "$SELF" --ack 7) >/dev/null 2>&1
+  [[ "$(jq -r --arg k "$K#7" '.[$k].review' "$T/.claude/watch-seen.json")" == "2026-01-01T00:00:09Z" ]] || bad+=("ack moved marker backwards")
   CAP_T=1 t cap cap "OPEN true pending 0 0"
   # watch.json exists while running, with pr/start/pid
   rm -f "$T"/[0-9]*.json "$T/n"; mk OPEN true pending 0 0 > "$T/1.json"
