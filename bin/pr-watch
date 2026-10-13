@@ -10,7 +10,7 @@
 # exit wakes the role, which handles the event and re-arms the watcher. Events:
 #   ready      draft promoted to ready      ci-passed / ci-failed   the checks' overall result changed
 #   review     a new review                 comment                 a new comment  (bot comments, e.g. github-actions, do not count;
-#   nor do comments or review bodies from the room itself: those carry the hidden marker <!-- busybody:room=NAME -->)
+#   nor do empty-body reviews, which are inline-thread replies carried by their own comments, nor comments or review bodies from the room itself: those carry the hidden marker <!-- busybody:room=NAME -->)
 #   merged     the PR merged                closed                  closed unmerged
 #   cap        7 days (PR_WATCH_CAP seconds) passed with no event
 # An already merged or closed PR exits at once. Exit 2: gh failed 30 polls in a row. Exit 3: another
@@ -36,12 +36,12 @@ CAP="${PR_WATCH_CAP:-604800}"
 die() { printf 'pr-watch: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
-# Reviews and comments (minus the room's own marked ones and bots): counts, plus rmax/cmax, the newest review and comment timestamps (the handled-memory markers).
+# Reviews and comments (minus the room's own marked ones, bots and empty-body reviews): counts, plus rmax/cmax, the newest review and comment timestamps (the handled-memory markers).
 heavy_fetch() {
   local h
   h="$("$GH" pr view "$PR" "${REPO_ARGS[@]}" --json reviews,comments 2>/dev/null | jq -c '
     "<!-- busybody:room=[A-Za-z0-9._-]+ -->" as $m
-    | ([.reviews[] | select((.body // "") | test($m) | not)]) as $r
+    | ([.reviews[] | select((.body // "") != "" and ((.body // "") | test($m) | not))]) as $r
     | ([.comments[] | select(((.author.login // "") | test("^(github-actions|.*\\[bot\\])$") | not) and ((.body // "") | test($m) | not))]) as $c
     | { reviews: ($r | length), comments: ($c | length),
         rmax: ([$r[].submittedAt // empty] | max // ""), cmax: ([$c[].createdAt // empty] | max // "") }')" || return 1
@@ -192,8 +192,8 @@ GH
       failure) roll='[{"status":"COMPLETED","conclusion":"FAILURE"}]' ;;
       pending) roll='[{"status":"IN_PROGRESS","conclusion":""}]' ;;
     esac
-    jq -n --arg s "$1" --argjson d "$2" --argjson r "$roll" --argjson rv "$4" --argjson cm "$5" --argjson bt "${6:-0}" --argjson mc "${7:-0}" --argjson mr "${8:-0}" \
-      '{state:$s,isDraft:$d,updatedAt:("u\($rv)-\($cm)-\($bt)-\($mc)-\($mr)-\($s)"),url:"https://github.com/o/r/pull/7",statusCheckRollup:$r,reviews:([range($rv)|{id:"r\(.)",submittedAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"someone"}}] + [range($mr)|{id:"mr\(.)",submittedAt:"2026-01-02T00:00:0\(.)Z",body:"x <!-- busybody:room=rv1 -->",author:{login:"someone"}}]),
+    jq -n --arg s "$1" --argjson d "$2" --argjson r "$roll" --argjson rv "$4" --argjson cm "$5" --argjson bt "${6:-0}" --argjson mc "${7:-0}" --argjson mr "${8:-0}" --argjson er "${9:-0}" \
+      '{state:$s,isDraft:$d,updatedAt:("u\($rv)-\($cm)-\($bt)-\($mc)-\($mr)-\($er)-\($s)"),url:"https://github.com/o/r/pull/7",statusCheckRollup:$r,reviews:([range($rv)|{id:"r\(.)",submittedAt:"2026-01-01T00:00:0\(.)Z",body:"review",author:{login:"someone"}}] + [range($er)|{id:"er\(.)",submittedAt:"2026-01-03T00:00:0\(.)Z",body:"",author:{login:"someone"}}] + [range($mr)|{id:"mr\(.)",submittedAt:"2026-01-02T00:00:0\(.)Z",body:"x <!-- busybody:room=rv1 -->",author:{login:"someone"}}]),
         comments:([range($cm)|{id:"c\(.)",createdAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"someone"}}] + [range($mc)|{id:"m\(.)",createdAt:"2026-01-02T00:00:0\(.)Z",body:"x <!-- busybody:room=rv1 -->",author:{login:"someone"}}] + [range($bt)|{id:"b\(.)",createdAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"github-actions"}}])}'
   }
   t() { # name expected-event files... (state draft ci reviews comments per call)
@@ -251,6 +251,9 @@ GH
   SEED='{"@K#7":{"review":"2026-01-01T00:00:09Z","comment":""}}' t ack-keep-marker merged "OPEN false success 2 0" "MERGED false success 0 0"
   rm -f "$T/n"; (cd "$T" && PR_WATCH_GH="$T/gh" "$SELF" --ack 7) >/dev/null 2>&1
   [[ "$(jq -r --arg k "$K#7" '.[$k].review' "$T/.claude/watch-seen.json")" == "2026-01-01T00:00:09Z" ]] || bad+=("ack moved marker backwards")
+  # empty-body reviews (inline-thread replies) are dropped from counts and the restart check
+  t empty-review-ignored merged "OPEN false success 0 0" "OPEN false success 0 0 0 0 0 1" "MERGED false success 0 0"
+  SEED='{"@K#7":{"review":"","comment":""}}' t empty-review-ignored-on-restart merged "OPEN false success 0 0 0 0 0 1" "MERGED false success 0 0"
   CAP_T=1 t cap cap "OPEN true pending 0 0"
   # watch.json exists while running, with pr/start/pid
   rm -f "$T"/[0-9]*.json "$T/n"; mk OPEN true pending 0 0 > "$T/1.json"
