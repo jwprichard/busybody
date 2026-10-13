@@ -40,14 +40,16 @@ Needs: Claude Code, `git`, `python3`, `jq`, and `gh` logged in (`gh auth status`
    `/plugin install busybody --marketplace jwprichard/busybody`.
 5. **Your first room.** Ask the controller (this session) for a piece of work: it opens an initiative issue and starts a room lead
    (`bin/busybody lead-start <repo> <slug> --controller <session name>`, or the band's Start room button). Add repos to `office.json`
-   (`repos`, each with `branchPrefix` and `merge`) first; `docs/design.md` lists the fields. The shim is `bin/busybody` and is not on your PATH: run
-   `bin/busybody help`, or add the workspace's `bin/` to your PATH.
+   (`repos`, each with `branchPrefix` and `merge`) first; `docs/design.md` lists the fields. `init` also installed a `busybody` launcher in `~/.local/bin`, so
+   `busybody help` works from any folder inside the workspace (add `~/.local/bin` to your PATH if `init` says it is missing; `--no-path` skips the launcher).
 
 ### What init writes
 
 Each item is skipped when it is already as wanted; a second run changes nothing and says so.
 - `office.json` (never overwritten): the minutes repo, the workspace repo as the only repo (branches `feat/`, merged with `bin/land`), tracker `none`
 - `bin/busybody`: a shim that runs the engine at its recorded absolute path (a plugin's root is not in Bash)
+- `~/.local/bin/busybody` (outside the workspace; `--no-path` skips it): a small `sh` launcher that finds the nearest folder above the cwd holding `office.json` and an
+  executable `bin/busybody`, and runs that shim. Updated when it is ours and outdated, never overwritten when it is not. `init` prints a line, and never edits your shell rc, when `~/.local/bin` is not on PATH
 - `.claude-plugin/marketplace.json` (plugin source `./busybody`) and `.claude/settings.json` (committed, portable): `busybody@<folder>` enabled
   and a small `permissions.deny` (force pushes, `--no-verify`, setting `core.hooksPath`, `gh pr merge|ready`). Existing keys are kept.
   This machine's marketplace path goes into the gitignored `.claude/settings.local.json`.

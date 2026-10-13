@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up a workspace folder for the Busybody engine (runs as `busybody init`). Non-interactive; never pushes.
 #
-#   busybody init [DIR] --minutes-repo OWNER/NAME [--name DISPLAYNAME] [--engine PATH] [--tracker none] [--create] [--dry-run]
+#   busybody init [DIR] --minutes-repo OWNER/NAME [--name DISPLAYNAME] [--engine PATH] [--tracker none] [--create] [--no-path] [--dry-run]
 #   busybody init --self-test
 #
 # DIR (default: the cwd) is the workspace folder: a git repo, `git init`ed when it is not one yet. OWNER/NAME is its GitHub repo,
@@ -11,6 +11,8 @@
 # so clone it there first: git clone <engine repo url> DIR/busybody. DIR must not sit inside another git repo. Writes, each skipped when it already exists as wanted:
 #   office.json                     minutesRepo, the workspace repo alone, tracker, room rules. Never overwritten.
 #   bin/busybody                    the shim: runs <engine>/bin/busybody (the plugin root is not in Bash, so the path is written here)
+#   ~/.local/bin/busybody           the launcher (POSIX sh): from any folder inside a workspace it runs that workspace's bin/busybody. Updated when
+#                                   it is ours and outdated, never overwritten when it is not; a note when ~/.local/bin is not on PATH. --no-path skips it
 #   .claude-plugin/marketplace.json the workspace's local marketplace, its one plugin being the engine
 #   .claude/settings.json           merged, never clobbered, portable: enabledPlugins and a small permissions.deny
 #   .claude/settings.local.json     merged, gitignored: this machine's marketplace path
@@ -126,7 +128,7 @@ self_test() {
   T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE BUSYBODY_WORKSPACE BUSYBODY_CONFIG OFFICE_WORKSPACE OFFICE_CONFIG
-  mkdir -p "$T/stub"
+  mkdir -p "$T/stub" "$T/home"; export HOME="$T/home"   # the launcher goes under HOME: never the real one
   # the stub gh: `api repos/*` answers $GH_STUB (true | false | fail); `repo create` is recorded; anything else is an error
   cat > "$T/stub/gh" <<'EOS'
 #!/usr/bin/env bash
@@ -212,6 +214,26 @@ PY
     out="$(cd "$W" && CLAUDE_CONFIG_DIR="$T/cc" bash -c 'claude plugin marketplace add ./ --scope user && claude plugin install busybody@acme-office --scope user && claude plugin list' 2>&1)" || bad+=("plugin install: $out")
     [[ "$out" == *"busybody@acme-office"* && "$out" == *"enabled"* && "$out" == *"$W/busybody"* ]] || bad+=("plugin not enabled from the clone: $out")
   else echo "init self-test: NOTE: claude CLI not found, skipping the plugin load check" >&2; fi
+  # the launcher: written under the scratch HOME, run from a nested folder, an error outside any workspace
+  L="$HOME/.local/bin/busybody"
+  [[ -x "$L" && "$(head -1 "$L")" == "#!/bin/sh" ]] || bad+=("launcher not installed")
+  mkdir -p "$W/a/b"; [[ "$(cd "$W/a/b" && "$L" help 2>&1)" == *"  init"* ]] || bad+=("launcher does not resolve a nested folder")
+  rc=0; out="$(cd "$T" && "$L" help 2>&1)" || rc=$?
+  [[ $rc == 1 && "$out" == "busybody: not inside a workspace (no office.json above $T)" ]] || bad+=("launcher outside a workspace: rc=$rc $out")
+  run "$W" --minutes-repo acme-co/acme-office --name "$NAME_Q" --engine "$W/busybody"
+  [[ "$out" == *"unchanged: $L"* ]] || bad+=("launcher re-run not skipped: $out")
+  # an outdated launcher of ours is updated; a foreign file is never overwritten
+  printf '#!/bin/sh\n# busybody launcher written by `busybody init`: STALE\n' > "$L"; run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ "$out" == *"updated: $L"* && "$(cat "$L")" != *STALE* ]] || bad+=("outdated launcher not updated: $out")
+  printf '#!/bin/sh\necho mine\n' > "$L"; run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ $rc == 0 && "$out" == *"not the busybody launcher: left alone"* && "$("$L")" == mine ]] || bad+=("foreign launcher overwritten: rc=$rc $out")
+  # --no-path and --dry-run write nothing; the PATH hint shows only when ~/.local/bin is missing from PATH
+  rm -rf "$HOME/.local"; run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody" --no-path
+  [[ $rc == 0 && ! -e "$HOME/.local" && "$out" != *".local/bin"* ]] || bad+=("--no-path: rc=$rc $out")
+  run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody" --dry-run
+  [[ $rc == 0 && ! -e "$HOME/.local" && "$out" == *"would create: $L"* && "$out" == *"not on your PATH"* ]] || bad+=("launcher dry-run: rc=$rc $out")
+  PATH="$HOME/.local/bin:$PATH" run "$W" --minutes-repo acme-co/acme-office --engine "$W/busybody"
+  [[ -x "$L" && "$out" != *"not on your PATH"* ]] || bad+=("PATH hint shown though on PATH: $out")
   # second run: a no-op that says so
   before="$(snap "$W")"; run "$W" --minutes-repo acme-co/acme-office --name "$NAME_Q" --engine "$W/busybody"; after="$(snap "$W")"
   [[ $rc == 0 && "$out" == *"nothing to change"* && "$before" == "$after" ]] || bad+=("second run: rc=$rc $out")
@@ -282,7 +304,7 @@ PY
 }
 
 # --- arguments --------------------------------------------------------------------------------------------------------------
-DIR="" MINUTES="" NAME="" ENGINE="" TRACKER=none CREATE=0 DRY=0
+DIR="" MINUTES="" NAME="" ENGINE="" TRACKER=none CREATE=0 DRY=0 NOPATH=0
 while (($#)); do
   case "$1" in
     --self-test) self_test; exit $? ;;
@@ -291,6 +313,7 @@ while (($#)); do
     --engine) ENGINE="${2:?}"; shift 2 ;;
     --tracker) TRACKER="${2:?}"; shift 2 ;;
     --create) CREATE=1; shift ;;
+    --no-path) NOPATH=1; shift ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) usage 0 ;;
     -*) die "unknown flag $1" ;;
@@ -371,6 +394,30 @@ else
   st=created; [[ -e "$SHIM" ]] && st=updated
   if ! ((DRY)); then mkdir -p "$DIR/bin"; printf '%s\n' "$SHIM_WANT" > "$SHIM"; chmod +x "$SHIM"; fi
   report "$st" "bin/busybody"
+fi
+
+# the global launcher: ~/.local/bin/busybody walks up from the cwd to the nearest workspace and runs its shim. The same for every workspace
+LAUNCHER_WANT='#!/bin/sh
+# busybody launcher written by `busybody init`: runs the bin/busybody shim of the workspace holding the current folder.
+d="$PWD"
+while :; do
+  if [ -f "$d/office.json" ] && [ -x "$d/bin/busybody" ]; then exec "$d/bin/busybody" "$@"; fi
+  [ "$d" = / ] && break
+  d="$(dirname "$d")"
+done
+echo "busybody: not inside a workspace (no office.json above $PWD)" >&2
+exit 1'
+if ((!NOPATH)); then
+  LBIN="${HOME:?HOME is not set}/.local/bin"; LAUNCHER="$LBIN/busybody"
+  if [[ -e "$LAUNCHER" ]] && ! grep -qF "busybody launcher written by" "$LAUNCHER"; then
+    say "  NOTE: $LAUNCHER exists and is not the busybody launcher: left alone"
+  elif [[ -e "$LAUNCHER" && "$(cat "$LAUNCHER")" == "$LAUNCHER_WANT" && -x "$LAUNCHER" ]]; then report unchanged "$LAUNCHER"
+  else
+    st=created; [[ -e "$LAUNCHER" ]] && st=updated
+    if ! ((DRY)); then mkdir -p "$LBIN"; printf '%s\n' "$LAUNCHER_WANT" > "$LAUNCHER"; chmod +x "$LAUNCHER"; fi
+    report "$st" "$LAUNCHER"
+  fi
+  case ":$PATH:" in *":$LBIN:"*) ;; *) say "  NOTE: $LBIN is not on your PATH: add this to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
 fi
 
 # the engine is a plugin source "./<its folder>"; a clone (it has its own .git) is gitignored here like a child repo
@@ -463,6 +510,6 @@ elif labels="$(gh label list -R "$MINUTES" --json name --jq '.[].name' 2>/dev/nu
 else say "  NOTE: could not list labels on $MINUTES: make sure it has an 'initiative' label before starting a room"; fi
 
 if ((CHANGED)); then
-  ((DRY)) || say "init: $DIR is set up. Nothing was pushed. Next: cd $DIR && claude   (then /reload-plugins if the plugin is not loaded). The shim is $DIR/bin/busybody: run bin/busybody help, or add $DIR/bin to your PATH"
+  ((DRY)) || say "init: $DIR is set up. Nothing was pushed. Next: cd $DIR && claude   (then /reload-plugins if the plugin is not loaded). Run busybody help (or $DIR/bin/busybody help)"
   ((!DRY)) || say "init: dry run, nothing written"
 else say "init: nothing to change: $DIR is already set up"; fi
