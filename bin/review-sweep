@@ -1,0 +1,184 @@
+#!/usr/bin/python3 -I
+"""Reviews waiting on a room's PR that nobody has answered: a cheap sweep for cron or /loop (no model turns).
+
+  bin/review-sweep              one line per hit, nothing at all (exit 0) when there is nothing to do
+  bin/review-sweep --json       the hits as a JSON list ([] when none)
+  bin/review-sweep --self-test  check the sweep against stub data
+
+Per open `initiative` issue with a `## Room` block (repo + branch), find the room's open PR and its newest comment or review
+that is not from a bot (`github-actions`, `*[bot]`) and carries no room marker `<!-- busybody:room=<name> -->`. It is waiting
+when it is newer than both the room's last minute (the latest minute on the issue whose header `who` is the room; controller
+NOTE/ANSWER/RECORD never count as the room speaking) and the room's newest marker-bearing PR reply (rooms put the marker in
+their replies, so a replied-to review is answered).
+Line: `<room> PR #N <url> review-pending <comment|review> <iso time> session=<live|dead>`, and for a dead session the command that
+resumes it (README, Resume). Reads through the minutes client's cache; the PR lookups are `gh` calls ($BUSYBODY_GH names gh).
+"""
+import json, os, re, shlex, subprocess, sys
+
+ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ENGINE_ROOT, "bin", "lib"))
+from officeroot import data_root, invoked_root, workspace_root, selftest_reexec  # noqa: E402
+selftest_reexec(ENGINE_ROOT)
+WORKSPACE_ROOT = workspace_root(ENGINE_ROOT, invoked=invoked_root())
+import officeconfig  # noqa: E402
+import minutes  # noqa: E402
+import sessions  # noqa: E402
+
+OFFICE = officeconfig.load_or_exit(WORKSPACE_ROOT, "review-sweep")
+TYPES = "PROGRESS|DECISION|BLOCKED|DONE|ANSWER|WAITING|NOTE|RECORD"
+# Same header as bin/rooms (which runs on import, so cannot be imported): `**TYPE** · who · where`.
+HEADER_RE = re.compile(rf"^\s*\*\*({TYPES})\*\*\s*·\s*([^·\n]*?)\s*(?:·\s*(.*?))?\s*$", re.I)
+CONTROL_TYPES = ("NOTE", "RECORD", "ANSWER")
+MARKER_RE = re.compile(r"<!-- busybody:room=([A-Za-z0-9._-]+) -->")
+GONE = ("done", "failed", "stopped", "completed")
+
+
+def gh_json(args):
+    try:
+        r = subprocess.run(shlex.split(os.environ.get("BUSYBODY_GH") or "gh") + args, capture_output=True, text=True, timeout=60)
+        d = json.loads(r.stdout) if r.returncode == 0 else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return d if isinstance(d, list) else []
+
+
+def find_pr(github, branch):
+    """The room's open PR as {number, url}, or None."""
+    prs = gh_json(["pr", "list", "-R", github, "--head", branch, "--state", "open", "--json", "number,url", "--limit", "1"])
+    return prs[0] if prs and isinstance(prs[0], dict) else None
+
+
+def pr_items(github, number):
+    """Every comment and non-empty review on the PR: [{kind, who, bot, body, at}]. shortcut: first 100 of each, upgrade if a PR outgrows that."""
+    out = []
+    for kind, path, at in (("comment", f"issues/{number}/comments", "created_at"), ("comment", f"pulls/{number}/comments", "created_at"),
+                           ("review", f"pulls/{number}/reviews", "submitted_at")):
+        for x in gh_json(["api", f"repos/{github}/{path}?per_page=100"]):
+            if not isinstance(x, dict) or not x.get(at):
+                continue
+            u = x.get("user") or {}
+            if kind == "review" and not (x.get("body") or "").strip():
+                continue   # the wrapper of inline comments, which are listed on their own
+            out.append({"kind": kind, "who": u.get("login", ""), "bot": u.get("type") == "Bot", "body": x.get("body") or "", "at": x[at]})
+    return out
+
+
+def is_bot(it):
+    w = it["who"].lower()
+    return it["bot"] or w.endswith("[bot]") or w == "github-actions"
+
+
+def last_room_minute(room, comments):
+    """Latest createdAt of a minute whose header `who` is the room and whose type is not a controller one, else ''."""
+    at = ""
+    for c in comments:
+        m = HEADER_RE.match(next((l for l in (c.get("body") or "").splitlines() if l.strip()), ""))
+        if m and m.group(2).strip() == room and m.group(1).upper() not in CONTROL_TYPES:
+            at = max(at, c.get("createdAt") or "")
+    return at
+
+
+def sweep(issues, agents, find_pr=find_pr, pr_items=pr_items):
+    """Hits: {room, issue, pr, url, kind, at, session, resume}. ISO times in UTC `Z` form compare as strings."""
+    by_name = {a.get("name"): a for a in agents}
+    hits = []
+    for iss in issues:
+        m = re.search(r"^## Room\s*\n(.*?)(?=^## |\Z)", iss.get("body") or "", re.S | re.M)
+        room = {k.replace("-", "_"): v for k, v in re.findall(r"^\s*[-*]\s*([\w-]+):\s*(.*?)\s*$", m.group(1), re.M)} if m else {}
+        name, repo, branch = room.get("room"), room.get("repo"), room.get("branch")
+        if not (name and repo and branch):
+            continue
+        github = OFFICE.github(repo)
+        pr = find_pr(github, branch)
+        if not pr:
+            continue
+        items = pr_items(github, pr["number"])
+        # a marker-bearing reply is the room answering, so it also moves the cutoff
+        answered = max([it["at"] for it in items if name in MARKER_RE.findall(it["body"])] or [""])
+        cutoff = max(last_room_minute(name, iss.get("comments", [])), answered)
+        waiting = [it for it in items if not is_bot(it) and not MARKER_RE.search(it["body"]) and it["at"] > cutoff]
+        if not waiting:
+            continue
+        w = max(waiting, key=lambda it: it["at"])
+        ag = by_name.get(name)
+        live = bool(ag) and str(ag.get("state", "")).lower() not in GONE
+        resume = "" if live else (f"cd {room['worktree']} && " if room.get("worktree") else "") + \
+            f"claude --bg --resume {(ag or {}).get('sessionId') or '<session-id>'} -n {name}"
+        hits.append({"room": name, "issue": iss["number"], "pr": pr["number"], "url": pr["url"], "kind": w["kind"], "at": w["at"],
+                     "session": "live" if live else "dead", "resume": resume})
+    return hits
+
+
+def line(h):
+    s = f"{h['room']} PR #{h['pr']} {h['url']} review-pending {h['kind']} {h['at']} session={h['session']}"
+    return s + (f" resume: {h['resume']}" if h["resume"] else "")
+
+
+def self_test():
+    import tempfile
+    iss = lambda comments, body="## Room\n- room: room-a\n- repo: acme-web\n- branch: work/a\n- worktree: /w/a\n": [
+        {"number": 7, "body": body, "comments": comments}]
+    minute = lambda who, at, typ="PROGRESS": {"body": f"**{typ}** · {who} · here\nsummary", "createdAt": at}
+    it = lambda at, body="please change x", who="alice", kind="review", bot=False: {"kind": kind, "who": who, "bot": bot, "body": body, "at": at}
+    pr = lambda g, b: {"number": 3, "url": "https://example.com/pr/3"}
+    run = lambda comments, items, agents=(), **kw: sweep(iss(comments, **kw), list(agents), pr, lambda g, n: items)
+    M = "<!-- busybody:room=room-a -->"
+    live = [{"name": "room-a", "state": "working", "sessionId": "s1"}]
+    got = run([minute("room-a", "2026-10-01T00:00:00Z")], [it("2026-10-02T00:00:00Z")])
+    checks = [
+        ("review newer than the last minute, dead session: reported with a resume hint",
+         len(got) == 1 and got[0]["session"] == "dead" and got[0]["kind"] == "review" and got[0]["resume"] == "cd /w/a && claude --bg --resume <session-id> -n room-a"
+         and line(got[0]).startswith("room-a PR #3 https://example.com/pr/3 review-pending review 2026-10-02T00:00:00Z session=dead resume: ")),
+        ("a live session is reported live with no resume", [(h["session"], h["resume"]) for h in run([minute("room-a", "2026-10-01T00:00:00Z")], [it("2026-10-02T00:00:00Z")], live)] == [("live", "")]),
+        ("review older than the last minute: silent", run([minute("room-a", "2026-10-03T00:00:00Z")], [it("2026-10-02T00:00:00Z")]) == []),
+        ("a controller NOTE is not the room speaking", len(run([minute("room-a", "2026-10-01T00:00:00Z"), minute("room-a", "2026-10-05T00:00:00Z", "NOTE")], [it("2026-10-02T00:00:00Z")])) == 1),
+        ("bot comment: silent", run([], [it("2026-10-02T00:00:00Z", who="github-actions", kind="comment"), it("2026-10-02T00:00:00Z", who="dependabot[bot]"),
+                                         it("2026-10-02T00:00:00Z", who="x", bot=True)]) == []),
+        ("marker comment: silent", run([], [it("2026-10-02T00:00:00Z", f"on it\n{M}", kind="comment")]) == []),
+        ("marker reply newer than the review: answered", run([], [it("2026-10-02T00:00:00Z"), it("2026-10-03T00:00:00Z", f"done\n{M}", kind="comment")]) == []),
+        ("marker reply older than the review: still waiting", len(run([], [it("2026-10-03T00:00:00Z"), it("2026-10-02T00:00:00Z", f"hi\n{M}", kind="comment")])) == 1),
+        ("another room's marker does not answer this room", len(run([], [it("2026-10-02T00:00:00Z"), it("2026-10-03T00:00:00Z", "<!-- busybody:room=room-b -->", kind="comment")])) == 1),
+        ("no PR items at all: silent", run([minute("room-a", "2026-10-01T00:00:00Z")], []) == []),
+        ("no issues: silent", sweep([], []) == []),
+        ("an issue with no Room block or no branch is skipped", run([], [it("2026-10-02T00:00:00Z")], body="Goal") == []
+         and run([], [it("2026-10-02T00:00:00Z")], body="## Room\n- room: room-a\n- repo: acme-web\n") == []),
+    ]
+    # the gh readers, against a stub gh
+    d = tempfile.mkdtemp()
+    try:
+        stub = os.path.join(d, "gh")
+        open(stub, "w").write("#!/bin/sh\ncase \"$*\" in *'pr list'*) echo '[{\"number\":4,\"url\":\"u4\"}]';; *reviews*) echo '[{\"user\":{\"login\":\"bob\",\"type\":\"User\"},"
+                              "\"body\":\"no\",\"submitted_at\":\"T1\"},{\"user\":{\"login\":\"bob\"},\"body\":\"\",\"submitted_at\":\"T2\"}]';; *) echo '[{\"user\":{\"login\":\"ci[bot]\","
+                              "\"type\":\"Bot\"},\"body\":\"x\",\"created_at\":\"T0\"}]';; esac\n")
+        os.chmod(stub, 0o755)
+        os.environ["BUSYBODY_GH"] = stub
+        items = pr_items("acme-co/web-app", 4)
+        checks.append(("gh readers: open PR, comments and non-empty reviews, bots marked",
+                       find_pr("acme-co/web-app", "b") == {"number": 4, "url": "u4"} and [(i["kind"], is_bot(i)) for i in items] == [("comment", True), ("comment", True), ("review", False)]))
+        os.environ["BUSYBODY_GH"] = os.path.join(d, "missing")
+        checks.append(("a failing gh is an empty answer, not a crash", find_pr("a/b", "b") is None and pr_items("a/b", 1) == []))
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+    bad = [n for n, c in checks if not c]
+    print("review-sweep self-test:", "ok" if not bad else "FAILED: " + "; ".join(bad))
+    sys.exit(1 if bad else 0)
+
+
+def main(argv):
+    if "--self-test" in argv:
+        self_test()
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        sys.exit(0)
+    cache = os.path.join(data_root(WORKSPACE_ROOT), ".cache")
+    mc = minutes.Minutes(OFFICE.minutes_repo, cache)
+    mc.sync(labels=["initiative"])
+    hits = sweep(mc.issues("initiative"), sessions.agents_list(5))
+    if "--json" in argv:
+        print(json.dumps(hits, indent=1))
+    for h in hits if "--json" not in argv else []:
+        print(line(h))
+
+
+main(sys.argv[1:])
