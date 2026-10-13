@@ -36,7 +36,7 @@ design from the `design` team), post a `PROGRESS` note saying so and carry on.
    The owner promotes and merges. Never run `gh pr merge`.
 3. **Watch.** Start `busybody pr-watch #N` as a **background shell**: no model turns while waiting.
    - It wakes you only on an event: promotion to ready, a CI result, a new review or comment, the merge.
-   - A CI failure or a review goes to a worker to fix (the same worker that wrote it); the push re-arms the watcher.
+   - A CI failure or a review goes to a worker to fix (the same worker that wrote it). Order: fix, push, post the marked PR reply, run `--ack`, and only then re-arm the watcher (re-armed earlier, it reports the same review again).
    - **Respond to every review** (a review, or a review left as a PR comment, from anyone but a bot or you). Each finding gets one of three answers: a **fix commit**, a **reply saying why not**, or a **`DECISION`** for the owner if it is a product call. After the push, post one PR comment that takes each finding in turn, mapping it to its answer. A minute on the issue is not a reply (owner, 2026-10-08).
    - **Mark your PR comments.** End every PR comment you post with the hidden line `<!-- busybody:room=<your room name> -->`. `busybody pr-watch` and `busybody review-sweep` skip comments carrying it, so you never wake on yourself; every other comment from the same GitHub account is treated as a reviewer's.
    - **Mark it handled.** After the reply is posted, run `busybody pr-watch --ack <N>` so a restarted watcher does not report the review again. A review that landed while you were down is reported the moment the watcher starts.
