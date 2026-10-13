@@ -412,7 +412,7 @@ fi
 
 # 5. .gitignore: the engine's per-machine files (child clone dirs are added as repos are added) -----------------------------
 GI="$DIR/.gitignore"; MISSING=()
-for l in "/.cache/" ".claude/settings.local.json" ".claude/watch.json" "/.claude/role-sessions/" ${EXTRA_IGNORE[@]+"${EXTRA_IGNORE[@]}"}; do
+for l in "/.cache/" ".claude/settings.local.json" ".claude/watch.json" ".claude/watch-seen.json" "/.claude/role-sessions/" ${EXTRA_IGNORE[@]+"${EXTRA_IGNORE[@]}"}; do
   grep -qxF -e "$l" "$GI" 2>/dev/null || MISSING+=("$l")
 done
 if ((${#MISSING[@]})); then

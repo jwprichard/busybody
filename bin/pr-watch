@@ -2,6 +2,7 @@
 # Background PR watcher: wakes a role only on an event, with no model turns while it waits.
 #
 #   bin/pr-watch <pr> [-R owner/repo]
+#   bin/pr-watch --ack <pr> [-R owner/repo]
 #   bin/pr-watch --self-test
 #
 # Run it as a background shell. It polls GitHub every BUSYBODY_PR_WATCH_INTERVAL seconds (default 240; the old
@@ -13,6 +14,10 @@
 #   cap        7 days (PR_WATCH_CAP seconds) passed with no event
 # An already merged or closed PR exits at once. Exit 2: gh failed 30 polls in a row. Exit 3: another
 # live watcher already owns .claude/watch.json (it is left untouched).
+# Handled-memory: <repo root>/.claude/watch-seen.json keeps, per PR, the newest review and comment the room has handled. The first
+# start for a PR baselines it from the PR's current state. Later starts report at once (before polling) any review or comment
+# newer than that, so one that landed while the watcher was down is not lost. An event is not marked handled when printed (the
+# room may die first): after answering, run `bin/pr-watch --ack <pr>`, which marks everything now on the PR handled and exits 0.
 # While it runs, <repo root>/.claude/watch.json ({pr, start, pid}) marks the room "watching"; it is
 # removed on exit, but only if it still names this process. Output is the event name and the PR URL only (link, don't paste).
 # PR_WATCH_GH overrides the gh command (tests).
@@ -25,6 +30,28 @@ CAP="${PR_WATCH_CAP:-604800}"
 
 die() { printf 'pr-watch: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+# Reviews and comments: counts, plus rmax/cmax, the newest review and comment timestamps (the handled-memory markers).
+heavy_fetch() {
+  local h
+  h="$("$GH" pr view "$PR" "${REPO_ARGS[@]}" --json reviews,comments 2>/dev/null | jq -c '
+    ([.reviews[]]) as $r
+    | ([.comments[] | select((.author.login // "") | test("^(github-actions|.*\\[bot\\])$") | not)]) as $c
+    | { reviews: ($r | length), comments: ($c | length),
+        rmax: ([$r[].submittedAt // empty] | max // ""), cmax: ([$c[].createdAt // empty] | max // "") }')" || return 1
+  [[ -n "$h" ]] && echo "$h"
+}
+
+# Record the markers for this PR in watch-seen.json, never moving one backwards. $1 = {rmax, cmax}.
+seen_write() {
+  local f="$ROOT/.claude/watch-seen.json" cur="$1"
+  mkdir -p "$ROOT/.claude"
+  jq -c --arg p "$PR_NUM" --argjson c "$cur" '
+    (.[$p] // {review: "", comment: ""}) as $o
+    | .[$p] = {review: ([$o.review, $c.rmax] | max), comment: ([$o.comment, $c.cmax] | max)}' \
+    "$f" 2>/dev/null > "$f.tmp" || jq -cn --arg p "$PR_NUM" --argjson c "$cur" '{($p): {review: $c.rmax, comment: $c.cmax}}' > "$f.tmp"
+  mv "$f.tmp" "$f"
+}
 
 # One compact snapshot: state, draft flag, overall CI, review and comment counts, url. Two calls at most, and usually one: every
 # poll fetches only the light fields (state, draft, url, updatedAt, the check rollup); reviews and comments, the expensive part,
@@ -44,10 +71,7 @@ snapshot() {
     jq -c --argjson p "$prev" '. + {reviews: $p.reviews, comments: $p.comments}' <<<"$light"
     return
   fi
-  heavy="$("$GH" pr view "$PR" "${REPO_ARGS[@]}" --json reviews,comments 2>/dev/null | jq -c '
-    { reviews: (.reviews | length),
-      comments: ([.comments[] | select((.author.login // "") | test("^(github-actions|.*\\[bot\\])$") | not)] | length) }')" || return 1
-  [[ -n "$heavy" ]] || return 1
+  heavy="$(heavy_fetch)" || return 1
   jq -c --argjson h "$heavy" '. + $h' <<<"$light"
 }
 
@@ -68,6 +92,7 @@ run() {
   # Remove the marker only if it is ours.
   trap '[[ "$(jq -r .pid "$ROOT/.claude/watch.json" 2>/dev/null)" == "$$" ]] && rm -f "$ROOT/.claude/watch.json"; true' EXIT
   trap 'exit 143' TERM INT
+  SEEN="$ROOT/.claude/watch-seen.json"
   while :; do
     if cur="$(snapshot)" && [[ -n "$cur" ]]; then
       fails=0
@@ -76,6 +101,19 @@ run() {
         MERGED) echo "EVENT: merged $url"; return 0 ;;
         CLOSED) echo "EVENT: closed $url"; return 0 ;;
       esac
+      if [[ -z "$prev" ]]; then   # first snapshot: baseline a new PR, or report what landed while we were down
+        seen="$(jq -c --arg p "$PR_NUM" '.[$p] // empty' "$SEEN" 2>/dev/null || true)"
+        if [[ -z "$seen" ]]; then seen_write "$cur"
+        else
+          ev="$(jq -rn --argjson s "$seen" --argjson c "$cur" '
+            [ (if $c.rmax > $s.review then "review" else empty end),
+              (if $c.cmax > $s.comment then "comment" else empty end) ] | .[]')"
+          if [[ -n "$ev" ]]; then
+            while read -r e; do echo "EVENT: $e $url"; done <<<"$ev"
+            return 0
+          fi
+        fi
+      fi
       if [[ -n "$prev" ]]; then
         ev="$(jq -rn --argjson p "$prev" --argjson c "$cur" '
           [ (if $p.draft and ($c.draft | not) then "ready" else empty end),
@@ -97,6 +135,13 @@ run() {
     if ((now - start >= CAP)); then echo "EVENT: cap ${url:-PR #$PR_NUM}"; return 0; fi
     sleep "$INTERVAL"
   done
+}
+
+ack() {
+  local h
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  h="$(heavy_fetch)" || die "gh failed fetching PR $PR_NUM"
+  seen_write "$h"
 }
 
 self_test() {
@@ -122,12 +167,14 @@ GH
       pending) roll='[{"status":"IN_PROGRESS","conclusion":""}]' ;;
     esac
     jq -n --arg s "$1" --argjson d "$2" --argjson r "$roll" --argjson rv "$4" --argjson cm "$5" --argjson bt "${6:-0}" \
-      '{state:$s,isDraft:$d,updatedAt:("u\($rv)-\($cm)-\($bt)-\($s)"),url:"https://github.com/o/r/pull/7",statusCheckRollup:$r,reviews:[range($rv)|{}],
-        comments:([range($cm)|{author:{login:"someone"}}] + [range($bt)|{author:{login:"github-actions"}}])}'
+      '{state:$s,isDraft:$d,updatedAt:("u\($rv)-\($cm)-\($bt)-\($s)"),url:"https://github.com/o/r/pull/7",statusCheckRollup:$r,reviews:[range($rv)|{id:"r\(.)",submittedAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"someone"}}],
+        comments:([range($cm)|{id:"c\(.)",createdAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"someone"}}] + [range($bt)|{id:"b\(.)",createdAt:"2026-01-01T00:00:0\(.)Z",body:"",author:{login:"github-actions"}}])}'
   }
   t() { # name expected-event files... (state draft ci reviews comments per call)
     local name="$1" want="$2"; shift 2
     rm -f "$T"/[0-9]*.json "$T/n" "$T/fail"
+    [[ -n "${KEEP:-}" ]] || rm -f "$T/.claude/watch-seen.json"
+    if [[ -n "${SEED:-}" ]]; then mkdir -p "$T/.claude"; echo "$SEED" > "$T/.claude/watch-seen.json"; fi
     local i=1; for spec in "$@"; do mk $spec > "$T/$i.json"; i=$((i + 1)); done
     rc=0; out="$(cd "$T" && PR_WATCH_GH="$T/gh" BUSYBODY_PR_WATCH_INTERVAL=0.05 PR_WATCH_CAP=${CAP_T:-600} timeout 20 "$SELF" 7 2>&1)" || rc=$?
     [[ "$rc" == 0 && "$out" == "EVENT: $want https://github.com/o/r/pull/7" ]] || bad+=("$name: rc=$rc out=$out")
@@ -144,6 +191,18 @@ GH
   t merged-later merged "OPEN false pending 0 0" "OPEN false pending 0 0" "MERGED false success 0 0"
   rm -f "$T/calls"; t merged-light merged "OPEN false success 0 0" "OPEN false success 0 0" "OPEN false success 0 0" "MERGED false success 0 0"
   [[ "$(grep -c 'reviews,comments' "$T/calls")" == 1 ]] || bad+=("reviews and comments are fetched only when updatedAt moves: $(grep -c 'reviews,comments' "$T/calls") calls")
+  # handled-memory: first start baselines silently; a restart reports what landed while down; --ack marks it handled
+  t baseline-silent merged "OPEN false success 2 1" "MERGED false success 0 0"
+  [[ "$(jq -c '.["7"]' "$T/.claude/watch-seen.json" 2>/dev/null)" == '{"review":"2026-01-01T00:00:01Z","comment":"2026-01-01T00:00:00Z"}' ]] || bad+=("baseline: seen file: $(cat "$T/.claude/watch-seen.json" 2>&1)")
+  SEED='{"7":{"review":"2026-01-01T00:00:00Z","comment":""}}' t restart-review review "OPEN false success 2 0"
+  SEED='{"7":{"review":"2026-01-01T00:00:01Z","comment":"2026-01-01T00:00:00Z"}}' t restart-comment comment "OPEN false success 2 2"
+  SEED='{"7":{"review":"2026-01-01T00:00:01Z","comment":"2026-01-01T00:00:01Z"}}' t restart-nothing-new merged "OPEN false success 2 2" "MERGED false success 0 0"
+  SEED='{"9":{"review":"x","comment":"x"}}' t other-pr-state-baselines merged "OPEN false success 2 2" "MERGED false success 0 0"
+  SEED='{"7":{"review":"2026-01-01T00:00:00Z","comment":""}}' t before-ack review "OPEN false success 2 0"
+  rm -f "$T/n"; rc=0; (cd "$T" && PR_WATCH_GH="$T/gh" "$SELF" --ack 7) >/dev/null 2>&1 || rc=$?
+  [[ "$rc" == 0 ]] || bad+=("ack: rc=$rc")
+  KEEP=1 t after-ack merged "OPEN false success 2 0" "MERGED false success 0 0"
+  [[ "$(jq -r '.["7"].review' "$T/.claude/watch-seen.json" 2>/dev/null)" == "2026-01-01T00:00:01Z" ]] || bad+=("ack: marker not written")
   CAP_T=1 t cap cap "OPEN true pending 0 0"
   # watch.json exists while running, with pr/start/pid
   rm -f "$T"/[0-9]*.json "$T/n"; mk OPEN true pending 0 0 > "$T/1.json"
@@ -171,10 +230,11 @@ GH
 }
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-PR="" REPO_ARGS=()
+PR="" REPO_ARGS=() ACK=
 while (($#)); do
   case "$1" in
     --self-test) self_test; exit $? ;;
+    --ack) ACK=1 ;;
     -h|--help) usage 0 ;;
     -R) [[ $# -ge 2 ]] || die "-R needs owner/repo"; REPO_ARGS=(-R "$2"); shift ;;
     -*) die "unknown flag $1" ;;
@@ -187,4 +247,5 @@ PR_NUM="${PR#\#}"; PR_NUM="${PR_NUM##*/}"
 [[ "$PR_NUM" =~ ^[0-9]+$ ]] || die "PR must be a number: $PR"
 PR="$PR_NUM"
 command -v jq >/dev/null || die "jq is required"
+if [[ -n "$ACK" ]]; then ack; exit 0; fi
 run
