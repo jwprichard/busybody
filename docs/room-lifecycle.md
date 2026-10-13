@@ -56,11 +56,22 @@ Open → Kickoff (go/no-go) → ────────── the team's own ph
 3. **Watch.** The role starts `busybody pr-watch #N` as a **background shell**: no model turns while waiting.
    - It wakes the role **only on an event**: promotion to ready, a CI result, a new review or
      comment, or the merge.
-   - A CI failure or a review goes to a worker to fix; the push re-arms the watcher.
+   - A CI failure or a review goes to a worker to fix. Order: fix, push, marked PR reply, `pr-watch --ack`, then re-arm the watcher.
+   - **Respond to every review.** Each finding is answered one of three ways: a fix commit, a reply saying
+     why not, or a `DECISION` for the owner (a product call). The role replies on the PR mapping findings to
+     answers, ends the comment with `<!-- busybody:room=<name> -->` (watchers and the sweep skip it), then
+     runs `busybody pr-watch --ack <N>`. A room does not post `DONE`, and the controller does not call the PR
+     ready to merge, while a review is unanswered.
    - It runs **until merge** (or the PR closes), with a safety cap of **7 days**.
    - GitHub is checked every 60–120 s, about 30–60 API calls an hour.
    - While it runs, `.claude/watch.json` marks the room **watching**.
 4. **Merged → Close.** The generic Close stage follows.
+
+**Review sweep.** Reviews can land after the room's session has died (OCR runs when the owner promotes the
+PR). The controller schedules `busybody review-sweep` (cron or `/loop`, no model turns, silent when there is
+nothing to do). It lists each open room PR with a non-bot, non-room comment or review that the room has not
+answered (answered = a marked PR reply or a `DONE` newer than it; a `PROGRESS` or `WAITING` minute does not
+count), and whether the room session is live or dead, so the controller can nudge or resume it.
 
 **Backstop.** The controller's 5-minute timer (the cap timer, no model turns) checks `WAITING` rooms
 that have no live watcher. It restarts the watcher, or nudges the role, when their PR changes. So a
@@ -85,7 +96,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
   resolves the issue.
 
 ## Build (built)
-- `busybody pr-watch` and the `watch.json` marker.
+- `busybody pr-watch` and the `watch.json` marker; the handled-memory (`watch-seen.json`, `pr-watch --ack`) and `busybody review-sweep`.
 - The backstop in the cap timer.
 - `busybody land`.
 - Draft-PR permission in the room config.
