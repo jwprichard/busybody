@@ -10,11 +10,15 @@
                             open the room: a project room through the lead launcher, a staff room through the role launcher
                             (initiative = N, #N or an issue URL of the workspace repo; anything else is a free-text task)
                             TEAM_LEAD_START and TEAM_ROLE_RUN name the launchers (default: the real scripts), TEAM_GH the gh command
-  bin/team resolve <initiative> [--check NAME] [--room NAME] [--close]
+  bin/team resolve <initiative> [--check NAME] [--room NAME] [--close] [--no-close]
                             run the recipe's done check (or NAME) against the issue: PASS / FAIL with the evidence it found.
                             --room NAME is needed for an issue with no Room block (a staff pass): only a DONE minute whose who is
-                            exactly that name counts, and an old-style `DONE:` never does. Exit 0 pass, 1 fail, 2 cannot decide. Never writes anything (no comment, label or close), except with --close:
-                            after a PASS it runs `claude stop <room>` and then ends the room's own process (the claude binary with `-n <room>`,
+                            exactly that name counts, and an old-style `DONE:` never does. Exit 0 pass, 1 fail, 2 cannot decide.
+                            After a PASS it posts a `**RECORD**` minute (the check and its evidence) and closes the issue as completed, through
+                            `gh issue close` and, if that errors (Projects classic), `gh api`. It never closes on FAIL/UNDECIDED, an issue
+                            labelled `project`, or one with open sub-issues (it says why); an already-closed issue passes with no second minute.
+                            --no-close skips the comment and the close. BUSYBODY_CONTROLLER names the minute's who (default: controller).
+                            With --close, after a PASS it also runs `claude stop <room>` and then ends the room's own process (the claude binary with `-n <room>`,
                             SIGTERM, SIGKILL only if ignored; TEAM_CLAUDE names the claude command), which `claude stop` can miss.
                             Checks: pr-merged verdict-posted ready-card report-posted landed card-has-design-link.
                             TEAM_GH, TEAM_GIT and TEAM_TRACKER name the gh, git and tracker commands (TEAM_TRELLO is read too); TEAM_REPOS_DIR the clones' parent
@@ -529,7 +533,10 @@ def self_test():
     fx = tempfile.mkdtemp()
     glog = os.path.join(fx, "gh.log")
     for name, text in (("gh", 'echo "$*" >> "$TEAM_FIX/gh.log"\ncase "$1 $2" in\n"issue view") cat "$TEAM_FIX/issue-$3.json" ;;\n'
-                                   '"pr list") cat "$TEAM_FIX/pr.json" ;;\n*) exit 1 ;;\nesac\n'),
+                                   '"pr list") cat "$TEAM_FIX/pr.json" ;;\n'
+                                   '"issue comment"|"issue close") [ -e "$TEAM_FIX/classic" ] && exit 1; exit 0 ;;\n'
+                                   '"api repos/"*) case "$2" in */sub_issues) cat "$TEAM_FIX/subs-$(echo "$2" | cut -d/ -f5).json" 2>/dev/null || echo "[]" ;; *) exit 0 ;; esac ;;\n'
+                                   '"api -X") exit 0 ;;\n*) exit 1 ;;\nesac\n'),
                        ("tracker", 'cat "$TEAM_FIX/card-$2.json"\n')):
         open(os.path.join(fx, name), "w").write("#!/bin/sh\n" + text)
         os.chmod(os.path.join(fx, name), 0o755)
@@ -559,10 +566,11 @@ def self_test():
                       TEAM_REPOS_DIR=repos, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
     appr = f"https://github.com/{REPO}/issues/9#issuecomment-1234"
 
-    def issue(n, branch="landed-b", team="dev-team", comments=(), room=True, who="room-r", repo="r1"):
+    def issue(n, branch="landed-b", team="dev-team", comments=(), room=True, who="room-r", repo="r1", state="OPEN", labels=()):
         body = "Goal\n\n## Room\n- room: room-r\n- team: %s\n- repo: %s\n- branch: %s\n" % (team, repo, branch) if room else "Goal"
         cs = [{"body": c.replace("WHO", who), "url": f"https://x/c{i}"} for i, c in enumerate(comments)]
-        json.dump({"title": "T", "body": body, "comments": cs}, open(os.path.join(fx, f"issue-{n}.json"), "w"))
+        json.dump({"title": "T", "body": body, "comments": cs, "state": state, "labels": [{"name": x} for x in labels]},
+                  open(os.path.join(fx, f"issue-{n}.json"), "w"))
 
     def resolve(n, *a):
         o = io.StringIO()
@@ -705,10 +713,62 @@ def self_test():
     git("remote", "add", "origin", os.path.join(fx, "nowhere"))
     git("update-ref", "refs/remotes/origin/main", "main~1")
     expect("landed fail when origin/main is behind", resolve(47, "--check", "landed"), 1, "origin/main")
-    # resolve never writes
-    log = open(glog).read()
-    if re.search(r"\b(comment|edit|close|reopen|create|label)\b", log):
-        bad.append(f"resolve wrote through gh: {log}")
+    # resolve closes the issue on PASS, and only then
+    raw = [""]
+
+    def writes():
+        log = open(glog).read()
+        raw[0] = log
+        open(glog, "w").write("")
+        return [ln for ln in log.splitlines() if re.match(r"(issue (comment|close)|api (-X|repos/\S+/(comments|issues/\d+$)))", ln)]
+
+    git("update-ref", "refs/remotes/origin/main", "main")
+    writes()
+    issue(60, branch="landed-b")
+    expect("PASS closes", resolve(60, "--check", "landed"), 0, "#60 closed as completed (RECORD minute posted)")
+    w = writes()
+    if not (len(w) == 2 and w[0].startswith("issue comment 60 -R acme-co/") and "**RECORD** · controller · #60\nResolved: landed passed:" in raw[0]
+            and w[1] == "issue close 60 -R " + REPO + " --reason completed"):
+        bad.append(f"resolve PASS writes: {w}")
+    os.environ["BUSYBODY_CONTROLLER"] = "ctl"
+    resolve(60, "--check", "landed")
+    if "**RECORD** · ctl · #60" not in "".join(writes()):
+        bad.append("resolve minute's who does not follow BUSYBODY_CONTROLLER")
+    os.environ.pop("BUSYBODY_CONTROLLER")
+    issue(61, branch="open-b")
+    expect("FAIL does not close", resolve(61, "--check", "landed"), 1, "FAIL landed")
+    if writes():
+        bad.append("resolve wrote on FAIL")
+    issue(62, branch="no-such-branch")
+    expect("UNDECIDED does not close", resolve(62, "--check", "landed"), 2, "UNDECIDED landed")
+    if writes():
+        bad.append("resolve wrote on UNDECIDED")
+    expect("--no-close skips", resolve(60, "--check", "landed", "--no-close"), 0, "PASS landed on #60")
+    if writes():
+        bad.append("--no-close wrote")
+    issue(63, labels=("project",))
+    expect("project label stays open", resolve(63, "--check", "landed"), 0, "carries the `project` label: left open")
+    if writes():
+        bad.append("resolve closed a project")
+    issue(64)
+    json.dump([{"number": 7, "state": "closed"}, {"number": 8, "state": "open"}], open(os.path.join(fx, "subs-64.json"), "w"))
+    expect("open sub-issue stays open", resolve(64, "--check", "landed"), 0, "left open: open sub-issues #8")
+    if writes():
+        bad.append("resolve closed an issue with open sub-issues")
+    json.dump([{"number": 7, "state": "closed"}], open(os.path.join(fx, "subs-64.json"), "w"))
+    expect("closed sub-issues do not block", resolve(64, "--check", "landed"), 0, "#64 closed as completed")
+    writes()
+    issue(65, state="CLOSED")
+    expect("already closed is idempotent", resolve(65, "--check", "landed"), 0, "PASS landed on #65")
+    if writes():
+        bad.append("resolve wrote on an already-closed issue")
+    open(os.path.join(fx, "classic"), "w").close()   # gh issue comment/close error, as on a repo with Projects classic
+    issue(66)
+    expect("falls back to gh api", resolve(66, "--check", "landed"), 0, "#66 closed as completed")
+    w = writes()
+    if not [x for x in w if x.startswith(f"api repos/{REPO}/issues/66/comments")] or not [x for x in w if x.startswith(f"api -X PATCH repos/{REPO}/issues/66 ")]:
+        bad.append(f"resolve fallback did not use gh api: {w}")
+    os.remove(os.path.join(fx, "classic"))
     globals()["TRACKER"] = saved_tracker0
     for k in ("TEAM_GH", "TEAM_TRACKER", "TEAM_GIT", "TEAM_FIX", "TEAM_REPOS_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
         os.environ.pop(k, None)
@@ -1145,10 +1205,12 @@ CHECKS = tuple(RESOLVERS)
 
 def cmd_resolve(argv, root=None):
     root = root or WORKSPACE_ROOT   # recipes belong to the workspace, not the engine
-    pos, override, room_opt, i, close = [], None, None, 0, False
+    pos, override, room_opt, i, close, no_close = [], None, None, 0, False, False
     while i < len(argv):
         if argv[i] == "--close":
             close = True
+        elif argv[i] == "--no-close":
+            no_close = True
         elif argv[i] in ("--check", "--room"):
             if i + 1 >= len(argv):
                 die(f"{argv[i]} needs a value", 2)
@@ -1164,12 +1226,12 @@ def cmd_resolve(argv, root=None):
         i += 1
     kind, n = parse_target(" ".join(pos))
     if len(pos) != 1 or kind != "initiative":
-        die("usage: bin/team resolve <initiative> [--check NAME] [--room NAME] [--close]", 2)
+        die("usage: bin/team resolve <initiative> [--check NAME] [--room NAME] [--close] [--no-close]", 2)
     if override and override not in CHECKS:
         die(f"unknown check {override}; one of: " + ", ".join(CHECKS), 2)
     check = override
     try:
-        r = tool("TEAM_GH", "gh", ["issue", "view", str(n), "-R", REPO, "--json", "title,body,comments"])
+        r = tool("TEAM_GH", "gh", ["issue", "view", str(n), "-R", REPO, "--json", "title,body,comments,state,labels"])
         try:
             issue = json.loads(r.stdout)
         except ValueError:
@@ -1191,9 +1253,58 @@ def cmd_resolve(argv, root=None):
         print(f"UNDECIDED {check or '?'} on #{n}: {e}")
         return 2
     print(f"{'PASS' if ok else 'FAIL'} {check} on #{n}: {evidence}")
+    if ok and not no_close and not close_issue(n, issue, check, evidence):
+        return 3   # the check passed but the issue could not be closed: fail loudly
     if ok and close and name and not close_session(name):
         return 3   # the check passed but the session is still running: fail loudly
     return 0 if ok else 1
+
+
+def gh_write(args):
+    """A gh write; True when it succeeded."""
+    return tool("TEAM_GH", "gh", args).returncode == 0
+
+
+def open_sub_issues(n):
+    """Open sub-issues of #n; None when gh cannot say (so the caller does not close blind)."""
+    r = tool("TEAM_GH", "gh", ["api", f"repos/{REPO}/issues/{n}/sub_issues"])
+    try:
+        subs = json.loads(r.stdout)
+    except ValueError:
+        return None
+    if r.returncode or not isinstance(subs, list):
+        return None
+    return [s.get("number") for s in subs if str(s.get("state", "")).lower() == "open"]
+
+
+def close_issue(n, issue, check, evidence):
+    """After a PASS: a RECORD minute, then close as completed. Skips (and says why) for a closed issue, a `project`, open sub-issues."""
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        print(f"#{n} is already closed: nothing to do")
+        return True
+    if any((lb.get("name") if isinstance(lb, dict) else lb) == "project" for lb in issue.get("labels") or []):
+        print(f"#{n} carries the `project` label: left open")
+        return True
+    subs = open_sub_issues(n)
+    if subs is None:
+        print(f"#{n} left open: could not read its sub-issues (close it by hand)")
+        return True
+    if subs:
+        print(f"#{n} left open: open sub-issues " + ", ".join(f"#{x}" for x in subs))
+        return True
+    who = bb_env(None, "CONTROLLER") or "controller"
+    body = f"**RECORD** · {who} · #{n}\nResolved: {check} passed: {evidence}"
+    # `gh issue comment` / `gh issue close` can error on a repo with Projects (classic); the REST calls do not
+    if not (gh_write(["issue", "comment", str(n), "-R", REPO, "--body", body])
+            or gh_write(["api", f"repos/{REPO}/issues/{n}/comments", "-f", f"body={body}"])):
+        print(f"#{n} not closed: could not post the RECORD minute")
+        return False
+    if not (gh_write(["issue", "close", str(n), "-R", REPO, "--reason", "completed"])
+            or gh_write(["api", "-X", "PATCH", f"repos/{REPO}/issues/{n}", "-f", "state=closed", "-f", "state_reason=completed"])):
+        print(f"#{n} not closed: the RECORD minute is posted but the close failed (close it by hand)")
+        return False
+    print(f"#{n} closed as completed (RECORD minute posted)")
+    return True
 
 
 def close_session(name):

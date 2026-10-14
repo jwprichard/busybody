@@ -56,7 +56,10 @@ Rules `busybody team check` enforces:
 
 ## Done checks (`busybody team resolve <initiative>`)
 
-Reports pass or fail with the evidence it found. It never closes, comments on or labels anything.
+Reports pass or fail with the evidence it found. On a pass it also posts a `RECORD` minute (the check and its evidence link) and closes the issue as
+completed, falling back to `gh api` where `gh issue close` errors (Projects classic). It never closes on a fail or undecided, an issue labelled
+`project`, or one with open sub-issues (it says why and leaves it open); an already-closed issue passes with no second minute. `--no-close` skips
+the minute and the close.
 `--check NAME` overrides the recipe's check for a one-off. In a repo whose `merge` is `land` (no PRs) a recipe with `draftPr` is
 checked as `landed`, not `pr-merged`, as `busybody team start` makes it land. Only a `DONE` minute whose "who" is
 the room's name counts (an old-style `DONE:` never does); an issue with no Room block (a staff pass) needs

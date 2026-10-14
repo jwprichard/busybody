@@ -1,5 +1,5 @@
 {
-  "_comment": "Room settings template. bin/lead-start fills env and drops _comment; it adds the protected branches' push denies (office.json noPush) and room.env, room.deny and room.prodRead; rules syntax: code.claude.com/docs/en/permissions (Bash(prefix *) globs; mcp__server__* tool-name globs, no parentheses). Draft PRs are allowed (docs/room-lifecycle.md). Limit: globs cannot express \"gh pr create without --draft\", and deny beats allow, so a ready PR is not blocked by settings; the dev-team skill forbids it and the owner promotes drafts. gh pr ready is denied, so only the owner promotes a draft. bin/land is allowed as bin/land or <path>/bin/land, but bin/land --no-checks is denied (deny beats allow). Rooms never open rooms: claude --bg (in any argument position), bin/team start, bin/lead-start and bin/role run are denied, and so are end-session and team resolve --close (only the control room ends sessions). bin/lead-start drops the draft-PR allow and the bin/land allows that its recipe (--team) does not grant.",
+  "_comment": "Room settings template. bin/lead-start fills env and drops _comment; it adds the protected branches' push denies (office.json noPush) and room.env, room.deny and room.prodRead; rules syntax: code.claude.com/docs/en/permissions (Bash(prefix *) globs; mcp__server__* tool-name globs, no parentheses). Draft PRs are allowed (docs/room-lifecycle.md). Limit: globs cannot express \"gh pr create without --draft\", and deny beats allow, so a ready PR is not blocked by settings; the dev-team skill forbids it and the owner promotes drafts. gh pr ready is denied, so only the owner promotes a draft. bin/land is allowed as bin/land or <path>/bin/land, but bin/land --no-checks is denied (deny beats allow). Rooms never open rooms: claude --bg (in any argument position), bin/team start, bin/lead-start and bin/role run are denied, and so are end-session and team resolve (only the control room resolves and ends sessions). bin/lead-start drops the draft-PR allow and the bin/land allows that its recipe (--team) does not grant.",
   "env": {
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
     "COMPOSE_PROJECT_NAME": "{{COMPOSE_PROJECT_NAME}}",
@@ -24,7 +24,7 @@
       "Bash(*busybody team start*)",
       "Bash(*busybody land*--no-checks*)",
       "Bash(*end-session*)",
-      "Bash(*team resolve*--close*)",
+      "Bash(*team resolve*)",
       "Bash(git push * main)",
       "Bash(git push * main *)",
       "Bash(git push *:main)",
