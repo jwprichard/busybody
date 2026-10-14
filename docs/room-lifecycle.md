@@ -107,7 +107,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
 - `teams/<name>/` for the dev team, MAD, refine, visual-poc and research (`busybody team check` validates them).
 - `busybody rooms` and the office show each room's recipe and current phase (the `Phase:` line in its minutes).
 - `busybody team start` (opens a recipe's room through the lead or role launcher), `busybody team powers` (the
-  powers text in the launch brief) and `busybody team resolve` (the mechanical done check; on a pass it posts the `RECORD` and closes the issue).
+  powers text in the launch brief) and `busybody team resolve` (the mechanical done check; on a pass it posts the `RECORD` and closes the issue; denied in rooms, only the control room runs it).
 - CLAUDE.md: close at merge for now.
 
 **Deferred:** prod-evidence gating at close (rooms close at merge for now; `busybody status` still tracks
