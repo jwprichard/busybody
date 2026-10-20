@@ -615,7 +615,7 @@ def self_test():
                       BUSYBODY_AGENTS_JSON=os.path.join(fx, "agents.json"))
     expect("--close ends the room's own process through the agents pid map", resolve(31, "--close"), 0, "claude stop room-r: No job matching room-r\nroom-r: ended pid 4194001 (SIGTERM)")
     json.dump([{"name": "room-r", "pid": None}], open(os.path.join(fx, "agents.json"), "w"))
-    expect("--close fails loudly when a listed session cannot be ended", resolve(31, "--close"), 3, "listed by `claude agents` but no claude process could be matched")
+    expect("--close treats a listed session with no process as stopped", resolve(31, "--close"), 0, "nothing to end, treated as stopped")
     expect("without --close nothing is stopped", resolve(31), 0, "PASS pr-merged on #31: https://github.com/acme-co/r1/pull/5 is merged")
     for k in ("TEAM_CLAUDE", "BUSYBODY_PS_FILE", "BUSYBODY_NO_SIGNAL", "BUSYBODY_AGENTS_JSON"):
         os.environ.pop(k, None)

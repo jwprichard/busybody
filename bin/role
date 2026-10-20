@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.join(HERE, "bin", "lib"))
 from officeroot import invoked_root, workspace_root, bb_env, selftest_reexec  # noqa: E402
 selftest_reexec(ENGINE_ROOT)
 import officeconfig  # noqa: E402
+import sessions  # noqa: E402
 from tracker import Tracker  # noqa: E402
 WS = bb_env(None, "ROLE_WS", "SCH_ROLE_WS") or workspace_root(ENGINE_ROOT, invoked=invoked_root())   # BUSYBODY_ROLE_WS is a test hook
 import costlib  # noqa: E402
@@ -1285,7 +1286,7 @@ def cmd_run(argv):
         commit_candidates(name)
     if pending(name):
         die(f"{name} has a memory diff waiting for review: accept or reject it first (bin/role diff {name})")
-    live = [a for a in role_sessions(name) if a.get("state") not in ("done", "failed", "stopped", "completed")]
+    live = [a for a in role_sessions(name) if sessions.is_live(a)]
     if live:
         die(f"{name} already has a running session ({live[0].get('name')}): one pass at a time, or its memory diffs collide")
     issue = cfg.get("issue")
@@ -1368,7 +1369,7 @@ def self_test():
         ws = os.path.join(tmp, "ws")
         for d in ("bin/lib", "templates"):
             os.makedirs(os.path.join(ws, "engine", d))
-        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py", "bin/lib/kitlib.py", "bin/lib/deskskills.py",
+        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py", "bin/lib/kitlib.py", "bin/lib/deskskills.py", "bin/lib/sessions.py",
                   "templates/role-charter.md", "templates/prices.json", "templates/role-brief.md", "templates/role-settings.json",
                   "templates/room-settings.json"):
             shutil.copy2(os.path.join(HERE, f), os.path.join(ws, "engine", f))
@@ -1512,10 +1513,19 @@ def self_test():
         expect("run refuses while a memory diff waits", role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0)
         sh("git", "checkout", "--", MEM)
         busy = os.path.join(tmp, "busy.json")
-        json.dump([{"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws", "state": "busy"}], open(busy, "w"))
-        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
-                           env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=busy), capture_output=True, text=True)
-        expect("run refuses while a pass is running", r.returncode != 0 and "already has a running session" in r.stderr)
+        ps = os.path.join(tmp, "ps.jsonl")
+        with open(ps, "w") as f:
+            f.write(json.dumps({"pid": 7001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"]}) + "\n")
+
+        def run_with(agents):
+            json.dump(agents, open(busy, "w"))
+            return subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
+                                  env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=busy, BUSYBODY_PS_FILE=ps), capture_output=True, text=True)
+        old = {"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws"}
+        r = run_with([dict(old, state="busy", pid=7001)])
+        expect("run refuses while a pass is running (a live process behind it)", r.returncode != 0 and "already has a running session" in r.stderr)
+        r = run_with([dict(old, state="blocked")])
+        expect("a pid-less blocked session is not running: run is not refused", r.returncode == 0)
         expect("run needs a controller", role("run", "test-role", "x", "--dry-run").returncode != 0)
         expect("run refuses a disabled role", (role("disable", "test-role", "t").returncode == 0
                and role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0

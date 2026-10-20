@@ -306,9 +306,9 @@ def build_roles(role_doc):
 
 
 def active_session(agents, role):
-    """The role's running session (`role-<role>-*`, not finished), newest first, or None."""
-    live = [a for a in agents if (a.get("name") or "").startswith(f"role-{role}-")
-            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
+    """The role's running session (`role-<role>-*`, a live process behind it), newest first, or None."""
+    table = sessions.processes()
+    live = [a for a in agents if (a.get("name") or "").startswith(f"role-{role}-") and sessions.is_live(a, table)]
     return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
 
 
@@ -320,8 +320,8 @@ def pass_slug(task):
 def pass_session(agents, role, task):
     """A pass issue's running session: `role-<role>-<slug>[-n]` from its title, not finished, or None."""
     slug = f"role-{role}-{pass_slug(task)}"
-    live = [a for a in agents if re.fullmatch(re.escape(slug) + r"(-\d+)?", a.get("name") or "")
-            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
+    table = sessions.processes()
+    live = [a for a in agents if re.fullmatch(re.escape(slug) + r"(-\d+)?", a.get("name") or "") and sessions.is_live(a, table)]
     return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
 
 
@@ -569,8 +569,11 @@ def self_test():
     load = lambda n: json.load(open(os.path.join(d, n)))
     now = parse_ts("2026-10-06T03:00:00Z")
     status_text = open(os.path.join(d, "status.txt")).read()
+    os.environ["BUSYBODY_PS_FILE"] = os.path.join(d, "ps.jsonl")   # the process table: only pid 7001 (the scribe pass) is running
     got = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, load("roles.json"),
                 None, load("role-issues.json"), load("pass-issues.json"))
+    ghost = active_session([a for a in load("agents.json") if a["name"] == "role-scribe-ghost"], "scribe")
+    os.environ.pop("BUSYBODY_PS_FILE")
     none = build([], [], {}, "", now, None, "bin/role status failed: boom")
     by = {r["name"]: r for r in got["rooms"]}
     alpha, beta = by.get("room-alpha"), by.get("room-beta")
@@ -610,6 +613,8 @@ def self_test():
          [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"]) for s in got["role_sessions"]]
          == [("role-scribe-tidy-notes", "busy", "sess-scribe")]
          and got["role_sessions"][0]["issue"] == 95 and none["role_sessions"] == []),
+        ("a pid-less blocked role session is not live: not listed, not the active session",
+         "role-scribe-ghost" not in [s["name"] for s in got["role_sessions"]] and ghost is None),
         ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1}),
         ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
          and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
