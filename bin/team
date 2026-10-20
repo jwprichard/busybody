@@ -13,8 +13,9 @@
   bin/team resolve <initiative> [--check NAME] [--room NAME] [--close] [--no-close]
                             run the recipe's done check (or NAME) against the issue: PASS / FAIL with the evidence it found.
                             --room NAME is needed for an issue with no Room block (a staff pass): only a DONE minute whose who is
-                            exactly that name counts, and an old-style `DONE:` never does. A `--room role-…` (a role pass on the initiative) is used even when the issue
-                            has a Room block, and its resolve never closes the initiative. Exit 0 pass, 1 fail, 2 cannot decide.
+                            exactly that name counts, and an old-style `DONE:` never does. A `--room role-…` (a role pass on an initiative) is used even when the issue
+                            has a Room block, and its resolve leaves that initiative open; only a legacy pass issue (no Room block, titled
+                            `<role>: <task>`, labelled `refine` or `<role>-pass`) is closed, with its RECORD, as before. Exit 0 pass, 1 fail, 2 cannot decide.
                             After a PASS it posts a `**RECORD**` minute (the check and its evidence) and closes the issue as completed, through
                             `gh issue close` and, if that errors (Projects classic), `gh api`. It never closes on FAIL/UNDECIDED, an issue
                             labelled `project`, or one with open sub-issues (it says why); an already-closed issue passes with no second minute.
@@ -567,10 +568,10 @@ def self_test():
                       TEAM_REPOS_DIR=repos, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
     appr = f"https://github.com/{REPO}/issues/9#issuecomment-1234"
 
-    def issue(n, branch="landed-b", team="dev-team", comments=(), room=True, who="room-r", repo="r1", state="OPEN", labels=()):
+    def issue(n, branch="landed-b", team="dev-team", comments=(), room=True, who="room-r", repo="r1", state="OPEN", labels=(), title="T"):
         body = "Goal\n\n## Room\n- room: room-r\n- team: %s\n- repo: %s\n- branch: %s\n" % (team, repo, branch) if room else "Goal"
         cs = [{"body": c.replace("WHO", who), "url": f"https://x/c{i}"} for i, c in enumerate(comments)]
-        json.dump({"title": "T", "body": body, "comments": cs, "state": state, "labels": [{"name": x} for x in labels]},
+        json.dump({"title": title, "body": body, "comments": cs, "state": state, "labels": [{"name": x} for x in labels]},
                   open(os.path.join(fx, f"issue-{n}.json"), "w"))
 
     def resolve(n, *a):
@@ -645,6 +646,12 @@ def self_test():
            resolve(80, "--check", "verdict-posted", "--room", "role-x-pass"), 0, "stays open")
     if "issue close 80 " in open(glog).read() or "state=closed" in open(glog).read().split("issue view 80")[-1]:
         bad.append("resolve of a role pass closed the initiative")
+    issue(81, team="mad", room=False, title="scribe: tidy notes", labels=("scribe-pass",), who="role-scribe-tidy",
+          comments=["**DONE** · WHO · #81\nVerdict: legacy pass issue\n"])
+    expect("a legacy pass issue (no Room block, `<role>: <task>`, pass label) is closed with its RECORD as before",
+           resolve(81, "--check", "verdict-posted", "--room", "role-scribe-tidy"), 0, "#81 closed as completed (RECORD minute posted)")
+    issue(82, team="mad", room=False, title="Some initiative", who="role-scribe-tidy", comments=["**DONE** · WHO · #82\nVerdict: not a pass issue\n"])
+    expect("an issue not recognised as a pass issue stays open", resolve(82, "--check", "verdict-posted", "--room", "role-scribe-tidy"), 0, "stays open")
     issue(49, team="mad", room=False, comments=["**DONE** · WHO · #49\nVerdict: pass session\n"])
     expect("no Room block: DONE not trusted without --room", resolve(49, "--check", "verdict-posted"), 2, "pass --room NAME")
     expect("no Room block: --room names the session", resolve(49, "--check", "verdict-posted", "--room", "room-r"), 0, "PASS verdict-posted")
@@ -1255,6 +1262,10 @@ def cmd_resolve(argv, root=None):
         comments = issue.get("comments") or []
         # a role pass (`--room role-…`) resolves the pass, not the initiative: its DONE is found even when the issue has a Room block
         is_pass = bool(room_opt and room_opt.startswith("role-"))
+        # a legacy pass issue (no Room block, titled `<role>: <task>`, labelled `refine` or `<role>-pass`) is the pass's own issue: it closes as before
+        pm = re.match(r"^([a-z][a-z0-9-]*): \S", issue.get("title") or "")
+        labels = {(lb.get("name") if isinstance(lb, dict) else lb) for lb in issue.get("labels") or []}
+        legacy_pass = bool(is_pass and not room and pm and room_opt.startswith(f"role-{pm.group(1)}-") and ({"refine", f"{pm.group(1)}-pass"} & labels))
         name = room_opt if is_pass else (room.get("room") or room_opt)   # otherwise the Room block wins: --room only names a pass session when there is no block
         ctx = {"room": room, "room_name": name, "done": done_minute(comments, name), "comments": comments}
         ok, evidence = RESOLVERS[check](ctx)
@@ -1262,7 +1273,7 @@ def cmd_resolve(argv, root=None):
         print(f"UNDECIDED {check or '?'} on #{n}: {e}")
         return 2
     print(f"{'PASS' if ok else 'FAIL'} {check} on #{n}: {evidence}")
-    if ok and is_pass:
+    if ok and is_pass and not legacy_pass:
         print(f"#{n} stays open: {name} is a pass on this initiative, not the initiative's room")
     elif ok and not no_close and not close_issue(n, issue, check, evidence):
         return 3   # the check passed but the issue could not be closed: fail loudly
