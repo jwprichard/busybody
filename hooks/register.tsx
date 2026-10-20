@@ -1,8 +1,8 @@
 // office mod: the task tracker inside Claude Code.
 //
 //   /office            opens the pane: one row per open initiative (the name links
-//                      to its issue) with its stage, an owner marker, its room and
-//                      age, most complete stage first; then the owner's sticky
+//                      to its issue) as a one-line table: stage, owner flag, name, room, age
+//                      (columns sized to the pane, never wrapping), most complete first; then the sticky
 //                      notes and memory reviews, and a Start room form
 //   band               🏢 N tasks · M need you
 //   refresh            $.clock every 120 s runs `bin/rooms --json` (no model)
@@ -76,8 +76,13 @@ import {
   nameHash,
   parseOfficeDoc,
   stageTone,
+  fitName,
+  trackerCols,
+  trackerHeader,
+  trackerRow,
   trackerHeadline,
   workspaceCandidates,
+  type TrackerCols,
 } from './office/parse'
 const PANE = 'office'
 const REFRESH_MS = 120_000
@@ -788,7 +793,7 @@ function drawReview(
   )
 }
 
-/** Small per-row buttons for a task whose worker is a project room; other rows just link to the issue. */
+/** Small buttons under a needs-you row whose worker is a project room (attach sits on the row itself). */
 function drawRowButtons(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | undefined): RenderElement {
   const { Box, Button } = kit
   const id = nameHash(room.name).toString(36)
@@ -801,7 +806,6 @@ function drawRowButtons(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | 
     <Box key={`btns-${id}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
       {btn('stop', 'stop', isMissing)}
       {btn('resume', 'resume', !isMissing || room.capped)}
-      {btn('attach', isMissing ? 'open' : 'attach')}
       {btn('issue', `#${room.issue}`)}
       {btn('pr', prLabel, pr !== undefined && pr.pr === null)}
     </Box>
@@ -812,29 +816,37 @@ function drawTaskRow(
   kit: Kit,
   $: $T,
   t: OfficeTask,
-  v: { stages: string[]; room: OfficeRoom | undefined; pr: OfficePrLookup | undefined; notice: string | null },
+  v: { stages: string[]; cols: TrackerCols; room: OfficeRoom | undefined; pr: OfficePrLookup | undefined; notice: string | null },
 ): RenderElement {
-  const { Box, Text, Link } = kit
+  const { Box, Text, Link, Button } = kit
   const tone = stageTone(t.stage, v.stages)
   const stageColor = tone === 'done' ? C.ok : tone === 'parked' ? C.dim : C.info
+  const r = trackerRow(t, v.cols)
+  const gap = ' '.repeat(v.cols.gap)
+  const id = v.room === undefined ? '' : nameHash(v.room.name).toString(36)
+  const nameCells = [...fitName(t.name, v.cols.name)].length
   return (
     <Box key={`task-${t.number}`} flexDirection="column">
-      <Box key={`task-row-${t.number}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
+      <Box key={`task-row-${t.number}`} flexDirection="row">
         <Text wrap="truncate-end">
-          <Text color={C.warn} bold>{t.needsYou ? '◆ ' : '  '}</Text>
+          <Text color={stageColor} bold>{r.stage}</Text>
+          <Text>{gap}</Text>
+          <Text color={C.warn} bold>{r.flag}</Text>
+          <Text>{gap}</Text>
           {t.url !== '' ? (
-            <Link key={`task-link-${t.number}`} href={t.url} label={t.name} />
+            <Link key={`task-link-${t.number}`} href={t.url} label={fitName(t.name, v.cols.name)} />
           ) : (
-            <Text bold={t.needsYou} dimColor={tone === 'parked'}>{t.name}</Text>
+            <Text bold={t.needsYou} dimColor={tone === 'parked'}>{fitName(t.name, v.cols.name)}</Text>
           )}
+          <Text>{' '.repeat(Math.max(0, v.cols.name - nameCells))}</Text>
+          <Text color={C.dim}>{`${gap}${r.who}${v.cols.who > 0 ? gap : ''}${r.age}`}</Text>
         </Text>
-        <Text wrap="truncate-end">
-          <Text color={stageColor} bold>{t.stage}</Text>
-          {t.needsYou ? <Text color={C.warn}>{` · needs you: ${t.reason}`}</Text> : null}
-          <Text color={C.dim}>{` · ${t.worker === null ? 'no room' : `${t.worker}${t.working ? ' (working)' : ''}`} · ${t.ageS === null ? '?' : formatAge(t.ageS)}`}</Text>
-        </Text>
-        {v.room === undefined ? null : drawRowButtons(kit, $, v.room, v.pr)}
+        {v.room === undefined ? null : (
+          <Button key={`attach-${id}`} label={v.room.lead.status === 'missing' ? 'open' : 'attach'} onPress={() => onRoomAction($, 'attach', v.room!.name, kit.surface)} />
+        )}
       </Box>
+      {t.needsYou ? <Text color={C.warn} wrap="truncate-end">{`  ⚑ needs you: ${t.reason}`}</Text> : null}
+      {t.needsYou && v.room !== undefined ? drawRowButtons(kit, $, v.room, v.pr) : null}
       {t.stageWarning ? <Text color={C.warn} wrap="truncate-end">{`  ⚠ ${t.stageWarning}`}</Text> : null}
       {v.notice ? <Text color={C.dim} wrap="truncate-end">{`  ↳ ${v.notice}`}</Text> : null}
     </Box>
@@ -844,22 +856,24 @@ function drawTaskRow(
 function drawTracker(
   kit: Kit,
   $: $T,
-  v: { doc: OfficeDoc | null; prs: Record<string, OfficePrLookup>; notices: Record<string, string> },
+  v: { doc: OfficeDoc | null; prs: Record<string, OfficePrLookup>; notices: Record<string, string>; width: number },
 ): RenderElement {
   const { Box, Text } = kit
   const tasks = v.doc?.tasks ?? []
+  const cols = trackerCols(v.width, v.doc?.stages ?? [])
   return (
     <Box key="tracker" flexDirection="column">
-      <Text>
-        <Text color={C.accent} bold>{'TASKS'}</Text>
-        <Text color={C.dim}>{'  '}</Text>
+      <Text wrap="truncate-end">
+        <Text color={C.accent} bold>{'🏢 Office'}</Text>
+        <Text color={C.dim}>{' — '}</Text>
         <Text color={(v.doc?.totals.needsYou ?? 0) > 0 ? C.warn : C.ok} bold>{trackerHeadline(tasks)}</Text>
       </Text>
-      {tasks.length === 0 ? <Text color={C.dim}>No open initiative. ＋ Start room opens one.</Text> : null}
+      {tasks.length === 0 ? <Text color={C.dim}>No open initiative. ＋ Start room opens one.</Text> : <Text color={C.dim} wrap="truncate-end">{trackerHeader(cols)}</Text>}
       {tasks.map(t => {
         const room = t.worker === null ? undefined : v.doc?.rooms.find(r => r.name === t.worker)
         return drawTaskRow(kit, $, t, {
           stages: v.doc?.stages ?? [],
+          cols,
           room,
           pr: room ? v.prs[room.name] : undefined,
           notice: room ? (v.notices[room.name] ?? null) : null,
@@ -1082,7 +1096,7 @@ export const register: Register = on => {
     const header = drawHeader(kit, $, { doc, refreshState, now })
     const confirmBox = confirm ? drawConfirm(kit, $, confirm) : null
     const inbox = drawInbox(kit, $, { doc, drafts, sends, width, now, ws, roleBatches, roleItems, roleRatings, roleRuns })
-    const tracker = drawTracker(kit, $, { doc, prs, notices })
+    const tracker = drawTracker(kit, $, { doc, prs, notices, width })
     const form$ = showForm ? drawForm(kit, $, { form, notice: notices.start ?? null, width, workspace: doc?.workspace ?? null }) : null
     const console$ = output ? drawOutput(kit, $, output, e.surface) : null
 

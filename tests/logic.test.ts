@@ -18,6 +18,12 @@ import {
   bandAlerts,
   bandText,
   stageTone,
+  fitName,
+  padTo,
+  trackerCols,
+  trackerHeader,
+  trackerRow,
+  whoCell,
   trackerHeadline,
   formatAge,
   parseOfficeDoc,
@@ -451,5 +457,69 @@ describe('roles', () => {
     expect(roleFailureNote('accept', 3, '', '')).toBe('bin/role accept refused: exit 3')
     expect(roleSuccessNote('accept', 'role(scribe): use 2\n')).toBe('accepted: role(scribe): use 2')
     expect(roleSuccessNote('reject', '')).toBe('rejected')
+  })
+})
+
+describe('tracker table', () => {
+  const stages = ['complete', 'awaiting-uat', 'ci-deploy', 'review', 'development', 'design', 'planning', 'research', 'idea', 'parked']
+  const task = (over: Record<string, unknown> = {}) => ({
+    number: 1, name: 'Harden the flow from idea to confirmed delivery (58-issue)', url: '', stage: 'development', stageWarning: null,
+    needsYou: false, reason: '', worker: 'room-role-engine', working: true, ageS: 900, ...over,
+  }) as Parameters<typeof trackerRow>[0]
+  const rowLen = (t: Parameters<typeof trackerRow>[0], c: ReturnType<typeof trackerCols>) => {
+    const r = trackerRow(t, c)
+    return [r.stage, r.flag, r.name, r.who, r.age].filter(x => x !== '' || false).join(' '.repeat(c.gap)).length
+  }
+
+  test('columns fill the pane: fixed STAGE/flag/AGE, INITIATIVE gets most of the rest', () => {
+    for (const w of [60, 80, 120, 200]) {
+      const c = trackerCols(w, stages)
+      expect(c.stage).toBe(12)
+      expect(c.name).toBeGreaterThan(c.who)
+      expect(c.stage + c.gap * 4 + 1 + c.name + c.who + c.age + 1 + c.act).toBeLessThanOrEqual(Math.max(w, 52))
+    }
+    expect(trackerCols(120, stages).name).toBeGreaterThan(trackerCols(80, stages).name)
+  })
+
+  test('every row and the header are one line of the same width, at every pane width', () => {
+    for (const w of [60, 80, 120, 200]) {
+      const c = trackerCols(w, stages)
+      const want = rowLen(task({ name: 'x (1-issue)' }), c)
+      for (const t of [task(), task({ stage: 'awaiting-uat', needsYou: true, worker: null, working: false, ageS: null }), task({ name: 'Short (7-issue)' })]) {
+        expect(rowLen(t, c)).toBe(want)
+        expect(trackerRow(t, c).stage).toHaveLength(c.stage)
+      }
+      expect(trackerHeader(c).startsWith('STAGE')).toBe(true)
+      expect(trackerHeader(c)).toContain('INITIATIVE')
+      expect(trackerHeader(c).length).toBeLessThanOrEqual(want)
+    }
+  })
+
+  test('fitName keeps the (N-issue) suffix and cuts the friendly part with an ellipsis', () => {
+    const name = 'Harden the flow from idea to confirmed delivery (58-issue)'
+    expect(fitName(name, 80)).toBe(name)
+    for (const max of [20, 30, 45]) {
+      const out = fitName(name, max)
+      expect([...out]).toHaveLength(max)
+      expect(out.endsWith(' (58-issue)')).toBe(true)
+      expect(out).toContain('…')
+    }
+    expect(fitName(name, 32)).toBe('Harden the flow from… (58-issue)')
+    expect(fitName('No tag at all here', 8)).toBe('No tag …')
+    expect(fitName(name, 8)).toBe('(58-issu')   // too narrow for any friendly text: the tag alone, cut hard
+  })
+
+  test('WHO keeps its working dot; padTo pads and cuts to exact width', () => {
+    expect(whoCell('room-a', true, 12)).toBe('room-a ●')
+    expect(whoCell('room-with-a-very-long-name', true, 12)).toBe('room-with… ●')
+    expect(whoCell(null, false, 10)).toBe('—')
+    expect(padTo('ab', 4)).toBe('ab  ')
+    expect(padTo('abcdef', 4)).toBe('abcd')
+  })
+
+  test('the flag column marks only the tasks that need the owner', () => {
+    const c = trackerCols(120, stages)
+    expect(trackerRow(task({ needsYou: true }), c).flag).toBe('⚑')
+    expect(trackerRow(task(), c).flag).toBe(' ')
   })
 })
