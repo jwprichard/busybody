@@ -8,7 +8,6 @@ import type {
   OfficeLatest,
   OfficeLeadStatus,
   OfficePrInfo,
-  OfficePose,
   OfficeRole,
   OfficeRoleSession,
   OfficeRoleStatus,
@@ -58,21 +57,6 @@ export function parseMinuteHeader(line: string): MinuteHeader | null {
   const o = OLD_HEADER.exec(line)
   if (o) return { verb: (o[1] ?? '').toUpperCase(), who: null, where: null, rest: (o[2] ?? '').trim() }
   return null
-}
-
-/** What to show after the verb: the new header's `who · where`, or the old text after the colon. */
-export function minuteSummary(latest: Pick<OfficeLatest, 'firstLine' | 'body'> & { summary?: string }): string {
-  if (latest.summary) return latest.summary
-  const h = parseMinuteHeader(latest.firstLine)
-  if (h === null) return latest.firstLine
-  if (h.rest !== '') return h.rest
-  const next = latest.body
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .slice(1)
-    .find(l => l.trim() !== '')
-  const who = [h.who, h.where].filter((x): x is string => x !== null && x !== '').join(' · ')
-  return (next ?? '').trim() !== '' ? (next ?? '').trim() : who
 }
 
 function parseLatest(v: unknown): OfficeLatest | null {
@@ -149,7 +133,6 @@ function parseRoom(v: unknown): OfficeRoom | null {
     team: str(o.team),
     phases: arr(o.phases).filter((p): p is string => typeof p === 'string'),
     phase: str(o.phase) || null,
-    watcherAlive: o.watcher_alive === true || obj(o.watcher).alive === true,
   }
 }
 
@@ -350,10 +333,6 @@ export function formatAge(seconds: number | null): string {
   return `${Math.floor(seconds / 86400)}d`
 }
 
-export function formatMoney(n: number): string {
-  return `$${n.toFixed(2)}`
-}
-
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`
 }
@@ -385,143 +364,12 @@ export function bandText(doc: OfficeDoc | null): string | null {
   return parts.join(' · ')
 }
 
-export type RoomDisplayKind = 'busy' | 'idle' | 'needs_input' | 'done' | 'capped' | 'stalled' | 'watching' | 'waiting'
-
-export type RoomDisplay = {
-  kind: RoomDisplayKind
-  /** The status words beside the head desk: `working`, `Done · awaiting merge/release`, ... */
-  label: string
-  /** Still at work, or owed work: everything but a finished room. */
-  isActive: boolean
-  /** The warning line on the desk, or null for none. */
-  warning: { text: string; tone: 'warn' | 'danger' | 'info' } | null
-}
-
-/** An idle room: `watching` with its watcher alive, `waiting` when its last minute is WAITING with none, else `idle`. */
-function idleKind(room: OfficeRoom): 'idle' | 'watching' | 'waiting' {
-  if (room.watcherAlive) return 'watching'
-  // bin/rooms room_state skips controller NOTE/RECORD/ANSWER when finding the room's own last minute; prefer it.
-  if (room.state) return room.state === 'waiting' ? 'waiting' : 'idle'
-  return room.latest?.verb === 'WAITING' ? 'waiting' : 'idle'
-}
-
-/** `dev-team · build` on a room desk: the recipe and its current phase (`?` when unknown); '' without a recipe. */
-export function recipeLabel(room: OfficeRoom): string {
-  if (room.team === '') return ''
-  return `${room.team} · ${room.phase ?? '?'}`
-}
-
-/** The desk pose for a room: the display kind where it has a pose of its own, else the lead's status. */
-export function roomPose(room: OfficeRoom): OfficePose {
-  const k = roomDisplay(room).kind
-  return k === 'watching' || k === 'waiting' ? k : room.lead.status
-}
-
-/**
- * What a room is, from the head desk's status and its latest report: a room lead that
- * is gone after a DONE report is a finished room awaiting merge/release, not
- * a stalled one. Only a missing head desk WITHOUT a DONE warns as stalled.
- */
-export function roomDisplay(room: OfficeRoom): RoomDisplay {
-  const isGone = room.lead.status === 'missing'
-  const saidDone = room.latest?.verb === 'DONE'
-  if (isGone && saidDone) {
-    return { kind: 'done', label: 'Done · awaiting merge/release', isActive: false, warning: null }
-  }
-  if (room.capped) {
-    return {
-      kind: 'capped',
-      label: isGone ? 'capped · stopped' : 'capped',
-      isActive: true,
-      warning: { text: '⛔ CAPPED · hard cap hit, room stopped. Resuming needs a new cap from you.', tone: 'danger' },
-    }
-  }
-  if (isGone && !room.watcherAlive && room.latest?.verb !== 'WAITING') {
-    return {
-      kind: 'stalled',
-      label: 'not running',
-      isActive: true,
-      warning: { text: '○ STALLED? · the room lead is gone with no DONE report. Read the minutes (issue), then Resume.', tone: 'warn' },
-    }
-  }
-  if (room.lead.status === 'needs_input') {
-    return {
-      kind: 'needs_input',
-      label: 'needs input',
-      isActive: true,
-      warning: { text: '✋ NEEDS INPUT · the room lead is waiting on a prompt. Attach to see it.', tone: 'warn' },
-    }
-  }
-  const kind: RoomDisplayKind = room.lead.status === 'busy' ? 'busy' : idleKind(room)
-  const label = kind === 'watching' || kind === 'waiting' ? kind : saidDone ? `${kind === 'busy' ? 'working' : 'idle'} · reported DONE` : kind === 'busy' ? 'working' : 'idle'
-  if (room.cost && room.cost.soft > 0 && room.cost.today >= room.cost.soft) {
-    return {
-      kind,
-      label,
-      isActive: true,
-      warning: { text: `⚠ over the soft cap (${formatMoney(room.cost.soft)}): expect a sticky note.`, tone: 'warn' },
-    }
-  }
-  if (room.openDecisions > 0) {
-    return {
-      kind,
-      label,
-      isActive: true,
-      warning: { text: `◆ ${room.openDecisions} sticky note${room.openDecisions === 1 ? "" : "s"} on your whiteboard`, tone: 'info' },
-    }
-  }
-  return { kind, label, isActive: true, warning: null }
-}
-
-/** Extra alerts the band appends: rooms needing input, capped rooms. */
+/** Extra alerts the band appends: the GitHub budget warning. */
 export function bandAlerts(doc: OfficeDoc): string[] {
-  const needs = doc.rooms.filter(r => r.lead.status === 'needs_input').length
-  const capped = doc.rooms.filter(r => r.capped).length
-  const out: string[] = []
-  if (needs > 0) out.push(`✋ ${needs} needs input`)
-  if (capped > 0) out.push(`⛔ ${capped} capped`)
   const gh = doc.ghUsage
-  if (gh !== null && gh.limit > 0 && gh.hourPointsEst >= gh.limit * 0.7) {
-    out.push(`⚠ GitHub ${Math.round((gh.hourPointsEst / gh.limit) * 100)}% of the hour's GraphQL (est.)`)
-  }
-  return out
-}
-
-export type BarSegment = { text: string; tone: 'ok' | 'warn' | 'over' | 'empty' | 'soft' | 'hard' }
-
-/**
- * A spend bar scaled to the hard cap: filled cells for today's spend, a soft
- * cap marker `│` where the soft cap falls, and a hard cap end `┃`.
- * `width` counts the inside cells (the hard marker is one more).
- */
-export function spendBar(today: number, soft: number, hard: number, width: number): BarSegment[] {
-  const w = Math.max(4, Math.floor(width))
-  const scale = hard > 0 ? hard : Math.max(soft, today, 1)
-  const filled = Math.min(w, Math.round((Math.max(0, today) / scale) * w))
-  const softAt = soft > 0 && soft < scale ? Math.min(w - 1, Math.round((soft / scale) * w)) : -1
-  const tone: BarSegment['tone'] = today >= hard && hard > 0 ? 'over' : soft > 0 && today >= soft ? 'warn' : 'ok'
-  const segs: BarSegment[] = []
-  const push = (text: string, t: BarSegment['tone']) => {
-    const last = segs[segs.length - 1]
-    if (last && last.tone === t) last.text += text
-    else segs.push({ text, tone: t })
-  }
-  for (let i = 0; i < w; i++) {
-    if (i === softAt) push(i < filled ? '▓' : '│', 'soft')
-    else if (i < filled) push('█', tone)
-    else push('░', 'empty')
-  }
-  push('┃', 'hard')
-  return segs
-}
-
-export type Layout = 'wide' | 'normal' | 'compact'
-
-/** Compact for narrow terminals or 5+ rooms; two rooms a row when wide. */
-export function chooseLayout(columns: number, roomCount: number): Layout {
-  if (columns < 72 || roomCount >= 5) return 'compact'
-  if (columns >= 124 && roomCount >= 2) return 'wide'
-  return 'normal'
+  return gh !== null && gh.limit > 0 && gh.hourPointsEst >= gh.limit * 0.7
+    ? [`⚠ GitHub ${Math.round((gh.hourPointsEst / gh.limit) * 100)}% of the hour's GraphQL (est.)`]
+    : []
 }
 
 /** Where to look for the workspace (the folder holding bin/rooms): the

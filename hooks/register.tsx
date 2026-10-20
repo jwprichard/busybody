@@ -150,27 +150,6 @@ function setOutput($: $T, out: OfficeOutput | null) {
 
 // ---- refresh: bin/rooms --json through $.process, never the model ---------
 
-/**
- * A room's watcher is alive when `<worktree>/.claude/watch.json` names a running pid.
- * Read-only: one `sh` per room prints `alive` and nothing else counts.
- */
-const WATCH_PROBE =
-  'f="$1/.claude/watch.json"; [ -f "$f" ] || exit 0; ' +
-  'p=$(tr -d " \\n" < "$f" | sed -n \'s/.*"pid":\\([0-9][0-9]*\\).*/\\1/p\'); ' +
-  '[ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo alive; exit 0'
-
-async function probeWatchers($: $T, rooms: OfficeRoom[]): Promise<void> {
-  for (const room of rooms) {
-    if (room.watcherAlive || room.worktree === '') continue
-    try {
-      const res = await $.process.run(['sh', '-c', WATCH_PROBE, 'sh', room.worktree], { timeoutMs: 5_000 })
-      if (res.exitCode === 0 && res.stdout.trim() === 'alive') room.watcherAlive = true
-    } catch {
-      // unreadable: no watcher
-    }
-  }
-}
-
 // `fresh` (after an answer, a command or the Refresh button) passes --fresh: skip bin/rooms' 60 s document cache so the change shows now.
 async function refresh($: $T, fresh = false): Promise<void> {
   if (isRefreshing) return
@@ -187,7 +166,6 @@ async function refresh($: $T, fresh = false): Promise<void> {
         : ({ ok: false, error: firstLine(res.stderr) || `bin/rooms exited ${res.exitCode}` } as const)
     const t1 = await $.clock.now()
     if (parsed.ok) {
-      await probeWatchers($, parsed.doc.rooms)
       await update($, docA, () => parsed.doc)
       const first = parsed.doc.workspace?.repos[0]?.name
       if (first !== undefined) await update($, formA, f => (f.repo === '' ? { ...f, repo: first } : f))

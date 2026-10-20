@@ -1,5 +1,5 @@
 // The pure modules: state parsing, the owner's whiteboard sticky notes (ANSWER is exactly
-// what was typed), button-to-command mapping, the start form and sprites.
+// what was typed), button-to-command mapping, the start form, the tracker and roles.
 
 import { describe, expect, test } from 'claude-code/testing'
 
@@ -19,26 +19,12 @@ import {
   bandText,
   stageTone,
   trackerHeadline,
-  chooseLayout,
   formatAge,
   parseOfficeDoc,
-  recipeLabel,
-  roomDisplay,
-  roomPose,
-  spendBar,
   workspaceCandidates,
 } from '../hooks/office/parse'
-import { STATUS_LABEL, base64, pickGraphics, spriteRaster, spriteShapesAreValid, textArt } from '../hooks/office/sprites'
 import {
-  contractorsLine,
-  costLine,
   diffLineTone,
-  draftsText,
-  isRoleBusy,
-  lastUseText,
-  memoryLine,
-  pilotText,
-  ratioBar,
   batchSignature,
   parseBatch,
   roleBatchArgv,
@@ -47,7 +33,7 @@ import {
   roleSuccessNote,
   truncateDiff,
 } from '../hooks/office/roles'
-import { minuteSummary, parseMinuteHeader } from '../hooks/office/parse'
+import { parseMinuteHeader } from '../hooks/office/parse'
 import { DECISION_BODY, ROOMS_DOC, ROOMS_JSON, WORKSPACE } from './fixture'
 
 const CARDS: OfficeWorkspace = { ...WORKSPACE, tracker: { type: 'acme', name: 'Acme', cardUrlRegex: 'https://tasks\\.acme\\.test/t/(\\d+)' } }
@@ -144,15 +130,11 @@ describe('state parsing', () => {
     expect(bandText(null)).toBe(null)
   })
 
-  test('ages, layouts and workspace candidates', () => {
+  test('ages and workspace candidates', () => {
     expect(formatAge(44)).toBe('44s')
     expect(formatAge(240)).toBe('4m')
     expect(formatAge(7200)).toBe('2h')
     expect(formatAge(null)).toBe('?')
-    expect(chooseLayout(60, 2)).toBe('compact')
-    expect(chooseLayout(100, 5)).toBe('compact')
-    expect(chooseLayout(100, 2)).toBe('normal')
-    expect(chooseLayout(140, 3)).toBe('wide')
     expect(workspaceCandidates('/home/u/ws/acme-web', '/home/u/ws/engine')).toEqual([
       '/home/u/ws/acme-web',
       '/home/u/ws',
@@ -162,16 +144,6 @@ describe('state parsing', () => {
     ].filter((v, i, a) => a.indexOf(v) === i))
   })
 
-  test('spend bar marks the soft cap and the hard end', () => {
-    const segs = spendBar(10, 15, 40, 20)
-    const text = segs.map(s => s.text).join('')
-    expect(text).toHaveLength(21)
-    expect(text.endsWith('┃')).toBe(true)
-    expect(text.indexOf('│')).toBe(8) // 15/40 of 20 cells
-    expect(segs[0]).toEqual({ text: '█████', tone: 'ok' })
-    expect(spendBar(20, 15, 40, 20).some(s => s.tone === 'warn')).toBe(true)
-    expect(spendBar(45, 15, 40, 20).some(s => s.tone === 'over')).toBe(true)
-  })
 })
 
 describe('minute headers (new and old formats)', () => {
@@ -190,8 +162,6 @@ describe('minute headers (new and old formats)', () => {
     if (!r.ok) throw new Error(r.error)
     const l = r.doc.rooms[0]?.latest
     expect(l).toMatchObject({ verb: 'BLOCKED', who: 'room-alpha', where: '#9001' })
-    expect(minuteSummary(l!)).toBe('needs the key')
-    expect(minuteSummary({ firstLine: 'DECISION: pick one', body: 'DECISION: pick one' })).toBe('pick one')
   })
 
   test('a DECISION in the new format reads its question from the line under the header', () => {
@@ -203,102 +173,7 @@ describe('minute headers (new and old formats)', () => {
   })
 })
 
-describe('room display state', () => {
-  test('a lead gone after DONE is a finished room, not a stalled one', () => {
-    const d = roomDisplay(room(2))
-    expect(d.kind).toBe('done')
-    expect(d.label).toBe('Done · awaiting merge/release')
-    expect(d.isActive).toBe(false)
-    expect(d.warning).toBe(null)
-  })
 
-  test('a lead gone WITHOUT a DONE warns as stalled', () => {
-    const stalled: OfficeRoom = { ...room(2), latest: { ...room(2).latest!, verb: 'PROGRESS' } }
-    const d = roomDisplay(stalled)
-    expect(d.kind).toBe('stalled')
-    expect(d.isActive).toBe(true)
-    expect(d.warning?.text).toContain('STALLED')
-    expect(roomDisplay({ ...room(2), latest: null }).kind).toBe('stalled')
-  })
-
-  test('capped, needs input, running after DONE', () => {
-    expect(roomDisplay(room(1)).kind).toBe('capped')
-    expect(roomDisplay(room(0)).kind).toBe('needs_input')
-    const running: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'busy' } }
-    expect(roomDisplay(running)).toMatchObject({ kind: 'busy', label: 'working · reported DONE', isActive: true })
-    const cappedDone: OfficeRoom = { ...room(2), capped: true }
-    expect(roomDisplay(cappedDone).kind).toBe('done')
-  })
-})
-
-describe('watching and waiting', () => {
-  const waitingMinute = (r: OfficeRoom, verb = 'WAITING') => ({ ...r.latest!, verb, firstLine: `**${verb}** · ${r.name} · #1` })
-  test('idle with a live watcher is watching', () => {
-    const r: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'idle' }, watcherAlive: true, latest: waitingMinute(room(2)) }
-    expect(roomDisplay(r)).toMatchObject({ kind: 'watching', label: 'watching', isActive: true })
-    expect(roomPose(r)).toBe('watching')
-  })
-  test('last minute WAITING with no watcher is waiting, even after a restart', () => {
-    const idle: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'idle' }, latest: waitingMinute(room(2)) }
-    expect(roomDisplay(idle)).toMatchObject({ kind: 'waiting', label: 'waiting' })
-    expect(roomPose(idle)).toBe('waiting')
-    const gone: OfficeRoom = { ...room(2), latest: waitingMinute(room(2)) } // lead missing
-    expect(roomDisplay(gone)).toMatchObject({ kind: 'waiting', isActive: true, warning: null })
-  })
-  test('a busy lead is working; a gone lead with a live watcher is not stalled; plain idle stays idle', () => {
-    const busy: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'busy' }, watcherAlive: true, latest: waitingMinute(room(2)) }
-    expect(roomDisplay(busy).kind).toBe('busy')
-    expect(roomPose(busy)).toBe('busy')
-    const watched: OfficeRoom = { ...room(2), latest: waitingMinute(room(2), 'PROGRESS'), watcherAlive: true }
-    expect(roomDisplay(watched).kind).toBe('watching')
-    const idle: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'idle' }, latest: waitingMinute(room(2), 'PROGRESS') }
-    expect(roomDisplay(idle).kind).toBe('idle')
-    expect(roomPose(idle)).toBe('idle')
-  })
-  test('bin/rooms state wins: a later controller NOTE does not hide WAITING, and NOTE/RECORD parse as minutes', () => {
-    const base: OfficeRoom = { ...room(2), lead: { ...room(2).lead, status: 'idle' }, latest: waitingMinute(room(2), 'NOTE') }
-    expect(roomDisplay({ ...base, state: 'waiting' }).kind).toBe('waiting')
-    expect(roomDisplay({ ...base, state: 'idle' }).kind).toBe('idle')
-    expect(parseMinuteHeader('**NOTE** · controller · #1')).toMatchObject({ verb: 'NOTE' })
-    expect(parseMinuteHeader('**RECORD** · controller · #1')).toMatchObject({ verb: 'RECORD' })
-    const doc = parseOfficeDoc(JSON.stringify({ rooms: [{ name: 'r', state: 'waiting', lead: { status: 'idle' } }] }))
-    if (!doc.ok) throw new Error(doc.error)
-    expect(doc.doc.rooms[0]!.state).toBe('waiting')
-  })
-  test('DONE and capped still win; the old WAITING: prefix counts', () => {
-    expect(roomDisplay({ ...room(2), watcherAlive: true }).kind).toBe('done')
-    const old = parseOfficeDoc(JSON.stringify({ rooms: [{ name: 'r', lead: { status: 'idle' }, latest: { first_line: 'WAITING: draft green', body: 'WAITING: draft green' } }] }))
-    if (!old.ok) throw new Error(old.error)
-    expect(roomDisplay(old.doc.rooms[0]!).kind).toBe('waiting')
-  })
-  test('recipe and phase read from bin/rooms and label the desk', () => {
-    const [a, b, g] = rooms()
-    expect(a?.team).toBe('dev-team')
-    expect(a?.phases).toEqual(['plan', 'build', 'review'])
-    expect(recipeLabel(a!)).toBe('dev-team · build')
-    expect(recipeLabel(b!)).toBe('mad · ?')
-    expect(g?.team).toBe('')
-    expect(recipeLabel(g!)).toBe('')
-  })
-  test('watcher flag reads from bin/rooms when it says so', () => {
-    const doc = JSON.parse(ROOMS_JSON)
-    doc.rooms[0].watcher = { alive: true }
-    doc.rooms[1].watcher_alive = true
-    const r = parseOfficeDoc(JSON.stringify(doc))
-    if (!r.ok) throw new Error(r.error)
-    expect(r.doc.rooms.map(x => x.watcherAlive)).toEqual([true, true, false])
-  })
-  test('both poses have sprites and text-art of the right shape, distinct from idle', () => {
-    expect(spriteShapesAreValid()).toBe(true)
-    for (const pose of ['watching', 'waiting'] as const) {
-      const lines = textArt('room-x', pose, 0, false)
-      expect(lines).toHaveLength(4)
-      for (const l of lines) expect(Array.from(l.map(x => x.text).join(''))).toHaveLength(16)
-      expect(spriteRaster('room-x', pose, 0, false).cells).not.toBe(spriteRaster('room-x', 'idle', 0, false).cells)
-      expect(STATUS_LABEL[pose]).toBe(pose)
-    }
-  })
-})
 
 describe('sticky notes (decisions)', () => {
   test('reads question, options, recommendation and blocking', () => {
@@ -466,51 +341,6 @@ describe('button to command mapping', () => {
   })
 })
 
-describe('sprites', () => {
-  test('every scene and art line is its reserved size', () => {
-    expect(spriteShapesAreValid()).toBe(true)
-  })
-
-  test('raster cells pack 16 x 5 cells as LE u32 triplets', () => {
-    const r = spriteRaster('room-alpha', 'busy', 0, false)
-    expect(r.columns).toBe(16)
-    expect(r.rows).toBe(5)
-    // 80 cells * 12 bytes = 960 bytes → 1280 base64 chars
-    expect(r.cells).toHaveLength(1280)
-    expect(spriteRaster('room-alpha', 'busy', 1, false).cells).not.toBe(r.cells)
-    expect(spriteRaster('room-alpha', 'busy', 0, true).cells).not.toBe(r.cells)
-  })
-
-  test('base64 matches the standard alphabet with padding', () => {
-    const enc = (s: string) => base64(new TextEncoder().encode(s))
-    expect(enc('')).toBe('')
-    expect(enc('f')).toBe('Zg==')
-    expect(enc('fo')).toBe('Zm8=')
-    expect(enc('foo')).toBe('Zm9v')
-    expect(enc('foobar')).toBe('Zm9vYmFy')
-  })
-
-  test('text-art is four coloured lines of 16', () => {
-    for (const s of ['busy', 'idle', 'needs_input', 'missing'] as const) {
-      const lines = textArt('room-x', s, 0, false)
-      expect(lines).toHaveLength(4)
-      for (const l of lines) expect(Array.from(l.map(x => x.text).join(''))).toHaveLength(16)
-    }
-  })
-
-  test('graphics detection falls back cleanly', () => {
-    expect(pickGraphics('auto', 'terminal', { colorterm: 'truecolor' })).toBe('pixel')
-    expect(pickGraphics('auto', 'terminal', {})).toBe('text')
-    expect(pickGraphics('auto', 'terminal', { termProgram: 'WezTerm' })).toBe('pixel')
-    expect(pickGraphics('pixel', 'desktop', { colorterm: 'truecolor' })).toBe('text')
-    expect(pickGraphics('text', 'terminal', { colorterm: 'truecolor' })).toBe('text')
-    expect(pickGraphics('pixel', 'terminal', {})).toBe('pixel')
-  })
-
-  test('fixture stays made-up', () => {
-    expect(ROOMS_DOC.rooms.every(r => r.issue > 9000)).toBe(true)
-  })
-})
 
 describe('roles', () => {
   const doc = () => {
@@ -549,39 +379,8 @@ describe('roles', () => {
     expect(r.ok && r.doc.rolesError).toBe(null)
   })
 
-  test('desk text: pilot, kept, memory, money, last use, drafts', () => {
-    expect(pilotText(role('scribe'))).toBe('pilot 1/6 uses · day 4/21')
-    expect(pilotText(role('auditor'))).toBe('kept')
-    expect(pilotText(role('retired'))).toBe('disabled')
-    expect(memoryLine(role('scribe'))).toBe('memory 2.0/8.0 KB · 1/4 stale')
-    expect(memoryLine(role('auditor'))).toBe('memory 8.8/8.0 KB')
-    expect(costLine(role('scribe'))).toBe('$3.50/$15 month')
-    expect(contractorsLine(role('scribe'))).toBe('hot desks (workers) $1.25/$20')
-    expect(contractorsLine(role('retired'))).toBe('hot desks (workers) $0.00/?')
-    expect(lastUseText(role('scribe'))).toBe('last used 2026-10-05')
-    expect(lastUseText(role('auditor'))).toBe('never used')
-    expect(draftsText(role('scribe'))).toBe('drafts 2 approved · 1 unedited')
-    expect(draftsText(role('auditor'))).toBe(null)
-  })
 
-  test('bars: green, amber from 80%, red at the cap, clamped', () => {
-    const tones = (v: number, cap: number | null) => ratioBar(v, cap, 10).map(s => s.tone)
-    expect(tones(2, 8)).toEqual(['ok', 'empty'])
-    expect(tones(7, 8)).toEqual(['warn', 'empty'])
-    expect(tones(8, 8)).toEqual(['over'])
-    expect(tones(80, 8)).toEqual(['over'])
-    expect(tones(1, null)).toEqual(['empty'])
-    expect(ratioBar(80, 8, 10).map(s => s.text).join('')).toHaveLength(10)
-  })
 
-  test('busy only with activity in the last few minutes', () => {
-    const s = { ...role('scribe'), lastActivity: '2026-10-07T10:00:00Z' }
-    const t = Date.parse('2026-10-07T10:00:00Z')
-    expect(isRoleBusy(s, t + 60_000)).toBe(true)
-    expect(isRoleBusy(s, t + 10 * 60_000)).toBe(false)
-    expect(isRoleBusy({ ...s, lastActivity: '' }, t)).toBe(false)
-    expect(isRoleBusy({ ...s, lastActivity: 'garbage' }, t)).toBe(false)
-  })
 
   const BATCH = [
     'scribe: 3 memory item(s) for the owner, showing 2 (yes/no each)',

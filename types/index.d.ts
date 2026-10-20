@@ -3,9 +3,6 @@
 
 export type OfficeLeadStatus = 'busy' | 'idle' | 'needs_input' | 'missing'
 
-/** A desk pose: the lead's status, plus the two idle-room poses (watcher alive / asleep). */
-export type OfficePose = OfficeLeadStatus | 'watching' | 'waiting'
-
 export type OfficeLatest = {
   verb: string
   /** From the new header `**TYPE** · who · where`; empty for the old `TYPE:` form. */
@@ -58,8 +55,6 @@ export type OfficeRoom = {
   /** The recipe's phases, in order ([] when unknown) and the room's current one (null when unknown). */
   phases: string[]
   phase: string | null
-  /** `.claude/watch.json` in the room worktree names a running pid (the mod probes it; bin/rooms may also say). */
-  watcherAlive: boolean
 }
 
 export type OfficeDecision = {
@@ -202,8 +197,6 @@ export type OfficePrInfo = { number: number; url: string; state: string; isDraft
 
 export type OfficePrLookup = { pr: OfficePrInfo | null; checkedAt: number; stale?: boolean }
 
-export type OfficeGraphics = 'auto' | 'pixel' | 'text'
-
 declare module 'claude-code' {
   interface PluginState {
     busybody: {
@@ -216,7 +209,6 @@ declare module 'claude-code' {
       output: OfficeOutput | null
       showForm: boolean
       form: OfficeStartForm
-      graphics: OfficeGraphics
       prs: Record<string, OfficePrLookup>
       notices: Record<string, string>
       /** `bin/role batch <role>` output, for each role with a pending memory diff. */

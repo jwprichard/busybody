@@ -1,14 +1,10 @@
-// Pure: how a standing role shows on its desk, and what the memory-review
+// Pure: what the memory-review
 // buttons run. No `$`, no I/O. The mod never decides a rating or accepts
 // anything itself: the argv is built only for a press of the person's.
 
-import type { OfficeRating, OfficeRole } from '../../types'
-import type { BarSegment } from './parse'
+import type { OfficeRating } from '../../types'
 
 export const RATINGS: readonly OfficeRating[] = ['saved-time', 'useful', 'no-value']
-
-/** A role is "at work" when its transcripts moved in the last few minutes. */
-export const ROLE_BUSY_MS = 5 * 60_000
 
 export const DIFF_SHOWN_LINES = 12
 export const NOTE_MAX_CHARS = 600
@@ -17,66 +13,6 @@ const ROLE_NAME = /^[a-z0-9][a-z0-9-]*$/
 
 export function isRating(v: string): v is OfficeRating {
   return (RATINGS as readonly string[]).includes(v)
-}
-
-export function isRoleBusy(role: OfficeRole, nowMs: number): boolean {
-  if (role.lastActivity === '') return false
-  const t = Date.parse(role.lastActivity)
-  return Number.isFinite(t) && nowMs - t >= 0 && nowMs - t <= ROLE_BUSY_MS
-}
-
-/** `pilot 1/6 uses · day 0/21`, `kept`, or `disabled`. */
-export function pilotText(role: OfficeRole): string {
-  if (role.status === 'kept') return 'kept'
-  if (role.status === 'disabled') return 'disabled'
-  if (role.pilot === null) return 'probation'
-  const p = role.pilot
-  return `pilot ${role.useCount}/${p.uses} uses · day ${p.days}/${p.weeks * 7}`
-}
-
-export function lastUseText(role: OfficeRole): string {
-  return role.lastUse === null ? 'never used' : `last used ${role.lastUse}`
-}
-
-export function draftsText(role: OfficeRole): string | null {
-  const d = role.drafts
-  return d.approved === 0 ? null : `drafts ${d.approved} approved · ${d.unedited} unedited`
-}
-
-export function formatKb(bytes: number): string {
-  return `${(bytes / 1024).toFixed(1)}`
-}
-
-/**
- * A bar of `value` against `cap`: green, amber from 80%, red at or over the
- * cap (the fill is clamped to the width). A missing or zero cap shows empty.
- */
-export function ratioBar(value: number, cap: number | null, width: number): BarSegment[] {
-  const w = Math.max(4, Math.floor(width))
-  if (cap === null || cap <= 0) return [{ text: '░'.repeat(w), tone: 'empty' }]
-  const ratio = Math.max(0, value) / cap
-  const filled = Math.min(w, Math.round(ratio * w))
-  const tone: BarSegment['tone'] = ratio >= 1 ? 'over' : ratio >= 0.8 ? 'warn' : 'ok'
-  const segs: BarSegment[] = []
-  if (filled > 0) segs.push({ text: '█'.repeat(filled), tone })
-  if (filled < w) segs.push({ text: '░'.repeat(w - filled), tone: 'empty' })
-  return segs
-}
-
-export function memoryLine(role: OfficeRole): string {
-  const m = role.memory
-  const stale = m.staleLines > 0 ? ` · ${m.staleLines}/${m.datedLines} stale` : ''
-  return `memory ${formatKb(m.indexBytes)}/${formatKb(m.capIndex)} KB${stale}`
-}
-
-export function costLine(role: OfficeRole): string {
-  const b = role.cost.budget
-  return `$${role.cost.month.toFixed(2)}/${b === null ? '?' : `$${b}`} month`
-}
-
-export function contractorsLine(role: OfficeRole): string {
-  const b = role.cost.contractorsBudget
-  return `hot desks (workers) $${role.cost.contractorsMonth.toFixed(2)}/${b === null ? '?' : `$${b}`}`
 }
 
 export type RoleChoice = 'yes' | 'no'
