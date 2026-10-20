@@ -274,7 +274,7 @@ test('the pane title is the workspace name from office.json, with Busybody besid
   await ui.unmount()
 })
 
-test('band: rooms, decisions and spend; hidden with no rooms', async ($, on) => {
+test('band: tasks and how many need you; hidden with no tasks', async ($, on) => {
   world(on)
   const band = {
     hasSurvey: false,
@@ -291,7 +291,7 @@ test('band: rooms, decisions and spend; hidden with no rooms', async ($, on) => 
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: 'busybody', surface, component: 'AbovePrompt', props: band })
-    expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('🏢 2 rooms · 1 sticky note · $61.50 today · ✓ 1 done')
+    expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('🏢 5 tasks · 2 need you · ✓ 1 done')
     await ui.unmount()
   }
 })
@@ -443,6 +443,6 @@ test('band: counts roles and memory waiting for review', async ($, on) => {
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   const band = { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 140, scroll: { offset: 0, bodyRows: 6 }, view: {} }
   const ui = await $.ui.mount({ plugin: 'busybody', surface: 'terminal', component: 'AbovePrompt', props: band })
-  expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('· 2 roles · 📝 1 memory to review')
+  expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('· 📝 1 memory to review')
   await ui.unmount()
 })

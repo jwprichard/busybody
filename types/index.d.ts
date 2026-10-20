@@ -123,9 +123,25 @@ export type OfficeWorkspace = {
   tracker: { type: string; name: string; cardUrlRegex: string | null }
 }
 
+export type OfficeTaskState = 'needs_you' | 'working' | 'waiting' | 'parked' | 'done'
+
+/** One tracker row from `bin/rooms` `tasks[]`: an initiative (or role pass) with its state, already sorted owner-first. */
+export type OfficeTask = {
+  number: number
+  /** `Friendly name (N-issue)`. */
+  name: string
+  url: string
+  /** The room or role session on it, or null. */
+  worker: string | null
+  state: OfficeTaskState
+  reason: string
+  ageS: number | null
+}
+
 export type OfficeDoc = {
   generatedAt: string
   rooms: OfficeRoom[]
+  tasks: OfficeTask[]
   decisions: OfficeDecision[]
   roles: OfficeRole[]
   roleSessions: OfficeRoleSession[]
@@ -135,7 +151,7 @@ export type OfficeDoc = {
   workspace: OfficeWorkspace | null
   /** The hour's GraphQL use estimated from the gh usage log (no gh call), when the logging shim is installed; else null. */
   ghUsage: { hourPointsEst: number; limit: number } | null
-  totals: { rooms: number; decisions: number; today: number; roles: number; memoryReviews: number }
+  totals: { rooms: number; decisions: number; today: number; roles: number; memoryReviews: number; tasks: number; needsYou: number }
 }
 
 export type OfficeRefresh = {

@@ -13,6 +13,8 @@ import type {
   OfficeRoleSession,
   OfficeRoleStatus,
   OfficeRoom,
+  OfficeTask,
+  OfficeTaskState,
   OfficeWorkspace,
 } from '../../types'
 
@@ -152,6 +154,25 @@ function parseRoom(v: unknown): OfficeRoom | null {
   }
 }
 
+const TASK_STATES: readonly OfficeTaskState[] = ['needs_you', 'working', 'waiting', 'parked', 'done']
+
+function parseTask(v: unknown): OfficeTask | null {
+  const o = obj(v)
+  const number = num(o.number, 0)
+  const name = str(o.name)
+  if (name === '' || number === 0) return null
+  const state = str(o.state)
+  return {
+    number,
+    name,
+    url: str(o.url),
+    worker: str(o.worker) || null,
+    state: (TASK_STATES as readonly string[]).includes(state) ? (state as OfficeTaskState) : 'parked',
+    reason: str(o.reason),
+    ageS: typeof o.age_s === 'number' && Number.isFinite(o.age_s) ? o.age_s : null,
+  }
+}
+
 function parseRoleSession(v: unknown): OfficeRoleSession | null {
   const o = obj(v)
   const name = str(o.name)
@@ -281,6 +302,7 @@ export function parseOfficeDoc(text: string): ParseResult {
   const decisions = arr(o.decisions)
     .map(parseDecisionEntry)
     .filter((d): d is OfficeDecision => d !== null)
+  const tasks = arr(o.tasks).map(parseTask).filter((t): t is OfficeTask => t !== null)
   const roles = arr(o.roles).map(parseRole).filter((r): r is OfficeRole => r !== null)
   const roleSessions = arr(o.role_sessions).map(parseRoleSession).filter((r): r is OfficeRoleSession => r !== null)
   const totals = obj(o.totals)
@@ -290,6 +312,7 @@ export function parseOfficeDoc(text: string): ParseResult {
     doc: {
       generatedAt: str(o.generated_at),
       rooms,
+      tasks,
       decisions,
       roles,
       roleSessions,
@@ -302,6 +325,8 @@ export function parseOfficeDoc(text: string): ParseResult {
         today: num(totals.today, today),
         roles: num(totals.roles, roles.filter(r => r.enabled).length),
         memoryReviews: num(totals.memory_reviews, roles.filter(r => r.memoryPending).length),
+        tasks: num(totals.tasks, tasks.length),
+        needsYou: num(totals.needs_you, tasks.filter(t => t.state === 'needs_you').length),
       },
     },
   }
@@ -323,29 +348,39 @@ function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
+/** Row order and labels of the tracker, owner-first. */
+export const TASK_STATE_LABEL: Record<OfficeTaskState, string> = {
+  needs_you: 'needs you',
+  working: 'working',
+  waiting: 'waiting',
+  parked: 'parked',
+  done: 'done',
+}
+
+/** The tracker's headline: how many need the owner first, then the other states that have rows. */
+export function trackerHeadline(tasks: readonly OfficeTask[]): string {
+  const n = (s: OfficeTaskState) => tasks.filter(t => t.state === s).length
+  const parts = TASK_STATES.filter(s => s !== 'needs_you' && n(s) > 0).map(s => `${n(s)} ${TASK_STATE_LABEL[s]}`)
+  return [`${n('needs_you')} need${n('needs_you') === 1 ? 's' : ''} you`, ...parts].join(' · ')
+}
+
 /**
- * The band's line, or null when there is nothing to show: no room and no
- * memory waiting for review. Roles alone don't open the band.
+ * The band's line, or null when there is nothing to show: no task and no
+ * memory waiting for review.
  */
 export function bandText(doc: OfficeDoc | null): string | null {
   if (doc === null) return null
   const reviews = doc.roles.filter(r => r.memoryPending).length
-  if (doc.rooms.length === 0 && reviews === 0) return null
+  const open = doc.tasks.filter(t => t.state !== 'done').length
+  if (doc.tasks.length === 0 && reviews === 0) return null
   const parts: string[] = []
-  if (doc.rooms.length > 0) {
-    const done = doc.rooms.filter(r => roomDisplay(r).kind === 'done').length
-    const active = doc.rooms.length - done
-    parts.push(
-      `🏢 ${plural(active, 'room', 'rooms')}`,
-      plural(doc.decisions.length, 'sticky note', 'sticky notes'),
-      `${formatMoney(doc.totals.today)} today`,
-    )
+  if (doc.tasks.length > 0) {
+    parts.push(`🏢 ${plural(open, 'task', 'tasks')}`, `${doc.totals.needsYou} need you`)
+    const done = doc.tasks.length - open
     if (done > 0) parts.push(`✓ ${done} done`)
   } else {
     parts.push('🏢 office')
   }
-  const roles = doc.roles.filter(r => r.enabled).length
-  if (roles > 0) parts.push(plural(roles, 'role', 'roles'))
   if (reviews > 0) parts.push(`📝 ${reviews} memory to review`)
   return parts.join(' · ')
 }

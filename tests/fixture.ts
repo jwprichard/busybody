@@ -113,6 +113,14 @@ export const ROOMS_DOC = {
       open_decisions: 0,
     },
   ],
+  tasks: [
+    { number: 9001, name: 'Alpha work (9001-issue)', url: 'https://github.com/acme-co/acme-office/issues/9001', worker: 'room-alpha', state: 'needs_you', reason: '1 decision to answer', age_s: 125 },
+    { number: 9002, name: 'Beta (9002-issue)', url: 'https://github.com/acme-co/acme-office/issues/9002', worker: 'room-beta', state: 'needs_you', reason: 'over its spend cap', age_s: 7200 },
+    { number: 9005, name: 'Tidy notes (9005-issue)', url: 'https://github.com/acme-co/acme-office/issues/9005', worker: 'role-scribe-tidy-notes', state: 'working', reason: 'at work', age_s: 60 },
+    { number: 9003, name: 'Gamma (9003-issue)', url: 'https://github.com/acme-co/acme-office/issues/9003', worker: 'room-gamma', state: 'waiting', reason: 'done, awaiting merge or deploy', age_s: 3600 },
+    { number: 9004, name: 'Unstarted idea (9004-issue)', url: 'https://github.com/acme-co/acme-office/issues/9004', worker: null, state: 'parked', reason: 'no one on it', age_s: null },
+    { number: 9000, name: 'Shipped thing (9000-issue)', url: 'https://github.com/acme-co/acme-office/issues/9000', worker: null, state: 'done', reason: 'closed', age_s: 7200 },
+  ],
   decisions: [
     {
       verb: 'DECISION',
@@ -177,7 +185,7 @@ export const ROOMS_DOC = {
     },
   ],
   roles_error: null,
-  totals: { rooms: 3, decisions: 1, today: 61.5, roles: 2, memory_reviews: 1 },
+  totals: { rooms: 3, decisions: 1, today: 61.5, roles: 2, memory_reviews: 1, tasks: 6, needs_you: 2 },
 }
 
 export const ROLE_BATCH = [

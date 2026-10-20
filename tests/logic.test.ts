@@ -17,6 +17,7 @@ import { answerArgv, buildAnswer, commentUrlFrom, nudgeTarget, nudgeText, parseD
 import {
   bandAlerts,
   bandText,
+  trackerHeadline,
   chooseLayout,
   formatAge,
   parseOfficeDoc,
@@ -67,7 +68,7 @@ describe('state parsing', () => {
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect(r.doc.rooms).toHaveLength(3)
-    expect(r.doc.totals).toEqual({ rooms: 3, decisions: 1, today: 61.5, roles: 2, memoryReviews: 1 })
+    expect(r.doc.totals).toEqual({ rooms: 3, decisions: 1, today: 61.5, roles: 2, memoryReviews: 1, tasks: 6, needsYou: 2 })
     const a = r.doc.rooms[0]
     expect(a?.name).toBe('room-alpha')
     expect(a?.branch).toBe('feat/alpha')
@@ -102,17 +103,41 @@ describe('state parsing', () => {
     expect(parseOfficeDoc('[1,2]').ok).toBe(false)
   })
 
-  test('band text, hidden with no rooms', () => {
+  test('tasks parse in the order the engine sent, with the headline counting the owner first', () => {
     const r = parseOfficeDoc(ROOMS_JSON)
     if (!r.ok) throw new Error(r.error)
-    expect(bandText(r.doc)).toBe(
-      '🏢 2 rooms · 1 sticky note · $61.50 today · ✓ 1 done · 2 roles · 📝 1 memory to review',
-    )
-    // no rooms and nothing to review: hidden, even with roles
-    expect(bandText({ ...r.doc, rooms: [], roles: r.doc.roles.map(x => ({ ...x, memoryPending: false })) })).toBe(null)
+    expect(r.doc.tasks.map(t => [t.name, t.worker, t.state, t.ageS])).toEqual([
+      ['Alpha work (9001-issue)', 'room-alpha', 'needs_you', 125],
+      ['Beta (9002-issue)', 'room-beta', 'needs_you', 7200],
+      ['Tidy notes (9005-issue)', 'role-scribe-tidy-notes', 'working', 60],
+      ['Gamma (9003-issue)', 'room-gamma', 'waiting', 3600],
+      ['Unstarted idea (9004-issue)', null, 'parked', null],
+      ['Shipped thing (9000-issue)', null, 'done', 7200],
+    ])
+    expect(trackerHeadline(r.doc.tasks)).toBe('2 need you · 1 working · 1 waiting · 1 parked · 1 done')
+    expect(trackerHeadline(r.doc.tasks.slice(0, 1))).toBe('1 needs you')
+    expect(trackerHeadline([])).toBe('0 need you')
+  })
+
+  test('a task without a name or number is dropped; an unknown state is parked; an old engine sends no tasks', () => {
+    const r = parseOfficeDoc(JSON.stringify({ tasks: [{ number: 1, name: 'A (1-issue)', state: 'weird' }, { number: 2 }, { name: 'B (x-issue)' }] }))
+    if (!r.ok) throw new Error(r.error)
+    expect(r.doc.tasks.map(t => [t.number, t.state])).toEqual([[1, 'parked']])
+    const old = parseOfficeDoc(JSON.stringify({ rooms: [{ name: 'room-x' }] }))
+    if (!old.ok) throw new Error(old.error)
+    expect(old.doc.tasks).toEqual([])
+    expect(old.doc.totals.needsYou).toBe(0)
+  })
+
+  test('band text: tasks and how many need you; hidden with no tasks', () => {
+    const r = parseOfficeDoc(ROOMS_JSON)
+    if (!r.ok) throw new Error(r.error)
+    expect(bandText(r.doc)).toBe('🏢 5 tasks · 2 need you · ✓ 1 done · 📝 1 memory to review')
+    // no tasks and nothing to review: hidden
+    expect(bandText({ ...r.doc, tasks: [], roles: r.doc.roles.map(x => ({ ...x, memoryPending: false })) })).toBe(null)
     // nothing but a pending memory diff still shows
-    expect(bandText({ ...r.doc, rooms: [] })).toBe('🏢 office · 2 roles · 📝 1 memory to review')
-    expect(bandText({ ...r.doc, roles: [], rolesError: 'x' })).toBe('🏢 2 rooms · 1 sticky note · $61.50 today · ✓ 1 done')
+    expect(bandText({ ...r.doc, tasks: [] })).toBe('🏢 office · 📝 1 memory to review')
+    expect(bandText({ ...r.doc, roles: [], rolesError: 'x' })).toBe('🏢 5 tasks · 2 need you · ✓ 1 done')
     expect(bandText(null)).toBe(null)
   })
 
