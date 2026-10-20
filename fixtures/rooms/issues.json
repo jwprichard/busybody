@@ -9,6 +9,9 @@
    },
    {
     "name": "capped"
+   },
+   {
+    "name": "stage:development"
    }
   ],
   "body": "Goal: x\n\n## Steps\n1. a\n\n## Room\n- room: room-alpha\n- repo: acme-web\n- model: sonnet\n- prod-read: no\n",
@@ -49,7 +52,11 @@
   "number": 8,
   "title": "No room",
   "url": "u",
-  "labels": [],
+  "labels": [
+   {
+    "name": "stage:bogus"
+   }
+  ],
   "body": "Goal only",
   "comments": [
    {
@@ -63,7 +70,14 @@
   "number": 9,
   "title": "Beta",
   "url": "https://github.com/x/y/issues/9",
-  "labels": [],
+  "labels": [
+   {
+    "name": "stage:review"
+   },
+   {
+    "name": "stage:planning"
+   }
+  ],
   "body": "## Room\n- room: room-beta\n- repo: acme-api\n",
   "comments": [
    {
@@ -77,16 +91,20 @@
   "number": 12,
   "title": "room-gamma",
   "url": "https://github.com/x/y/issues/12",
-  "labels": [],
+  "labels": [
+   {
+    "name": "stage:ci-deploy"
+   }
+  ],
   "body": "## Room\n- room: room-gamma\n- repo: acme-web\n",
   "comments": [
    {
-    "body": "**PROGRESS** \u00b7 room-gamma \u00b7 #12\nlead online",
+    "body": "**PROGRESS** · room-gamma · #12\nlead online",
     "url": "https://github.com/x/y/issues/12#c1",
     "createdAt": "2026-10-06T01:00:00Z"
    },
    {
-    "body": "**WAITING** \u00b7 room-gamma \u00b7 #12\ndraft #5 is green\n\nPromote when ready.",
+    "body": "**WAITING** · room-gamma · #12\ndraft #5 is green\n\nPromote when ready.",
     "url": "https://github.com/x/y/issues/12#c2",
     "createdAt": "2026-10-06T02:00:00Z"
    }
@@ -96,16 +114,20 @@
   "number": 13,
   "title": "room-delta",
   "url": "https://github.com/x/y/issues/13",
-  "labels": [],
+  "labels": [
+   {
+    "name": "stage:development"
+   }
+  ],
   "body": "## Room\n- room: room-delta\n- repo: acme-web\n",
   "comments": [
    {
-    "body": "**DECISION** \u00b7 room-delta \u00b7 #13\nwhich one?\n\nOptions: A, B",
+    "body": "**DECISION** · room-delta · #13\nwhich one?\n\nOptions: A, B",
     "url": "https://github.com/x/y/issues/13#c1",
     "createdAt": "2026-10-06T01:00:00Z"
    },
    {
-    "body": "**ANSWER** \u00b7 room-delta \u00b7 #13/c1\nA, I guess",
+    "body": "**ANSWER** · room-delta · #13/c1\nA, I guess",
     "url": "https://github.com/x/y/issues/13#c2",
     "createdAt": "2026-10-06T01:10:00Z"
    }
@@ -119,17 +141,17 @@
   "body": "## Room\n- room: room-epsilon\n- repo: acme-web\n",
   "comments": [
    {
-    "body": "**DECISION** \u00b7 room-epsilon \u00b7 #14\nwhich?",
+    "body": "**DECISION** · room-epsilon · #14\nwhich?",
     "url": "https://github.com/x/y/issues/14#c1",
     "createdAt": "2026-10-06T01:00:00Z"
    },
    {
-    "body": "**ANSWER** \u00b7 controller \u00b7 #14/c1\n\"A\" (the owner, verbatim)",
+    "body": "**ANSWER** · controller · #14/c1\n\"A\" (the owner, verbatim)",
     "url": "https://github.com/x/y/issues/14#c2",
     "createdAt": "2026-10-06T01:10:00Z"
    },
    {
-    "body": "**RECORD** \u00b7 controller \u00b7 #14\nscope settled",
+    "body": "**RECORD** · controller · #14\nscope settled",
     "url": "https://github.com/x/y/issues/14#c3",
     "createdAt": "2026-10-06T01:20:00Z"
    }

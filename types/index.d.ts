@@ -3,9 +3,6 @@
 
 export type OfficeLeadStatus = 'busy' | 'idle' | 'needs_input' | 'missing'
 
-/** A desk pose: the lead's status, plus the two idle-room poses (watcher alive / asleep). */
-export type OfficePose = OfficeLeadStatus | 'watching' | 'waiting'
-
 export type OfficeLatest = {
   verb: string
   /** From the new header `**TYPE** · who · where`; empty for the old `TYPE:` form. */
@@ -17,16 +14,6 @@ export type OfficeLatest = {
   url: string
   ageS: number | null
   body: string
-}
-
-export type OfficeCost = {
-  today: number
-  total: number
-  mix: Record<string, number>
-  softPct: number
-  hardPct: number
-  soft: number
-  hard: number
 }
 
 export type OfficeRoom = {
@@ -47,19 +34,7 @@ export type OfficeRoom = {
   prStale: boolean
   /** agentId: the short id `claude agents` lists and `claude stop`/`attach` take. */
   lead: { status: OfficeLeadStatus; sessionId: string | null; agentId: string | null; state: string | null }
-  cost: OfficeCost | null
-  statusLine: string
   capped: boolean
-  /** bin/rooms `state` (needs_input, capped, done, waiting, working, idle), or null when absent. */
-  state?: string | null
-  openDecisions: number
-  /** The room's recipe (team) name from bin/rooms; '' when an older bin/rooms sent none. */
-  team: string
-  /** The recipe's phases, in order ([] when unknown) and the room's current one (null when unknown). */
-  phases: string[]
-  phase: string | null
-  /** `.claude/watch.json` in the room worktree names a running pid (the mod probes it; bin/rooms may also say). */
-  watcherAlive: boolean
 }
 
 export type OfficeDecision = {
@@ -123,9 +98,31 @@ export type OfficeWorkspace = {
   tracker: { type: string; name: string; cardUrlRegex: string | null }
 }
 
+/** One tracker row from `bin/rooms` `tasks[]`: an open initiative, already sorted (most complete stage first). */
+export type OfficeTask = {
+  number: number
+  /** `Friendly name (N-issue)`. */
+  name: string
+  url: string
+  /** The issue's `stage:<name>` label (one of the document's `stages`); idea when unlabelled. */
+  stage: string
+  /** Several or unknown stage labels, else null. */
+  stageWarning: string | null
+  /** Waiting on the owner: a flag, not a stage. */
+  needsYou: boolean
+  reason: string
+  /** The project room on it, or null. */
+  worker: string | null
+  working: boolean
+  ageS: number | null
+}
+
 export type OfficeDoc = {
   generatedAt: string
   rooms: OfficeRoom[]
+  /** The stage table from bin/rooms, most complete first, parked last. */
+  stages: string[]
+  tasks: OfficeTask[]
   decisions: OfficeDecision[]
   roles: OfficeRole[]
   roleSessions: OfficeRoleSession[]
@@ -135,7 +132,7 @@ export type OfficeDoc = {
   workspace: OfficeWorkspace | null
   /** The hour's GraphQL use estimated from the gh usage log (no gh call), when the logging shim is installed; else null. */
   ghUsage: { hourPointsEst: number; limit: number } | null
-  totals: { rooms: number; decisions: number; today: number; roles: number; memoryReviews: number }
+  totals: { rooms: number; decisions: number; roles: number; memoryReviews: number; tasks: number; needsYou: number }
 }
 
 export type OfficeRefresh = {
@@ -180,8 +177,6 @@ export type OfficePrInfo = { number: number; url: string; state: string; isDraft
 
 export type OfficePrLookup = { pr: OfficePrInfo | null; checkedAt: number; stale?: boolean }
 
-export type OfficeGraphics = 'auto' | 'pixel' | 'text'
-
 declare module 'claude-code' {
   interface PluginState {
     busybody: {
@@ -194,7 +189,6 @@ declare module 'claude-code' {
       output: OfficeOutput | null
       showForm: boolean
       form: OfficeStartForm
-      graphics: OfficeGraphics
       prs: Record<string, OfficePrLookup>
       notices: Record<string, string>
       /** `bin/role batch <role>` output, for each role with a pending memory diff. */

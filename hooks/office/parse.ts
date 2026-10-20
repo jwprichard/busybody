@@ -2,17 +2,16 @@
 // small formatters the pane and band share. No `$`, no I/O.
 
 import type {
-  OfficeCost,
   OfficeDecision,
   OfficeDoc,
   OfficeLatest,
   OfficeLeadStatus,
   OfficePrInfo,
-  OfficePose,
   OfficeRole,
   OfficeRoleSession,
   OfficeRoleStatus,
   OfficeRoom,
+  OfficeTask,
   OfficeWorkspace,
 } from '../../types'
 
@@ -35,13 +34,6 @@ function arr(v: unknown): unknown[] {
   return Array.isArray(v) ? v : []
 }
 
-/** `soft $15/day, hard $40/day` → { soft: 15, hard: 40 }. */
-export function parseCapsText(text: string): { soft: number | null; hard: number | null } {
-  const soft = /soft\s*\$?\s*([\d.]+)/i.exec(text)
-  const hard = /hard\s*\$?\s*([\d.]+)/i.exec(text)
-  return { soft: soft ? Number(soft[1]) : null, hard: hard ? Number(hard[1]) : null }
-}
-
 export type MinuteHeader = { verb: string; who: string | null; where: string | null; rest: string }
 
 const MINUTE_VERBS = 'PROGRESS|DECISION|BLOCKED|DONE|ANSWER|WAITING|NOTE|RECORD'
@@ -57,21 +49,6 @@ export function parseMinuteHeader(line: string): MinuteHeader | null {
   const o = OLD_HEADER.exec(line)
   if (o) return { verb: (o[1] ?? '').toUpperCase(), who: null, where: null, rest: (o[2] ?? '').trim() }
   return null
-}
-
-/** What to show after the verb: the new header's `who · where`, or the old text after the colon. */
-export function minuteSummary(latest: Pick<OfficeLatest, 'firstLine' | 'body'> & { summary?: string }): string {
-  if (latest.summary) return latest.summary
-  const h = parseMinuteHeader(latest.firstLine)
-  if (h === null) return latest.firstLine
-  if (h.rest !== '') return h.rest
-  const next = latest.body
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .slice(1)
-    .find(l => l.trim() !== '')
-  const who = [h.who, h.where].filter((x): x is string => x !== null && x !== '').join(' · ')
-  return (next ?? '').trim() !== '' ? (next ?? '').trim() : who
 }
 
 function parseLatest(v: unknown): OfficeLatest | null {
@@ -90,27 +67,6 @@ function parseLatest(v: unknown): OfficeLatest | null {
     url: str(o.url),
     ageS: typeof o.age_s === 'number' && Number.isFinite(o.age_s) ? o.age_s : null,
     body,
-  }
-}
-
-function parseCost(v: unknown, capsText: string): OfficeCost | null {
-  if (v === null || typeof v !== 'object') return null
-  const o = obj(v)
-  const caps = obj(o.caps)
-  const fromText = parseCapsText(capsText)
-  const soft = num(caps.soft, fromText.soft ?? 15)
-  const hard = num(caps.hard, fromText.hard ?? 40)
-  const mix: Record<string, number> = {}
-  for (const [k, val] of Object.entries(obj(o.mix))) mix[k] = num(val)
-  const today = num(o.today)
-  return {
-    today,
-    total: num(o.total, today),
-    mix,
-    softPct: num(o.soft_pct, soft > 0 ? (today / soft) * 100 : 0),
-    hardPct: num(o.hard_pct, hard > 0 ? (today / hard) * 100 : 0),
-    soft,
-    hard,
   }
 }
 
@@ -140,15 +96,26 @@ function parseRoom(v: unknown): OfficeRoom | null {
     pr: parsePr(o.pr),
     prCheckedAt: typeof o.pr_checked_at === 'number' ? o.pr_checked_at : null,
     prStale: o.pr_stale === true,
-    cost: parseCost(o.cost, str(room.caps)),
-    statusLine: str(o.status_line),
     capped: o.capped === true,
-    state: str(o.state) || null,
-    openDecisions: num(o.open_decisions),
-    team: str(o.team),
-    phases: arr(o.phases).filter((p): p is string => typeof p === 'string'),
-    phase: str(o.phase) || null,
-    watcherAlive: o.watcher_alive === true || obj(o.watcher).alive === true,
+  }
+}
+
+function parseTask(v: unknown): OfficeTask | null {
+  const o = obj(v)
+  const number = num(o.number, 0)
+  const name = str(o.name)
+  if (name === '' || number === 0) return null
+  return {
+    number,
+    name,
+    url: str(o.url),
+    stage: str(o.stage, 'idea'),
+    stageWarning: str(o.stage_warning) || null,
+    needsYou: o.needs_you === true,
+    reason: str(o.reason),
+    worker: str(o.worker) || null,
+    working: o.working === true,
+    ageS: typeof o.age_s === 'number' && Number.isFinite(o.age_s) ? o.age_s : null,
   }
 }
 
@@ -178,6 +145,7 @@ function optNum(v: unknown): number | null {
   return v === null || v === undefined ? null : num(v, 0)
 }
 
+// shortcut: the whole role shape is parsed though the pane shows only name, issue and the memory review; trim when roles get no other use.
 function parseRole(v: unknown): OfficeRole | null {
   const o = obj(v)
   const name = str(o.name)
@@ -281,15 +249,17 @@ export function parseOfficeDoc(text: string): ParseResult {
   const decisions = arr(o.decisions)
     .map(parseDecisionEntry)
     .filter((d): d is OfficeDecision => d !== null)
+  const tasks = arr(o.tasks).map(parseTask).filter((t): t is OfficeTask => t !== null)
   const roles = arr(o.roles).map(parseRole).filter((r): r is OfficeRole => r !== null)
   const roleSessions = arr(o.role_sessions).map(parseRoleSession).filter((r): r is OfficeRoleSession => r !== null)
   const totals = obj(o.totals)
-  const today = rooms.reduce((sum, r) => sum + (r.cost?.today ?? 0), 0)
   return {
     ok: true,
     doc: {
       generatedAt: str(o.generated_at),
       rooms,
+      stages: arr(o.stages).filter((x): x is string => typeof x === 'string'),
+      tasks,
       decisions,
       roles,
       roleSessions,
@@ -299,12 +269,23 @@ export function parseOfficeDoc(text: string): ParseResult {
       totals: {
         rooms: num(totals.rooms, rooms.length),
         decisions: num(totals.decisions, decisions.length),
-        today: num(totals.today, today),
         roles: num(totals.roles, roles.filter(r => r.enabled).length),
         memoryReviews: num(totals.memory_reviews, roles.filter(r => r.memoryPending).length),
+        tasks: num(totals.tasks, tasks.length),
+        needsYou: num(totals.needs_you, tasks.filter(t => t.needsYou).length),
       },
     },
   }
+}
+
+/** A stable small hash of a name, for stable UI keys. */
+export function nameHash(name: string): number {
+  let h = 2166136261
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
 }
 
 export function formatAge(seconds: number | null): string {
@@ -315,178 +296,120 @@ export function formatAge(seconds: number | null): string {
   return `${Math.floor(seconds / 86400)}d`
 }
 
-export function formatMoney(n: number): string {
-  return `$${n.toFixed(2)}`
-}
-
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
+/** The tracker's headline: how many need the owner, out of how many tasks. */
+export function trackerHeadline(tasks: readonly OfficeTask[]): string {
+  const n = tasks.filter(t => t.needsYou).length
+  return `${n} need${n === 1 ? 's' : ''} you · ${plural(tasks.length, 'task', 'tasks')}`
+}
+
+/** Column widths of the tracker table, in terminal cells. Every row is exactly `total` cells wide, so none wraps. */
+export interface TrackerCols {
+  stage: number
+  name: number
+  who: number
+  age: number
+  /** Cells kept at the end of the row for the attach button. */
+  act: number
+  gap: number
+}
+
+const FLAG = '⚑'
+
 /**
- * The band's line, or null when there is nothing to show: no room and no
- * memory waiting for review. Roles alone don't open the band.
+ * Size the columns to the pane's width. STAGE (the longest stage name), the flag, AGE and the button column are fixed;
+ * INITIATIVE and WHO share the rest, INITIATIVE getting about 70% of it.
+ */
+export function trackerCols(width: number, stages: readonly string[]): TrackerCols {
+  const stage = Math.max(5, ...stages.map(s => s.length))
+  const age = 4, act = 8, gap = 2
+  const fixed = stage + gap + 1 + gap + gap + gap + age + 1 + act
+  const rest = Math.max(10, width - fixed)
+  const who = rest < 26 ? Math.max(0, Math.floor(rest * 0.25)) : Math.min(28, Math.max(10, Math.round(rest * 0.3)))
+  return { stage, name: rest - who, who, age, act, gap }
+}
+
+/** Pad with spaces to exactly `n` cells (text longer than `n` is cut hard; fit first). */
+export function padTo(s: string, n: number): string {
+  const a = [...s]
+  return a.length >= n ? a.slice(0, n).join('') : s + ' '.repeat(n - a.length)
+}
+
+/**
+ * Fit an initiative name into `max` cells with an ellipsis, always keeping its trailing "(N-issue)" tag whole:
+ * the friendly part before it is what gets cut.
+ */
+export function fitName(name: string, max: number): string {
+  const chars = [...name]
+  if (chars.length <= max) return name
+  const m = /^(.*?)\s*(\(\d+-[a-z]+\))$/.exec(name)
+  if (m === null) return max < 1 ? '' : chars.slice(0, max - 1).join('') + '…'
+  const tag = m[2] ?? ''
+  const room = max - [...tag].length - 1
+  if (room < 2) return [...tag].slice(0, Math.max(0, max)).join('')
+  return [...(m[1] ?? '')].slice(0, room - 1).join('') + '… ' + tag
+}
+
+/** Fit plain text into `max` cells with an ellipsis. */
+export function fitText(s: string, max: number): string {
+  const chars = [...s]
+  return chars.length <= max ? s : max < 1 ? '' : chars.slice(0, max - 1).join('') + '…'
+}
+
+/** The WHO cell: the room, then a dot while it works; the room's name is cut before the dot. */
+export function whoCell(worker: string | null, working: boolean, max: number): string {
+  if (worker === null) return fitText('—', max)
+  return working ? `${fitText(worker, Math.max(0, max - 2))} ●` : fitText(worker, max)
+}
+
+/** The table's header row, padded like the rows beneath it. */
+export function trackerHeader(c: TrackerCols): string {
+  const g = ' '.repeat(c.gap)
+  return [padTo('STAGE', c.stage), padTo(FLAG, 1), padTo('INITIATIVE', c.name), c.who > 0 ? padTo('WHO', c.who) : '', 'AGE']
+    .join(g).replace(/ +$/, '')
+}
+
+/** The pieces of one row, each padded to its column; the caller joins them with `' '.repeat(gap)` and styles each. */
+export function trackerRow(t: OfficeTask, c: TrackerCols): { stage: string; flag: string; name: string; who: string; age: string } {
+  return {
+    stage: padTo(t.stage, c.stage),
+    flag: t.needsYou ? FLAG : ' ',
+    name: padTo(fitName(t.name, c.name), c.name),
+    who: c.who > 0 ? padTo(whoCell(t.worker, t.working, c.who), c.who) : '',
+    age: padTo(formatAge(t.ageS), c.age),
+  }
+}
+
+/** A stage's tone from its place in the engine's table: the first is done, the last is parked, the rest are in flight. */
+export function stageTone(stage: string, stages: readonly string[]): 'done' | 'parked' | 'active' {
+  const i = stages.indexOf(stage)
+  return i === 0 ? 'done' : i === stages.length - 1 && i > 0 ? 'parked' : 'active'
+}
+
+/**
+ * The band's line, or null when there is nothing to show: no task and no
+ * memory waiting for review.
  */
 export function bandText(doc: OfficeDoc | null): string | null {
   if (doc === null) return null
   const reviews = doc.roles.filter(r => r.memoryPending).length
-  if (doc.rooms.length === 0 && reviews === 0) return null
+  if (doc.tasks.length === 0 && reviews === 0) return null
   const parts: string[] = []
-  if (doc.rooms.length > 0) {
-    const done = doc.rooms.filter(r => roomDisplay(r).kind === 'done').length
-    const active = doc.rooms.length - done
-    parts.push(
-      `🏢 ${plural(active, 'room', 'rooms')}`,
-      plural(doc.decisions.length, 'sticky note', 'sticky notes'),
-      `${formatMoney(doc.totals.today)} today`,
-    )
-    if (done > 0) parts.push(`✓ ${done} done`)
-  } else {
-    parts.push('🏢 office')
-  }
-  const roles = doc.roles.filter(r => r.enabled).length
-  if (roles > 0) parts.push(plural(roles, 'role', 'roles'))
+  if (doc.tasks.length > 0) parts.push(`🏢 ${plural(doc.tasks.length, 'task', 'tasks')}`, `${doc.totals.needsYou} need you`)
+  else parts.push('🏢 office')
   if (reviews > 0) parts.push(`📝 ${reviews} memory to review`)
   return parts.join(' · ')
 }
 
-export type RoomDisplayKind = 'busy' | 'idle' | 'needs_input' | 'done' | 'capped' | 'stalled' | 'watching' | 'waiting'
-
-export type RoomDisplay = {
-  kind: RoomDisplayKind
-  /** The status words beside the head desk: `working`, `Done · awaiting merge/release`, ... */
-  label: string
-  /** Still at work, or owed work: everything but a finished room. */
-  isActive: boolean
-  /** The warning line on the desk, or null for none. */
-  warning: { text: string; tone: 'warn' | 'danger' | 'info' } | null
-}
-
-/** An idle room: `watching` with its watcher alive, `waiting` when its last minute is WAITING with none, else `idle`. */
-function idleKind(room: OfficeRoom): 'idle' | 'watching' | 'waiting' {
-  if (room.watcherAlive) return 'watching'
-  // bin/rooms room_state skips controller NOTE/RECORD/ANSWER when finding the room's own last minute; prefer it.
-  if (room.state) return room.state === 'waiting' ? 'waiting' : 'idle'
-  return room.latest?.verb === 'WAITING' ? 'waiting' : 'idle'
-}
-
-/** `dev-team · build` on a room desk: the recipe and its current phase (`?` when unknown); '' without a recipe. */
-export function recipeLabel(room: OfficeRoom): string {
-  if (room.team === '') return ''
-  return `${room.team} · ${room.phase ?? '?'}`
-}
-
-/** The desk pose for a room: the display kind where it has a pose of its own, else the lead's status. */
-export function roomPose(room: OfficeRoom): OfficePose {
-  const k = roomDisplay(room).kind
-  return k === 'watching' || k === 'waiting' ? k : room.lead.status
-}
-
-/**
- * What a room is, from the head desk's status and its latest report: a room lead that
- * is gone after a DONE report is a finished room awaiting merge/release, not
- * a stalled one. Only a missing head desk WITHOUT a DONE warns as stalled.
- */
-export function roomDisplay(room: OfficeRoom): RoomDisplay {
-  const isGone = room.lead.status === 'missing'
-  const saidDone = room.latest?.verb === 'DONE'
-  if (isGone && saidDone) {
-    return { kind: 'done', label: 'Done · awaiting merge/release', isActive: false, warning: null }
-  }
-  if (room.capped) {
-    return {
-      kind: 'capped',
-      label: isGone ? 'capped · stopped' : 'capped',
-      isActive: true,
-      warning: { text: '⛔ CAPPED · hard cap hit, room stopped. Resuming needs a new cap from you.', tone: 'danger' },
-    }
-  }
-  if (isGone && !room.watcherAlive && room.latest?.verb !== 'WAITING') {
-    return {
-      kind: 'stalled',
-      label: 'not running',
-      isActive: true,
-      warning: { text: '○ STALLED? · the room lead is gone with no DONE report. Read the minutes (issue), then Resume.', tone: 'warn' },
-    }
-  }
-  if (room.lead.status === 'needs_input') {
-    return {
-      kind: 'needs_input',
-      label: 'needs input',
-      isActive: true,
-      warning: { text: '✋ NEEDS INPUT · the room lead is waiting on a prompt. Attach to see it.', tone: 'warn' },
-    }
-  }
-  const kind: RoomDisplayKind = room.lead.status === 'busy' ? 'busy' : idleKind(room)
-  const label = kind === 'watching' || kind === 'waiting' ? kind : saidDone ? `${kind === 'busy' ? 'working' : 'idle'} · reported DONE` : kind === 'busy' ? 'working' : 'idle'
-  if (room.cost && room.cost.soft > 0 && room.cost.today >= room.cost.soft) {
-    return {
-      kind,
-      label,
-      isActive: true,
-      warning: { text: `⚠ over the soft cap (${formatMoney(room.cost.soft)}): expect a sticky note.`, tone: 'warn' },
-    }
-  }
-  if (room.openDecisions > 0) {
-    return {
-      kind,
-      label,
-      isActive: true,
-      warning: { text: `◆ ${room.openDecisions} sticky note${room.openDecisions === 1 ? "" : "s"} on your whiteboard`, tone: 'info' },
-    }
-  }
-  return { kind, label, isActive: true, warning: null }
-}
-
-/** Extra alerts the band appends: rooms needing input, capped rooms. */
+/** Extra alerts the band appends: the GitHub budget warning. */
 export function bandAlerts(doc: OfficeDoc): string[] {
-  const needs = doc.rooms.filter(r => r.lead.status === 'needs_input').length
-  const capped = doc.rooms.filter(r => r.capped).length
-  const out: string[] = []
-  if (needs > 0) out.push(`✋ ${needs} needs input`)
-  if (capped > 0) out.push(`⛔ ${capped} capped`)
   const gh = doc.ghUsage
-  if (gh !== null && gh.limit > 0 && gh.hourPointsEst >= gh.limit * 0.7) {
-    out.push(`⚠ GitHub ${Math.round((gh.hourPointsEst / gh.limit) * 100)}% of the hour's GraphQL (est.)`)
-  }
-  return out
-}
-
-export type BarSegment = { text: string; tone: 'ok' | 'warn' | 'over' | 'empty' | 'soft' | 'hard' }
-
-/**
- * A spend bar scaled to the hard cap: filled cells for today's spend, a soft
- * cap marker `│` where the soft cap falls, and a hard cap end `┃`.
- * `width` counts the inside cells (the hard marker is one more).
- */
-export function spendBar(today: number, soft: number, hard: number, width: number): BarSegment[] {
-  const w = Math.max(4, Math.floor(width))
-  const scale = hard > 0 ? hard : Math.max(soft, today, 1)
-  const filled = Math.min(w, Math.round((Math.max(0, today) / scale) * w))
-  const softAt = soft > 0 && soft < scale ? Math.min(w - 1, Math.round((soft / scale) * w)) : -1
-  const tone: BarSegment['tone'] = today >= hard && hard > 0 ? 'over' : soft > 0 && today >= soft ? 'warn' : 'ok'
-  const segs: BarSegment[] = []
-  const push = (text: string, t: BarSegment['tone']) => {
-    const last = segs[segs.length - 1]
-    if (last && last.tone === t) last.text += text
-    else segs.push({ text, tone: t })
-  }
-  for (let i = 0; i < w; i++) {
-    if (i === softAt) push(i < filled ? '▓' : '│', 'soft')
-    else if (i < filled) push('█', tone)
-    else push('░', 'empty')
-  }
-  push('┃', 'hard')
-  return segs
-}
-
-export type Layout = 'wide' | 'normal' | 'compact'
-
-/** Compact for narrow terminals or 5+ rooms; two rooms a row when wide. */
-export function chooseLayout(columns: number, roomCount: number): Layout {
-  if (columns < 72 || roomCount >= 5) return 'compact'
-  if (columns >= 124 && roomCount >= 2) return 'wide'
-  return 'normal'
+  return gh !== null && gh.limit > 0 && gh.hourPointsEst >= gh.limit * 0.7
+    ? [`⚠ GitHub ${Math.round((gh.hourPointsEst / gh.limit) * 100)}% of the hour's GraphQL (est.)`]
+    : []
 }
 
 /** Where to look for the workspace (the folder holding bin/rooms): the
