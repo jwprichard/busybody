@@ -1,1 +1,1 @@
-[{"id":"s2","name":"role-test-role-42","sessionId":"sess2","cwd":"/fixture/ws","state":"done","startedAt":1}, {"id":"x","name":"room-other","sessionId":"sess9","cwd":"/fixture/ws","state":"done"}]
+[{"id":"s3","name":"role-test-role-43","sessionId":"sess3","cwd":"/fixture/ws","state":"done","startedAt":2}, {"id":"s2","name":"role-test-role-42","sessionId":"sess2","cwd":"/fixture/ws","state":"done","startedAt":1}, {"id":"x","name":"room-other","sessionId":"sess9","cwd":"/fixture/ws","state":"done"}]

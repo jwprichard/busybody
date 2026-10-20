@@ -49,7 +49,8 @@ Memory files (.claude/agent-memory/<role>/, only .md; contract enforced by bin/l
   bin/role run <role> <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]
                                     start ONE on-demand background session (role-<role>-<slug>) for a pass: it imports its
                                     charter and memory, asks the owner on its issue, hears the answers, hires <role>-c-*
-                                    workers, proposes a memory diff and ends. Refuses while a diff waits or a pass runs.
+                                    workers, proposes a memory diff and ends. Passes of one role run in parallel (each has its own session name; cost is
+                                    attributed by that name).
   bin/role check                    exit 1 unless the memory pre-commit guard is installed
   bin/role install-hook             install the guard into .git/hooks/pre-commit (chains any existing hook)
   bin/role --self-test              guard, promotion/archive/restore, batches, ratings, cites, cost and use counting, in a scratch repo
@@ -1284,11 +1285,6 @@ def cmd_run(argv):
         die("the memory guard is not installed: run bin/role install-hook")
     if not dry:
         commit_candidates(name)
-    if pending(name):
-        die(f"{name} has a memory diff waiting for review: accept or reject it first (bin/role diff {name})")
-    live = [a for a in role_sessions(name) if sessions.is_live(a)]
-    if live:
-        die(f"{name} already has a running session ({live[0].get('name')}): one pass at a time, or its memory diffs collide")
     issue = cfg.get("issue")
     if not issue and not dry:
         die(f"{name} has no issue in role.json: its sticky notes need an issue")
@@ -1510,22 +1506,19 @@ def self_test():
         expect("pass issue: one RECORD line on the role issue linking it",
                open(glog).read().count("issue comment 9 -R acme-co/acme-office --body **RECORD** · bin/role · #9\nanalyst pass opened: https://github.com/acme-co/acme-office/issues/321") == 1)
         write(f"- m2 2026-10-07: pending line (#7) {u1}")
-        expect("run refuses while a memory diff waits", role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0)
-        sh("git", "checkout", "--", MEM)
-        busy = os.path.join(tmp, "busy.json")
+        two = os.path.join(tmp, "two.json")
+        json.dump([{"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws", "state": "busy", "pid": 7001},
+                   {"name": "role-test-role-old2", "sessionId": "s2", "cwd": "/fixture/ws", "state": "blocked"}], open(two, "w"))
         ps = os.path.join(tmp, "ps.jsonl")
         with open(ps, "w") as f:
             f.write(json.dumps({"pid": 7001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"]}) + "\n")
-
-        def run_with(agents):
-            json.dump(agents, open(busy, "w"))
-            return subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
-                                  env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=busy, BUSYBODY_PS_FILE=ps), capture_output=True, text=True)
-        old = {"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws"}
-        r = run_with([dict(old, state="busy", pid=7001)])
-        expect("run refuses while a pass is running (a live process behind it)", r.returncode != 0 and "already has a running session" in r.stderr)
-        r = run_with([dict(old, state="blocked")])
-        expect("a pid-less blocked session is not running: run is not refused", r.returncode == 0)
+        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
+                           env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=two, BUSYBODY_PS_FILE=ps), capture_output=True, text=True)
+        expect("a second pass launches while one runs, and with a memory diff waiting (parallel passes)", r.returncode == 0 and "session:   role-test-role-x" in r.stdout)
+        globals()["_AGENTS"] = [{"name": "role-test-role-x"}]
+        expect("a second pass with the same task gets its own session name", _session_name("test-role", "x") == "role-test-role-x-2")
+        globals()["_AGENTS"] = None
+        sh("git", "checkout", "--", MEM)
         expect("run needs a controller", role("run", "test-role", "x", "--dry-run").returncode != 0)
         expect("run refuses a disabled role", (role("disable", "test-role", "t").returncode == 0
                and role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0
