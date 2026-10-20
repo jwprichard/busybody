@@ -306,6 +306,83 @@ export function trackerHeadline(tasks: readonly OfficeTask[]): string {
   return `${n} need${n === 1 ? 's' : ''} you · ${plural(tasks.length, 'task', 'tasks')}`
 }
 
+/** Column widths of the tracker table, in terminal cells. Every row is exactly `total` cells wide, so none wraps. */
+export interface TrackerCols {
+  stage: number
+  name: number
+  who: number
+  age: number
+  /** Cells kept at the end of the row for the attach button. */
+  act: number
+  gap: number
+}
+
+const FLAG = '⚑'
+
+/**
+ * Size the columns to the pane's width. STAGE (the longest stage name), the flag, AGE and the button column are fixed;
+ * INITIATIVE and WHO share the rest, INITIATIVE getting about 70% of it.
+ */
+export function trackerCols(width: number, stages: readonly string[]): TrackerCols {
+  const stage = Math.max(5, ...stages.map(s => s.length))
+  const age = 4, act = 8, gap = 2
+  const fixed = stage + gap + 1 + gap + gap + gap + age + 1 + act
+  const rest = Math.max(10, width - fixed)
+  const who = rest < 26 ? Math.max(0, Math.floor(rest * 0.25)) : Math.min(28, Math.max(10, Math.round(rest * 0.3)))
+  return { stage, name: rest - who, who, age, act, gap }
+}
+
+/** Pad with spaces to exactly `n` cells (text longer than `n` is cut hard; fit first). */
+export function padTo(s: string, n: number): string {
+  const a = [...s]
+  return a.length >= n ? a.slice(0, n).join('') : s + ' '.repeat(n - a.length)
+}
+
+/**
+ * Fit an initiative name into `max` cells with an ellipsis, always keeping its trailing "(N-issue)" tag whole:
+ * the friendly part before it is what gets cut.
+ */
+export function fitName(name: string, max: number): string {
+  const chars = [...name]
+  if (chars.length <= max) return name
+  const m = /^(.*?)\s*(\(\d+-[a-z]+\))$/.exec(name)
+  if (m === null) return max < 1 ? '' : chars.slice(0, max - 1).join('') + '…'
+  const tag = m[2] ?? ''
+  const room = max - [...tag].length - 1
+  if (room < 2) return [...tag].slice(0, Math.max(0, max)).join('')
+  return [...(m[1] ?? '')].slice(0, room - 1).join('') + '… ' + tag
+}
+
+/** Fit plain text into `max` cells with an ellipsis. */
+export function fitText(s: string, max: number): string {
+  const chars = [...s]
+  return chars.length <= max ? s : max < 1 ? '' : chars.slice(0, max - 1).join('') + '…'
+}
+
+/** The WHO cell: the room, then a dot while it works; the room's name is cut before the dot. */
+export function whoCell(worker: string | null, working: boolean, max: number): string {
+  if (worker === null) return fitText('—', max)
+  return working ? `${fitText(worker, Math.max(0, max - 2))} ●` : fitText(worker, max)
+}
+
+/** The table's header row, padded like the rows beneath it. */
+export function trackerHeader(c: TrackerCols): string {
+  const g = ' '.repeat(c.gap)
+  return [padTo('STAGE', c.stage), padTo(FLAG, 1), padTo('INITIATIVE', c.name), c.who > 0 ? padTo('WHO', c.who) : '', 'AGE']
+    .join(g).replace(/ +$/, '')
+}
+
+/** The pieces of one row, each padded to its column; the caller joins them with `' '.repeat(gap)` and styles each. */
+export function trackerRow(t: OfficeTask, c: TrackerCols): { stage: string; flag: string; name: string; who: string; age: string } {
+  return {
+    stage: padTo(t.stage, c.stage),
+    flag: t.needsYou ? FLAG : ' ',
+    name: padTo(fitName(t.name, c.name), c.name),
+    who: c.who > 0 ? padTo(whoCell(t.worker, t.working, c.who), c.who) : '',
+    age: padTo(formatAge(t.ageS), c.age),
+  }
+}
+
 /** A stage's tone from its place in the engine's table: the first is done, the last is parked, the rest are in flight. */
 export function stageTone(stage: string, stages: readonly string[]): 'done' | 'parked' | 'active' {
   const i = stages.indexOf(stage)
