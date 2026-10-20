@@ -225,14 +225,14 @@ answer is still posted and the result line says no nudge was sent.
 goes through the permission check and its dialog, so the mod doesn't use it.
 
 **Staff-room passes.** A pass (`bin/role run <role> --issue N`) runs on initiative issue N and posts its
-DECISION there (passes before this change had an issue of their own, titled `<role>: <task>` with the role's pass label). `bin/rooms` lists those issues'
-open DECISIONs (`decisions[]`, with `role`, `issue` = the pass issue, `room` =
-`role-<role>-<slug of task>`) and the running session (`role_sessions[]`, `issue` = the pass
-issue). The office posts the ANSWER to `decisions[].issue` and nudges the room by name, so
-an answer on pass issue #95 reaches `role-scribe-refine-758` as
-`ANSWER role-scribe-refine-758: .../issues/95#issuecomment-…`. DECISIONs still open on the
-role issue (older passes, #9) are listed and answered the same way. The mod holds no
-issue-number logic of its own.
+DECISION there, headed `**DECISION** · role-<role>-<slug> · #N`, whether or not the initiative has a Room block.
+`bin/rooms` lists those DECISIONs (`decisions[]`, with `role`, `issue` = the initiative, `room` = the pass
+session, never the room lead) and every running pass (`role_sessions[]`: parallel passes of one role are all
+listed, `issue` = the initiative each posts on). The office posts the ANSWER to `decisions[].issue` and nudges the
+pass by name, so an answer on #95 reaches `role-scribe-refine-758` as
+`ANSWER role-scribe-refine-758: .../issues/95#issuecomment-…`. Older passes had an issue of their own (title
+`<role>: <task>`, the role's pass label) and DECISIONs still open on the role issue (#9) are listed and answered
+the same way. The mod holds no issue-number logic of its own.
 Delivery to a live background room lead is not tested here: the tests mock
 `session.send` underneath the mod.
 

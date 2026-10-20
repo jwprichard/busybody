@@ -1,1 +1,2 @@
 {"pid": 7001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/scribe.sock"]}
+{"pid": 7002, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/second.sock"]}
