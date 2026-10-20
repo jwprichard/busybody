@@ -23,8 +23,8 @@ Open → Kickoff (go/no-go) → ────────── the team's own ph
 | **Kickoff** | role | Checks the brief against **the team's entry criteria only**: briefly, read-only, no workers. Never re-refines a Ready card or re-asks what the minutes already answered | `PROGRESS` plan; plan with A1…An; or a no-go `DECISION` saying exactly what's missing |
 | *(team phases)* | role + workers | See the teams below | `PROGRESS`, `DECISION`, `BLOCKED`, `WAITING` |
 | **Close** | role | Delivers **the team's output**, removes its worktrees, posts `DONE` (output, evidence links, cost line from `busybody room-cost`, retro), then **ends its own session** | `DONE` |
-| **Resolve** | controller | Spot-checks the `DONE` against the team's done condition, closes the issue (`busybody team resolve` does both on a pass), and moves the room to the DONE shelf. It can reopen if the check fails | `RECORD` |
-| **Review** | owner | The retro's sticky notes: a **procedure lesson for the whole team** becomes a proposed skill edit. A lesson about **the owner, or a technique one role uses in its own recurring work** (e.g. a faster tracker call) becomes role memory if it passes the three-test bar (the engine's `templates/role-charter.md`): first a candidate, then promoted on evidence, with the owner accepting the promotion | `ANSWER` |
+| **Resolve** | controller | Spot-checks the `DONE` against the team's done condition, closes the issue (`busybody team resolve` does both on a pass of a project room; a role pass, `--room role-…`, resolves only the pass and leaves the initiative open; a legacy pass issue of its own still closes), and moves the room to the DONE shelf. It can reopen if the check fails | `RECORD` |
+| **Review** | owner | The retro's sticky notes: a **procedure lesson for the whole team** becomes a proposed skill edit. A lesson about **the owner, or a technique one role uses in its own recurring work** (e.g. a faster tracker call) becomes role memory if it passes the three-test bar (the engine's `templates/role-charter.md`): first a candidate (the pass proposes it in a `MEMORY` minute, `role apply`), then promoted on evidence by the controller's `role triage` (a line quoting a recorded `ANSWER` is accepted at once; a repo lesson becomes a CLAUDE.md PR) | `ANSWER` |
 
 - A no-go counts against the **brief**, so the no-go rate per team measures brief quality.
 - "Better" is measured from data, never from the role's own claim: cost, no-go rate, vetoed
@@ -83,7 +83,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
 | **Enforced by the harness** | permissions, caps, spawn depth, no direct push to `main` (only `busybody land`), no opening rooms (deny `claude --bg`, `bin/lead-start` and `busybody role run` in room settings) |
 | **Trusted to the skill** | phases, entry criteria, when to escalate, output formats |
 | **Checked by the controller** | spot-check at Resolve, cost from transcripts, the backstop timer |
-| **Approved by the owner** | promoting and merging PRs, prod, schema, spend over the soft cap, scope, every skill or memory change |
+| **Approved by the owner** | promoting and merging PRs, prod, schema, spend over the soft cap, scope, every skill change |
 
 ## Delegated to the role
 - **Opens draft PRs** for dev teams by default. The owner promotes them; no PR is opened ready.
@@ -107,7 +107,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
 - `teams/<name>/` for the dev team, MAD, refine, visual-poc and research (`busybody team check` validates them).
 - `busybody rooms` and the office show each room's recipe and current phase (the `Phase:` line in its minutes).
 - `busybody team start` (opens a recipe's room through the lead or role launcher), `busybody team powers` (the
-  powers text in the launch brief) and `busybody team resolve` (the mechanical done check; on a pass it posts the `RECORD` and closes the issue; denied in rooms, only the control room runs it).
+  powers text in the launch brief) and `busybody team resolve` (the mechanical done check; on a pass it posts the `RECORD` and closes the issue (not for a role pass on an initiative, `--room role-…`; a legacy pass issue still closes); denied in rooms, only the control room runs it).
 - CLAUDE.md: close at merge for now.
 
 **Deferred:** prod-evidence gating at close (rooms close at merge for now; `busybody status` still tracks

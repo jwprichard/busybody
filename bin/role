@@ -7,9 +7,9 @@
                                     lines confirmed/contradicted, memory kill criterion (>20% of cited lines contradicted, or none
                                     confirmed over the pilot), candidates, flags
   bin/role diff <role>              the pending memory diff (stat + changed lines, <= 30 lines)
-  bin/role commit-candidates <role> commit candidates.md changes that need no owner review, as `role(<role>): candidates` (not a use);
+  bin/role commit-candidates <role> commit candidates.md changes that need no review, as `role(<role>): candidates` (not a use);
                                     `run` and `promote` do it first, and a candidates-only diff never counts as "waiting"
-  bin/role batch <role>             the pending diff as numbered yes/no items for the owner: PROMOTE / ARCHIVE / RESTORE
+  bin/role batch <role>             the pending diff as numbered yes/no items for the controller: PROMOTE / ARCHIVE / RESTORE
                                     (max 5 shown; the rest stay on disk for the next DONE), a `batch: <hash>` line and the accept command
                                     per item; `accept|reject --expect <hash>` refuses if the pending items changed since
   bin/role accept <role> [--expect HASH] [--items 1,3] [--rating-draft R] [--rating-memory R] [--drafts approved=N,unedited=M]
@@ -24,20 +24,33 @@
                                     drop the whole proposal and record the use as `(memory rejected)`; candidates.md changes still
                                     commit. --redo: restore without recording a use, because the redo stays inside this use.
                                     Refuses with no diff, so it can't follow an accept unnoticed. R = saved-time|useful|no-value
-  bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction]
+  bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction|answer]
                                     move candidate cN into MEMORY.md as the next mN, on disk, uncommitted (one batch item). The
                                     trigger is inferred (--link = 2-links; a generality word in the quote = 1-link; `corrects m<N>` =
-                                    correction); over the 15-line cap the least-cited line is archived in the same batch
+                                    correction; `answer` only via `triage`, which checks the link); over the 15-line cap the least-cited
+                                    line is archived in the same batch
+  bin/role triage <role> [--accept cN [--link URL2] | --drop cN]
+                                    the controller's memory triage (no owner review). For each candidate: (a) its evidence link is a recorded
+                                    owner `**ANSWER** ·` minute (header author office or the controller; checked against the issue's
+                                    comments, the quote and an earlier DECISION of the pass): promoted at once, one use; (b) `repo: <name>` in the line: it is a
+                                    repo lesson, not role memory: prints a "propose a CLAUDE.md PR to <name>" item and promotes nothing;
+                                    (c) otherwise prints the item with the four-point checklist (non-derivable, checkable, cites its
+                                    source, small). `--accept cN` promotes it as one use (needs the guard's trigger: --link URL2, a
+                                    generality word, or `corrects m<N>`); `--drop cN` removes it (a `role(<role>): candidates` commit)
   bin/role archive <role> <mN> --because <comment-url> [--reason TEXT]
                                     move mN to archive.md and commit at once `role(<role>): archive mN` (no owner wait)
   bin/role restore <role> <mN>      archive.md -> MEMORY.md as a proposed, uncommitted item (batch/accept like a promotion)
+  bin/role apply <role> <minute-url>
+                                    apply a pass's `**MEMORY** · role-<role>-… · #N` minute: each proposed `- c<N> …` line is renumbered to
+                                    the next free id and committed on its own as `role(<role>): candidates`, one at a time under a lock,
+                                    through the guard (a line it refuses is reported and skipped; one already applied is skipped)
 
 Memory files (.claude/agent-memory/<role>/, only .md; contract enforced by bin/lib/role-memory-check):
   MEMORY.md     injected, <= 15 content lines (# headers exempt), ids m1.. never reused:
                 - m<N> <YYYY-MM-DD>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction]
                 trigger: two DIFFERENT comment urls | `1-link` (single link, quote has always/never/by default/unless said otherwise/
                 from now on/every time) | `correction` (owner corrected a line's recommendation; the line says `corrects m<N>`)
-  candidates.md never injected, committed without owner review, <= 30 lines, 60-day expiry, first sightings:
+  candidates.md never injected, written only by `role apply` (a pass proposes in a MEMORY minute), <= 30 lines, 60-day expiry, first sightings:
                 - c<N> <date>: <line>. Changes: <...>. "<quote>" (<url>)
   archive.md    never injected: the moved line + ` | archived <date>: <why>, <link>`
   A line enters MEMORY.md only by promotion (same text as its candidate). Drafts cite MEMORY.md ids only; candidates are read
@@ -46,10 +59,13 @@ Memory files (.claude/agent-memory/<role>/, only .md; contract enforced by bin/l
   bin/role keep <role>              end probation (the pilot said keep)
   bin/role disable <role> <reason>  stop loading the role; memory stays in git, frozen
   bin/role enable <role>            load it again (back on probation)
-  bin/role run <role> <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]
-                                    start ONE on-demand background session (role-<role>-<slug>) for a pass: it imports its
-                                    charter and memory, asks the owner on its issue, hears the answers, hires <role>-c-*
-                                    workers, proposes a memory diff and ends. Refuses while a diff waits or a pass runs.
+  bin/role run <role> --issue N <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]
+                                    start ONE on-demand background session (role-<role>-<slug>) for a pass on initiative issue N
+                                    (required; the pass has no issue of its own: its minutes and cost line land on N, and the role
+                                    issue gets one RECORD line linking N and the session). It imports its
+                                    charter and memory, asks the owner on N, hears the answers, hires <role>-c-*
+                                    workers, proposes a memory diff and ends. Passes of one role run in parallel (each has its own session name; cost is
+                                    attributed by that name).
   bin/role check                    exit 1 unless the memory pre-commit guard is installed
   bin/role install-hook             install the guard into .git/hooks/pre-commit (chains any existing hook)
   bin/role --self-test              guard, promotion/archive/restore, batches, ratings, cites, cost and use counting, in a scratch repo
@@ -58,7 +74,7 @@ State is derived, not kept: uses and ratings come from `role(<role>): use N` com
 `Role-Value:` trailer; enabled/disabled from where the charter lives; cost from transcripts.
 roles/<role>/role.json holds only config and decisions (budget, metric, authority, pilot, issue).
 """
-import glob, importlib.machinery, json, os, re, shutil, subprocess, sys, tempfile
+import contextlib, fcntl, glob, importlib.machinery, json, os, re, shutil, subprocess, sys, tempfile
 from datetime import datetime, timedelta
 
 HERE = ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -106,6 +122,33 @@ def git(*a, check=True):
     if check and r.returncode:
         die(f"git {' '.join(a[:3])} failed: {(r.stderr or r.stdout).strip()[:300]}")
     return r
+
+
+_LOCK = {"fh": None, "n": 0}
+
+
+@contextlib.contextmanager
+def _locked():
+    """One lock for every command that commits memory (apply, triage, promote, accept, reject, commit-candidates, archive, restore, run):
+    two sessions' commits take turns instead of colliding on the index. Re-entrant, so triage may call promote."""
+    if _LOCK["n"] == 0:
+        _LOCK["fh"] = open(_lock_path(), "w")
+        fcntl.flock(_LOCK["fh"], fcntl.LOCK_EX)
+    _LOCK["n"] += 1
+    try:
+        yield
+    finally:
+        _LOCK["n"] -= 1
+        if _LOCK["n"] == 0:
+            _LOCK["fh"].close()
+
+
+def locked(fn):
+    def wrapper(*a, **kw):
+        with _locked():
+            return fn(*a, **kw)
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 def today():
@@ -197,7 +240,7 @@ def memory(name):
 
 def pending(name):
     r = git("status", "--porcelain", "--untracked-files=all", "--", f"{MEM}/{name}/", check=False)
-    # candidates.md commits without owner review, so a diff in it alone is not "waiting" (commit_candidates)
+    # candidates.md commits without review, so a diff in it alone is not "waiting" (commit_candidates)
     return [l for l in r.stdout.splitlines() if l.strip() and not l.rstrip().endswith("/candidates.md")]
 
 
@@ -351,9 +394,9 @@ def flags(name, cfg, st):
     if m["index_bytes"] > CAP_INDEX or m["total_bytes"] > CAP_ROLE:
         out.append("memory over cap")
     if m["candidate_lines"] >= G.CAP_CANDIDATES - 5:
-        out.append(f"candidates.md near its cap ({m['candidate_lines']}/{G.CAP_CANDIDATES}): promote or drop some")
+        out.append(f"candidates.md near its cap ({m['candidate_lines']}/{G.CAP_CANDIDATES}): triage some: bin/role triage {name}")
     if m["candidates_expired"]:
-        out.append(f"{m['candidates_expired']} candidate(s) older than {G.CANDIDATE_DAYS} days: promote or drop")
+        out.append(f"{m['candidates_expired']} candidate(s) older than {G.CANDIDATE_DAYS} days: triage them (bin/role triage {name})")
     if m["memory_lines"] > G.CAP_MEMORY_LINES:
         out.append(f"MEMORY.md has {m['memory_lines']} lines (cap {G.CAP_MEMORY_LINES})")
     ck = st["cites"]
@@ -362,7 +405,7 @@ def flags(name, cfg, st):
     elif ck["records"] and not ck["confirmed"] and st["pilot_over"]:
         out.append("memory kill criterion: no cited memory line was confirmed over the pilot")
     if st["pending"]:
-        out.append(f"memory diff waiting for review ({len(st['pending'])} file(s))")
+        out.append(f"memory diff waiting for controller triage ({len(st['pending'])} file(s)): bin/role batch {name}")
     if st["enabled"] and not st["hook"]:
         out.append("memory guard not installed: run bin/role install-hook")
     return out
@@ -461,7 +504,7 @@ def cmd_review(argv):
               f"unrated {s['use_count'] - sum(r.values())}; memory rejected {s['memory_rejected']}x")
         mr = s["memory_ratings"]
         print(f"   memory value  saved-time {mr['saved-time']}, useful {mr['useful']}, no-value {mr['no-value']}, "
-              f"unrated {s['use_count'] - sum(mr.values())} (the owner rates the memory diff apart from the drafts)")
+              f"unrated {s['use_count'] - sum(mr.values())} (the memory diff is rated apart from the drafts)")
         print(f"   memory    {s['memory']['dated_lines']} dated lines, {s['memory']['stale_lines']} stale; "
               f"{s['memory']['index_bytes']}B index, {s['memory']['total_bytes']}B total")
         ck = s["cites"]
@@ -550,8 +593,8 @@ def _lines_diff(a, b):
 
 
 def pending_items(name):
-    """(items, auto, H): the pending memory diff as owner yes/no items. `auto` = candidates.md
-    changes not tied to an item (they commit without owner review). H = the committed lines."""
+    """(items, auto, H): the pending memory diff as yes/no items. `auto` = candidates.md
+    changes not tied to an item (they commit without review). H = the committed lines."""
     H = {f: read_head(name, f) for f in G.FILES}
     D = {f: read_disk(name, f) for f in G.FILES}
     add = {f: _lines_diff(D[f], H[f]) for f in G.FILES}
@@ -690,7 +733,7 @@ def _record_cites(name, rec):
 
 
 def batch_hash(items):
-    """Short fingerprint of the pending items: `accept/reject --expect <hash>` refuses if the batch changed since the owner saw it."""
+    """Short fingerprint of the pending items: `accept/reject --expect <hash>` refuses if the batch changed since the controller saw it."""
     import hashlib
     return hashlib.sha1(json.dumps([[it["label"], it["ops"]] for it in items], sort_keys=True).encode()).hexdigest()[:8]
 
@@ -767,6 +810,7 @@ def commit_candidates(name):
     return True
 
 
+@locked
 def cmd_commit_candidates(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -786,7 +830,7 @@ def cmd_batch(argv):
         print("guard: " + ("ok" if not err else "REFUSES\n" + err))
         return
     shown, over = items[:MAX_ITEMS], items[MAX_ITEMS:]
-    print(f"{name}: {len(items)} memory item(s) for the owner, showing {len(shown)} (yes/no each)")
+    print(f"{name}: {len(items)} memory item(s) for the controller, showing {len(shown)} (yes/no each)")
     for i, it in enumerate(shown, 1):
         print(f" [{i}] {it['label']}")
     n_auto = len(auto["candidates.md"]["add"]) + len(auto["candidates.md"]["del"])
@@ -808,6 +852,7 @@ def commit_cand_pending(name):
     return bool(auto["candidates.md"]["add"] or auto["candidates.md"]["del"])
 
 
+@locked
 def cmd_accept(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -821,6 +866,7 @@ def cmd_accept(argv):
     _settle(name, argv, reject=False)
 
 
+@locked
 def cmd_reject(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -830,6 +876,204 @@ def cmd_reject(argv):
             f"Check `git log -1 -- .claude/agent-memory/{name}`; a use that learned nothing is "
             f"`bin/role accept {name} --no-memory`.")
     _settle(name, argv, reject=True)
+
+
+# ---- memory proposals: a pass posts a MEMORY minute, the controller applies it ---------------
+
+def _lock_path():
+    common = git("rev-parse", "--git-common-dir").stdout.strip()
+    return os.path.join(common if os.path.isabs(common) else p(common), "role-apply.lock")
+
+
+def _sources_path():
+    common = git("rev-parse", "--git-common-dir").stdout.strip()
+    return os.path.join(common if os.path.isabs(common) else p(common), "role-candidate-sources.json")
+
+
+def _sources():
+    """{role: {cN: {issue, session}}}: where `role apply` got each candidate (kept in the git dir, not the tree; triage needs it to verify an ANSWER)."""
+    try:
+        return json.load(open(_sources_path()))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_sources(d):
+    with open(_sources_path() + ".tmp", "w") as fh:
+        json.dump(d, fh)
+    os.replace(_sources_path() + ".tmp", _sources_path())
+
+
+def _record_source(name, cid, issue, session, body):
+    d = _sources()
+    d.setdefault(name, {})[str(cid)] = {"issue": issue, "session": session, "body": body}
+    _save_sources(d)
+
+
+def _drop_source(name, cid):
+    d = _sources()
+    if d.get(name, {}).pop(str(cid), None) is not None:
+        _save_sources(d)
+
+
+@locked
+def cmd_apply(argv):
+    name = argv[0] if argv else None
+    need_role(name)
+    m = re.fullmatch(r"https://github\.com/([^/\s]+/[^/\s]+)/issues/(\d+)#issuecomment-(\d+)", argv[1] if len(argv) == 2 else "")
+    if not m:
+        die("usage: bin/role apply <role> <minute-url>  (https://github.com/<owner>/<repo>/issues/N#issuecomment-ID)")
+    if m.group(1) != REPO:
+        die(f"{m.group(1)} is not the minutes repo ({REPO})")
+    if not hook_installed():
+        die("memory guard not installed: bin/role install-hook")
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/issues/comments/{m.group(3)}", "--jq", ".body"], capture_output=True, text=True)
+    if r.returncode:
+        die(f"cannot read the minute: {(r.stderr or r.stdout).strip()[:200]}")
+    lines = r.stdout.splitlines()
+    hd = re.match(rf"^\*\*MEMORY\*\* · (role-{re.escape(name)}-\S*) · #(\d+)\s*$", lines[0] if lines else "")
+    if not hd:
+        die(f"not a MEMORY minute of role {name} (line 1 must be `**MEMORY** · role-{name}-<slug> · #N`)")
+    session, issue = hd.group(1), int(hd.group(2))
+    if issue != int(m.group(2)):
+        die(f"the minute's header says #{issue} but its link is on issue #{m.group(2)}")
+    if not _pass_session_ok(name, session, role_names()):
+        die(f"{session} is not a session of role {name} (another role's name starts with {name}-)")
+    if session not in {a.get("name") for a in agents_list()}:
+        die(f"{session} is not a known session (`claude agents --json --all`): refusing a minute from an unknown author")
+    proposed = [l.strip() for l in lines[1:] if re.match(r"^\s*- c\d+ ", l)]
+    if not proposed:
+        print(f"{name}: the minute proposes no candidate lines")
+        return
+    strip_id = lambda l: re.sub(r"^- [cm]\d+ ", "", l)
+    for ln in proposed:  # the lock is held by @locked: two passes' proposals apply in sequence, each taking the next free id
+        _guard_index(name)
+        cands = read_disk(name, "candidates.md")
+        body = strip_id(ln)
+        have = [strip_id(c) for c in cands + read_head(name, "candidates.md")]
+        done = [strip_id(l).split(" | archived ")[0] for f in ("MEMORY.md", "archive.md") for l in read_disk(name, f) + read_head(name, f)]
+        if body in have or any(d.startswith(body) for d in done):  # a promoted line is its candidate's text plus a link and a marker
+            print(f"skipped (already applied): {ln[:100]}")
+            continue
+        nid = max([line_id(c, "c") or 0 for c in cands + read_head(name, "candidates.md")] or [0]) + 1
+        new = f"- c{nid} {body}"
+        write_lines(name, "candidates.md", cands + [new], existed_in_head=bool(read_head(name, "candidates.md")))
+        try:
+            commit_candidates(name)
+        except SystemExit as e:
+            write_lines(name, "candidates.md", cands, existed_in_head=bool(read_head(name, "candidates.md")))
+            why = str(e.code).replace(chr(10), " ")[:300]
+            if "index.lock" in why or "update-index" in why:   # git itself failed: an error to fix and re-run, not a line the guard turned down
+                die(f"error applying {ln[:80]}: {why}")
+            print(f"skipped (guard refused): {ln[:100]}\n  {why}")
+            continue
+        _record_source(name, nid, issue, session, body)
+        print(f"applied: {new[:100]}")
+
+
+def _pass_session_ok(name, session, roles):
+    """A role-<name>-<slug> session that is not really another role's (`a` must not claim role-a-b-x when a role `a-b` exists)."""
+    return session.startswith(f"role-{name}-") and not any(r != name and r.startswith(name + "-") and session.startswith(f"role-{r}-") for r in roles)
+
+
+# ---- triage: the controller settles candidates; the owner is not asked ---------------------------
+
+CHECKLIST = "non-derivable? checkable? cites its source? small?"
+
+
+def _answer_writers():
+    """Who may sign an ANSWER the office and the role brief accept: the office, the controller, the configured controller session."""
+    return {"office", "controller", bb_env(None, "CONTROLLER", "SCH_LIAISON_SESSION")} - {None, ""}
+
+
+def _answer_evidence(name, line):
+    """The candidate's own evidence link, if it is a recorded owner ANSWER. All of: the line is exactly the text `role apply` recorded
+    (so a hand-written or renumbered line inherits nothing), the link is the line's last `(url)` and one of the comments of the issue it
+    was applied from, its header author is the office or the controller (never the pass itself), the quote (>= 15 characters, >= 3 words) is
+    in the ANSWER's body below the header, verbatim and case-sensitive, and a DECISION of that pass's session came before it.
+    Limit: the header name is text, and a pass that can post comments can type `office`; the office flags ANSWERs from anyone else and the
+    controller's checklist is the backstop. Anything else, or a failed gh read, is None."""
+    src = _sources().get(name, {}).get(str(line_id(line, "c")))
+    m = re.search(r'"([^"\n]{3,})" \((https://github\.com/([^/\s]+/[^/\s]+)/issues/(\d+)#issuecomment-(\d+))\)\s*$', line)
+    if not src or not m or m.group(3) != REPO or int(m.group(4)) != src["issue"] or re.sub(r"^- c\d+ ", "", line) != src.get("body"):
+        return None
+    quote, url, aid = m.group(1), m.group(2), int(m.group(5))
+    if len(quote) < 15 or len(quote.split()) < 3:
+        return None
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/issues/{src['issue']}/comments", "--paginate", "--jq", ".[] | @json"], capture_output=True, text=True)
+    comments = {}
+    for ln in (r.stdout if r.returncode == 0 else "").splitlines():
+        try:
+            c = json.loads(ln)
+            comments[c["id"]] = c.get("body") or ""
+        except (ValueError, KeyError, TypeError):
+            continue
+    head, _, rest = comments.get(aid, "").partition("\n")
+    who = re.match(r"^\*\*ANSWER\*\* · (\S+) ·", head)
+    if not who or who.group(1) == src["session"] or who.group(1) not in _answer_writers() or quote not in rest:
+        return None
+    decision = re.compile(rf"^\*\*DECISION\*\* · {re.escape(src['session'])} · ")
+    return url if any(i < aid and decision.match(b) for i, b in comments.items()) else None
+
+
+def _promote_and_settle(name, cid, extra):
+    """Promote candidate cN and commit it as ONE use; on any refusal put the memory files back. Returns (ok, why)."""
+    snap = _snapshot(name)
+    try:
+        cmd_promote([name, f"c{cid}", *extra], from_triage=True)
+        _settle(name, [], False)
+    except SystemExit as e:
+        git("reset", "-q", "--", f"{MEM}/{name}/", check=False)
+        _rollback(name, snap)
+        return False, str(e.code).replace("\n", " ")[:300]
+    return True, ""
+
+
+@locked
+def cmd_triage(argv):
+    name = argv[0] if argv else None
+    need_role(name)
+    acc, drop, link = _opt(argv, "--accept"), _opt(argv, "--drop"), _opt(argv, "--link")
+    for flag, v in (("--accept", acc), ("--drop", drop)):
+        if v is not None and not re.fullmatch(r"c\d+", v):
+            die(f"usage: bin/role triage <role> [--accept cN [--link URL2] | --drop cN]  ({flag} takes a candidate id like c3)")
+    if acc and drop:
+        die("--accept and --drop are one candidate at a time")
+    if not hook_installed():
+        die("memory guard not installed: bin/role install-hook")
+    _guard_index(name)
+    if pending(name):
+        die(f"{name} has a memory diff waiting: settle it first (bin/role batch {name})")
+    commit_candidates(name)
+    cands = [l for l in read_disk(name, "candidates.md") if G.CAND_LINE.match(l)]
+    if acc or drop:
+        cid = int((acc or drop)[1:])
+        src = next((l for l in cands if line_id(l, "c") == cid), None)
+        if not src:
+            die(f"no candidate c{cid} in {MEM}/{name}/candidates.md")
+        if drop:
+            write_lines(name, "candidates.md", [l for l in read_disk(name, "candidates.md") if l != src])
+            commit_candidates(name)
+            _drop_source(name, cid)
+            return
+        ok, why = _promote_and_settle(name, cid, ["--link", link] if link else [])
+        if not ok:
+            die(f"c{cid} not accepted: {why}")
+        return
+    if not cands:
+        print(f"{name}: no candidates to triage")
+    for l in cands:
+        cid = line_id(l, "c")
+        repo = re.search(r"\brepo: ([A-Za-z0-9._-]+)", l)
+        if repo:  # a repo lesson belongs in that repo's CLAUDE.md, not in a role's memory (checked before the ANSWER rule)
+            print(f"[c{cid}] propose a CLAUDE.md PR to {repo.group(1)}: {l}\n      (not promoted; --drop c{cid} once the PR is open)")
+            continue
+        ans = _answer_evidence(name, l)
+        if ans:
+            ok, why = _promote_and_settle(name, cid, ["--trigger", "answer"])
+            print(f"[c{cid}] auto-accepted: its evidence is the recorded ANSWER {ans}" if ok else f"[c{cid}] quotes the ANSWER {ans} but was not promoted: {why}")
+            continue
+        print(f"[c{cid}] {l}\n      checklist: {CHECKLIST}\n      bin/role triage {name} --accept c{cid} [--link URL2]    bin/role triage {name} --drop c{cid}")
 
 
 # ---- memory lifecycle: promote, archive, restore -------------------------------------------
@@ -941,12 +1185,13 @@ def _propose(name, mem, cand, arch, keep_ids):
         die("the guard refuses this proposal:\n" + err)
 
 
-def cmd_promote(argv):
+@locked
+def cmd_promote(argv, from_triage=False):
     name = argv[0] if argv else None
     need_role(name)
     pos = [a for i, a in enumerate(argv[1:], 1) if not a.startswith("--") and argv[i - 1] not in ("--link", "--trigger")]
     if len(pos) != 1 or not re.fullmatch(r"c?\d+", pos[0]):
-        die("usage: bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction]")
+        die("usage: bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction|answer]")
     cid = int(pos[0].lstrip("c"))
     if commit_candidates(name):  # the candidate must be in HEAD, or the guard cannot see where the line came from
         pass
@@ -964,7 +1209,9 @@ def cmd_promote(argv):
     if trig is None:
         trig = "2-links" if (link or len(urls) >= 2) else ("1-link" if any(G.GENERAL.search(q) for q in quotes) else
                                        "correction" if G.CORRECTS.search(text) else None)
-    if trig not in ("2-links", "1-link", "correction"):
+    if trig == "answer" and not from_triage:
+        die("--trigger answer is for `bin/role triage`, which checks the ANSWER link; a hand promotion needs 2 links, 1-link or correction")
+    if trig not in ("2-links", "1-link", "correction", "answer"):
         die("no trigger: pass --link URL2 (2 links), or the quote needs a generality word (1-link), or the line a `corrects m<N>` (correction)")
     if trig == "2-links" and len(urls) < 2:
         die("--trigger 2-links needs --link URL2: a second, different comment URL")
@@ -974,9 +1221,11 @@ def cmd_promote(argv):
     cand.remove(src)
     mem.append(new)
     _propose(name, mem, cand, arch, {f"m{line_id(new, 'm')}"})
+    _drop_source(name, cid)
     print(f"proposed (uncommitted): {new}\nnext: bin/role batch {name}")
 
 
+@locked
 def cmd_archive(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -1007,6 +1256,7 @@ def cmd_archive(argv):
     print(f"role({name}): archive {pos[0]}")
 
 
+@locked
 def cmd_restore(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -1239,28 +1489,11 @@ def _role_settings(session, authority=0, team="", tracker=None):
     return {"env": env, "permissions": perms}
 
 
-def _pass_label(name):
-    return "refine" if name == "analyst" else f"{name}-pass"
-
-
-def _open_pass_issue(name, task, session, role_issue):
-    """One issue per pass: its minutes are the pass's evidence. Returns (number, url) or dies."""
-    label = _pass_label(name)
-    subprocess.run(["gh", "label", "create", label, "-R", REPO, "--color", "BFD4F2",
-                    "--description", f"A {name} staff-room pass: its minutes are the evidence"], capture_output=True)
-    body = (f"**NOTE** · bin/role · #{role_issue}\n{name} pass: {task}\n\n"
-            f"- Task: {task}\n- Session: `{session}`\n"
-            f"- Role issue (personnel file): https://github.com/{REPO}/issues/{role_issue}\n\n"
-            "The pass posts its `DECISION` / `ANSWER` / `DONE` minutes here. Resolve closes it.")
-    r = subprocess.run(["gh", "issue", "create", "-R", REPO, "--label", label, "--assignee", "@me",
-                        "--title", f"{name}: {task}", "--body", body], capture_output=True, text=True)
-    url = (r.stdout or "").strip().splitlines()[-1] if r.returncode == 0 and (r.stdout or "").strip() else ""
-    if not url.rsplit("/", 1)[-1].isdigit():
-        die(f"could not open the pass issue: {(r.stderr or r.stdout).strip()[:200]}")
-    num = int(url.rsplit("/", 1)[-1])
-    subprocess.run(["gh", "issue", "comment", str(role_issue), "-R", REPO, "--body",
-                    f"**RECORD** · bin/role · #{role_issue}\n{name} pass opened: {url}"], capture_output=True)
-    return num, url
+def _record_pass(role_issue, name, issue_url, session):
+    """The personnel-file line on the role issue: which pass started, on which initiative issue."""
+    if role_issue:
+        subprocess.run(["gh", "issue", "comment", str(role_issue), "-R", REPO, "--body",
+                        f"**RECORD** · bin/role · #{role_issue}\n{name} pass started on {issue_url}: session `{session}`"], capture_output=True)
 
 
 def cmd_run(argv):
@@ -1268,11 +1501,13 @@ def cmd_run(argv):
     dry, show = "--dry-run" in argv, "--show-brief" in argv
     liaison = _opt(argv, "--controller" if "--controller" in argv else "--liaison", bb_env(None, "CONTROLLER", "SCH_LIAISON_SESSION"))
     team = _opt(argv, "--team", "")
-    valued = ("--liaison", "--controller", "--team")
+    valued = ("--liaison", "--controller", "--team", "--issue")
     skip = {i for i, a in enumerate(argv) if a in valued} | {i + 1 for i, a in enumerate(argv) if a in valued}
     pos = [a for i, a in enumerate(argv) if i not in skip and not a.startswith("--")]
-    if len(pos) < 2:
-        die("usage: bin/role run <role> <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]")
+    usage = "usage: bin/role run <role> --issue N <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]"
+    issue = _opt(argv, "--issue", "")
+    if len(pos) < 2 or not issue.isdigit():
+        die(usage + " (N = the initiative issue the pass works on)")
     name, task = pos[0], " ".join(pos[1:])
     cfg = need_role(name)
     if not os.path.exists(p(AGENTS, name + ".md")):
@@ -1282,15 +1517,10 @@ def cmd_run(argv):
     if not hook_installed():
         die("the memory guard is not installed: run bin/role install-hook")
     if not dry:
-        commit_candidates(name)
-    if pending(name):
-        die(f"{name} has a memory diff waiting for review: accept or reject it first (bin/role diff {name})")
-    live = [a for a in role_sessions(name) if a.get("state") not in ("done", "failed", "stopped", "completed")]
-    if live:
-        die(f"{name} already has a running session ({live[0].get('name')}): one pass at a time, or its memory diffs collide")
-    issue = cfg.get("issue")
-    if not issue and not dry:
-        die(f"{name} has no issue in role.json: its sticky notes need an issue")
+        with _locked():
+            commit_candidates(name)
+    role_issue, issue = cfg.get("issue"), int(issue)
+    issue_url = f"https://github.com/{REPO}/issues/{issue}"
     team_powers = ""
     if team:  # the recipe's powers go into the brief itself, like a room lead's
         r = subprocess.run([e("bin", "team"), "powers", team], capture_output=True, text=True, env=dict(os.environ, BUSYBODY_WORKSPACE=WS))
@@ -1298,15 +1528,9 @@ def cmd_run(argv):
             die(f"cannot render the powers of recipe {team}: {(r.stderr or r.stdout).strip()[:200]}")
         team_powers = "\n" + r.stdout.rstrip("\n")
     session = _session_name(name, task)
-    role_issue = issue
-    if dry:
-        issue, issue_url = None, f"(pass issue \"{name}: {task}\", label {_pass_label(name)}: opened at launch, one per pass)"
-    else:
-        issue, issue_url = _open_pass_issue(name, task, session, role_issue)
-        print(f"pass issue #{issue}: {issue_url}")
     brief = _fill(open(e("templates", "role-brief.md")).read(), {
         "ROLE": name, "SESSION": session, "TASK": task, "TODAY": today().isoformat(), "ISSUE_URL": issue_url,
-        "ISSUE_NUM": issue or "N", "ROLE_ISSUE": role_issue or "N", "ISSUE_REPO": REPO, "LIAISON": liaison, "WS": WS, "ENGINE": ENGINE_ROOT,
+        "ISSUE_NUM": issue, "ROLE_ISSUE": role_issue or "N", "ISSUE_REPO": REPO, "LIAISON": liaison, "WS": WS, "ENGINE": ENGINE_ROOT,
         "AUTHORITY": f"level {cfg.get('authority', 0)}", "BUDGET": f"{cfg.get('budget_usd_month') or 0:g}",
         "CBUDGET": f"{cfg.get('contractor_budget_usd_month') or 0:g}",
         "TEAM_POWERS": team_powers, "CHARTER": _charter_body(name), "MEMORY": _memory_text(name)})
@@ -1330,10 +1554,11 @@ def cmd_run(argv):
     stamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     r = subprocess.run(cmd, cwd=WS, capture_output=True, text=True)
     if r.returncode:
-        subprocess.run(["gh", "issue", "close", str(issue), "-R", REPO, "--comment",
-                        f"**BLOCKED** · bin/role · #{issue}\nlaunch failed; pass not started"], capture_output=True)
+        subprocess.run(["gh", "issue", "comment", str(issue), "-R", REPO, "--body",
+                        f"**BLOCKED** · bin/role · #{issue}\nlaunch of {session} failed; pass not started"], capture_output=True)
         die(f"claude --bg failed: {(r.stderr or r.stdout).strip()[:300]}")
     print(f"launched {session}")
+    _record_pass(role_issue, name, issue_url, session)
     import time
     for _ in range(36):
         time.sleep(5)
@@ -1368,7 +1593,7 @@ def self_test():
         ws = os.path.join(tmp, "ws")
         for d in ("bin/lib", "templates"):
             os.makedirs(os.path.join(ws, "engine", d))
-        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py", "bin/lib/kitlib.py", "bin/lib/deskskills.py",
+        for f in ("bin/role", "bin/lib/role-memory-check", "bin/lib/pre-commit-role-memory", "bin/lib/costlib.py", "bin/lib/officeroot.py", "bin/lib/officeconfig.py", "bin/lib/tracker.py", "bin/lib/kitlib.py", "bin/lib/deskskills.py", "bin/lib/sessions.py",
                   "templates/role-charter.md", "templates/prices.json", "templates/role-brief.md", "templates/role-settings.json",
                   "templates/room-settings.json"):
             shutil.copy2(os.path.join(HERE, f), os.path.join(ws, "engine", f))
@@ -1379,8 +1604,8 @@ def self_test():
         def sh(*a, **kw):
             return subprocess.run(list(a), cwd=ws, env=env, capture_output=True, text=True, **kw)
 
-        def role(*a):
-            return sh(os.path.join(ws, "engine", "bin", "role"), *a)
+        def role(*a, **kw):
+            return sh(os.path.join(ws, "engine", "bin", "role"), *a, **kw)
 
         r = subprocess.run([os.path.join(HERE, "bin", "lib", "role-memory-check"), "--self-test"], capture_output=True, text=True)
         print(r.stdout.rstrip())
@@ -1456,7 +1681,7 @@ def self_test():
         expect("enable restores it on probation", role("enable", "test-role").returncode == 0
                and json.loads(role("status", "--json").stdout)["roles"][0]["status"] == "probation")
         # role sessions: bin/role run
-        r = role("run", "test-role", "refine", "card", "#42!", "--controller", "controller-x", "--dry-run", "--show-brief")
+        r = role("run", "test-role", "--issue", "42", "refine", "card", "#42!", "--controller", "controller-x", "--dry-run", "--show-brief")
         out = r.stdout
         expect(f"run --dry-run names the session by role and task (rc {r.returncode})", r.returncode == 0 and "session:   role-test-role-refine-card-42" in out)
         expect("brief imports the charter without its frontmatter", "keep the test backlog healthy" in out and "\nmodel: sonnet\nmemory: project" not in out and "description:" not in out.split("# Your charter")[1])
@@ -1464,13 +1689,15 @@ def self_test():
         expect("brief makes the role ask on its issue and hear the answers",
                "ANSWER (from the user)" in out and "one `DECISION:` comment" in out and "end your turn and wait" in out)
         expect("brief names the workers <role>-c-*", "test-role-c-<task>" in out)
-        expect("brief forbids committing or accepting memory", "Never commit, stage or push" in out and "bin/role accept" in out)
+        expect("brief: a pass proposes in one MEMORY minute and writes no memory file",
+               "**MEMORY** · role-test-role-refine-card-42 · #42" in out and "never write" in out.lower() and "Never commit, stage or push" in out
+               and "bin/role apply" in out and "candidates.md` is committed" not in out)
         expect("no unfilled placeholders", "{{" not in out)
         expect("without --team the brief has no team powers", "Team: " not in out and "**Team:" not in out)
         os.makedirs(os.path.join(ws, "teams"))
         shutil.copy2(os.path.join(HERE, "bin", "team"), os.path.join(ws, "engine", "bin", "team"))
         shutil.copytree(os.path.join(HERE, "fixtures", "teams", "dev-team"), os.path.join(ws, "teams", "dev-team"))
-        rt = role("run", "test-role", "refine", "card", "--controller", "controller-x", "--team", "dev-team", "--dry-run", "--show-brief")
+        rt = role("run", "test-role", "--issue", "42", "refine", "card", "--controller", "controller-x", "--team", "dev-team", "--dry-run", "--show-brief")
         expect("--team puts the recipe's powers in the brief, and its value is not read as the task",
                rt.returncode == 0 and "**Team: dev-team**" in rt.stdout and "gh pr create --draft" in rt.stdout
                and "session:   role-test-role-refine-card\n" in rt.stdout and "{{" not in rt.stdout)
@@ -1479,46 +1706,50 @@ def self_test():
             expect(f"--team {tm}: settings deny what the recipe withholds",
                    ("Bash(gh pr create*)" in dn) == (not has_draft) and ("Bash(*bin/land*)" in dn) == (not has_land))
         expect("no --team leaves the settings as they were", "Bash(*bin/land*)" not in _role_settings("s", 0)["permissions"]["deny"])
-        expect("--team with an unknown recipe is refused", role("run", "test-role", "x", "--controller", "c", "--team", "nope", "--dry-run").returncode != 0)
+        expect("--team with an unknown recipe is refused", role("run", "test-role", "--issue", "42", "x", "--controller", "c", "--team", "nope", "--dry-run").returncode != 0)
         expect("dry run writes no settings", not os.path.exists(os.path.join(ws, ".claude", "role-sessions")))
-        expect("dry run says the pass issue opens at launch", "opened at launch" in out and "label refine" not in out and "label test-role-pass" in out)
+        expect("dry run shows the initiative issue and opens nothing", "issue:     https://github.com/acme-co/acme-office/issues/42" in out and "pass issue" not in out)
+        expect("run needs --issue N", role("run", "test-role", "x", "--controller", "c", "--dry-run").returncode != 0
+               and "--issue N" in role("run", "test-role", "x", "--controller", "c", "--dry-run").stderr
+               and role("run", "test-role", "x", "--issue", "abc", "--controller", "c", "--dry-run").returncode != 0)
+        expect("the brief puts minutes and the PROGRESS check on the initiative issue",
+               "gh issue comment 42 -R acme-co/acme-office --body \"PROGRESS:" in out and "pass issue" not in out and "**DECISION** · role-test-role-refine-card-42 · #42" in out)
         stub = os.path.join(tmp, "stubbin")
         os.makedirs(stub)
         glog = os.path.join(tmp, "gh.log")
         with open(os.path.join(stub, "gh"), "w") as f:
-            f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$GH_LOG"\n'
-                    'case "$1 $2" in "issue create") echo https://github.com/acme-co/acme-office/issues/321;; esac\n')
+            f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$GH_LOG"\n')
         os.chmod(os.path.join(stub, "gh"), 0o755)
         saved = {k: os.environ.get(k) for k in ("PATH", "GH_LOG")}
         os.environ.update(PATH=stub + os.pathsep + os.environ["PATH"], GH_LOG=glog)
         try:
-            num, url = _open_pass_issue("analyst", "refine #758", "role-analyst-refine-758", 9)
-            num2, _ = _open_pass_issue("test-role", "x", "role-test-role-x", 7)
+            _record_pass(9, "analyst", "https://github.com/acme-co/acme-office/issues/42", "role-analyst-refine-42")
         finally:
             for k, v in saved.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        calls = open(glog).read().splitlines()
-        expect("pass issue: one per pass, returns number and url", num == 321 and url.endswith("/issues/321") and num2 == 321)
-        expect("pass issue: titled '<role>: <task>', label refine for the analyst, <role>-pass otherwise",
-               any(c.startswith("issue create") and "--title analyst: refine #758" in c and "--label refine" in c for c in calls)
-               and any("--label test-role-pass" in c for c in calls) and any(c.startswith("label create refine") for c in calls))
-        expect("pass issue: body uses the minute header", any("**NOTE** · bin/role · #9" in c for c in calls))
-        expect("pass issue: one RECORD line on the role issue linking it",
-               open(glog).read().count("issue comment 9 -R acme-co/acme-office --body **RECORD** · bin/role · #9\nanalyst pass opened: https://github.com/acme-co/acme-office/issues/321") == 1)
+        expect("one RECORD line on the role issue links the initiative issue and the session",
+               open(glog).read().count("issue comment 9 -R acme-co/acme-office --body **RECORD** · bin/role · #9\nanalyst pass started on https://github.com/acme-co/acme-office/issues/42: session `role-analyst-refine-42`") == 1
+               and "issue create" not in open(glog).read() and "label create" not in open(glog).read())
         write(f"- m2 2026-10-07: pending line (#7) {u1}")
-        expect("run refuses while a memory diff waits", role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0)
+        two = os.path.join(tmp, "two.json")
+        json.dump([{"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws", "state": "busy", "pid": 7001},
+                   {"name": "role-test-role-old2", "sessionId": "s2", "cwd": "/fixture/ws", "state": "blocked"}], open(two, "w"))
+        ps = os.path.join(tmp, "ps.jsonl")
+        with open(ps, "w") as f:
+            f.write(json.dumps({"pid": 7001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"]}) + "\n")
+        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "--issue", "42", "x", "--liaison", "l", "--dry-run"], cwd=ws,
+                           env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=two, BUSYBODY_PS_FILE=ps), capture_output=True, text=True)
+        expect("a second pass launches while one runs, and with a memory diff waiting (parallel passes)", r.returncode == 0 and "session:   role-test-role-x" in r.stdout)
+        globals()["_AGENTS"] = [{"name": "role-test-role-x"}]
+        expect("a second pass with the same task gets its own session name", _session_name("test-role", "x") == "role-test-role-x-2")
+        globals()["_AGENTS"] = None
         sh("git", "checkout", "--", MEM)
-        busy = os.path.join(tmp, "busy.json")
-        json.dump([{"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws", "state": "busy"}], open(busy, "w"))
-        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
-                           env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=busy), capture_output=True, text=True)
-        expect("run refuses while a pass is running", r.returncode != 0 and "already has a running session" in r.stderr)
-        expect("run needs a controller", role("run", "test-role", "x", "--dry-run").returncode != 0)
+        expect("run needs a controller", role("run", "test-role", "--issue", "42", "x", "--dry-run").returncode != 0)
         expect("run refuses a disabled role", (role("disable", "test-role", "t").returncode == 0
-               and role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0
+               and role("run", "test-role", "--issue", "42", "x", "--liaison", "l", "--dry-run").returncode != 0
                and role("enable", "test-role").returncode == 0))
         deny = json.load(open(os.path.join(HERE, "templates", "role-settings.json")))["deny"]
         expect("role settings deny git writes and accepting memory", "Bash(git commit*)" in deny and "Bash(*bin/role accept*)" in deny)
@@ -1665,8 +1896,8 @@ def self_test():
         expect("a candidates-only diff is not a waiting diff", "memory diff waiting" not in " ".join(json.loads(role("status", "--json").stdout)["roles"][0]["flags"])
                and "0 memory item" not in role("batch", "test-role").stdout and "no memory items" in role("batch", "test-role").stdout)
         expect("run does not refuse on a candidates-only diff and commits it first",
-               role("run", "test-role", "x", "--controller", "l", "--dry-run").returncode == 0)
-        r = role("run", "test-role", "x", "--controller", "l", "--dry-run")
+               role("run", "test-role", "--issue", "42", "x", "--controller", "l", "--dry-run").returncode == 0)
+        r = role("run", "test-role", "--issue", "42", "x", "--controller", "l", "--dry-run")
         sh("git", "checkout", "--", MEM)
         with open(cpath, "a") as f:
             f.write(cline(51) + "\n")
@@ -1787,6 +2018,162 @@ def self_test():
         st = json.loads(role("status", "--json").stdout)["roles"][0]
         expect("status flags expired candidates", any("older than 60 days" in f for f in st["flags"]))
         sh("git", "checkout", "--", MEM)
+        # role apply: a pass's MEMORY minute becomes candidates, one commit per line, ids renumbered, under a lock
+        set_cands()
+        bodies = os.path.join(tmp, "minutes")
+        os.makedirs(bodies)
+        gh2 = os.path.join(tmp, "stubgh2")
+        os.makedirs(gh2)
+        with open(os.path.join(gh2, "gh"), "w") as f:
+            f.write('#!/bin/sh\ncase "$2" in */issues/comments/*) cat "$GH_BODY_DIR/${2##*/}";; */issues/*/comments) d=${2%/comments}; cat "$GH_BODY_DIR/list-${d##*/}";; esac\n')
+        os.chmod(os.path.join(gh2, "gh"), 0o755)
+        env.update(PATH=gh2 + os.pathsep + env["PATH"], GH_BODY_DIR=bodies)
+        murl = lambda n: f"https://github.com/acme-co/acme-office/issues/42#issuecomment-{n}"
+
+        def minute(n, who, *lines):
+            with open(os.path.join(bodies, str(n)), "w") as f:
+                f.write(f"**MEMORY** · {who} · #42\n{len(lines)} proposed lesson(s)\n\n" + "\n".join(lines) + "\n")
+        ln = lambda i, tag, link=True: f'- c{i} {today().isoformat()}: Lesson {tag}. Changes: ask {tag} first. "always ask {tag}"' + (f" ({cu(500 + i)})" if link else "")
+        minute(555, "role-test-role-pass-a", ln(1, "A1"), ln(2, "A2"))
+        minute(556, "role-test-role-pass-b", ln(1, "B1"), ln(2, "B2", link=False), ln(3, "B3"))
+        c0 = sh("git", "rev-list", "--count", "HEAD").stdout.strip()
+        ra, rb = role("apply", "test-role", murl(555)), role("apply", "test-role", murl(556))
+        got = open(cpath).read().splitlines()
+        ids = [re.match(r"- c(\d+) ", l).group(1) for l in got if l.startswith("- c")]
+        expect(f"two passes' proposals apply in sequence with no id collision (rc {ra.returncode}/{rb.returncode})",
+               ra.returncode == 0 and rb.returncode == 0 and len(ids) == 4 == len(set(ids))
+               and all(t in open(cpath).read() for t in ("Lesson A1", "Lesson A2", "Lesson B1", "Lesson B3")))
+        expect("the guard still refuses a proposed line with no evidence link: reported and skipped, the others applied",
+               "Lesson B2" not in open(cpath).read() and "skipped (guard refused)" in rb.stdout and "applied" in rb.stdout)
+        expect("each applied line is its own `role(<role>): candidates` commit through the guard, leaving nothing uncommitted",
+               int(sh("git", "rev-list", "--count", "HEAD").stdout.strip()) - int(c0) == 4
+               and set(sh("git", "log", "-4", "--format=%s").stdout.split("\n")) - {""} == {"role(test-role): candidates"}
+               and sh("git", "status", "--porcelain").stdout.strip() == "" and "Lesson B3" in head_cands())
+        expect("session matching is exact: role a does not claim a session of role a-b",
+               _pass_session_ok("test", "role-test-role-x", ["test"]) and not _pass_session_ok("test", "role-test-role-x", ["test", "test-role"])
+               and _pass_session_ok("test-role", "role-test-role-x", ["test", "test-role"]))
+        again = role("apply", "test-role", murl(555))
+        expect("applying a minute twice adds nothing", again.returncode == 0 and again.stdout.count("already applied") == 2 and open(cpath).read().splitlines() == got)
+        minute(557, "role-other-x", ln(1, "O1"))
+        with open(os.path.join(bodies, "558"), "w") as f:
+            f.write("**DONE** · role-test-role-pass-a · #42\nnot a memory minute\n")
+        expect("a minute of another role, or not a MEMORY minute, is refused",
+               role("apply", "test-role", murl(557)).returncode != 0 and role("apply", "test-role", murl(558)).returncode != 0
+               and role("apply", "test-role", "https://example.com/x").returncode != 0 and "Lesson O1" not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
+        with open(os.path.join(bodies, "704"), "w") as fh:
+            fh.write("**MEMORY** · role-test-role-pass-a · #43\n1\n\n" + ln(1, "H1") + "\n")
+        minute(705, "role-test-role-ghost", ln(1, "G1"))
+        expect("apply refuses a header #N that is not its link's issue, and a session `claude agents` does not know",
+               role("apply", "test-role", murl(704)).returncode != 0 and role("apply", "test-role", murl(705)).returncode != 0
+               and "Lesson H1" not in open(cpath).read() and "Lesson G1" not in open(cpath).read())
+        # a git index.lock collision is an error to re-run, never "skipped (guard refused)"
+        minute(706, "role-test-role-pass-a", ln(1, "L1"))
+        open(os.path.join(ws, ".git", "index.lock"), "w").close()
+        r = role("apply", "test-role", murl(706))
+        os.remove(os.path.join(ws, ".git", "index.lock"))
+        expect("an index.lock collision is reported as an error, the line is not applied, and nothing is left on disk",
+               r.returncode != 0 and "guard refused" not in r.stdout and "index.lock" in r.stderr and "Lesson L1" not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
+        # every committing command takes the one lock
+        import fcntl as _fc
+        with open(os.path.join(ws, ".git", "role-apply.lock"), "w") as held:
+            _fc.flock(held, _fc.LOCK_EX)
+            blocked = []
+            for cmd in (("commit-candidates", "test-role"), ("triage", "test-role"), ("promote", "test-role", "c1")):
+                try:
+                    role(*cmd, timeout=2)
+                    blocked.append(False)
+                except subprocess.TimeoutExpired:
+                    blocked.append(True)
+        expect("commit-candidates, triage and promote wait for the lock another commit holds", blocked == [True, True, True])
+        sh("git", "checkout", "--", MEM)
+        # triage: (a) a line whose evidence is a verified ANSWER is promoted at once, (b) a repo lesson becomes a CLAUDE.md item,
+        # (c) the rest is printed with the checklist for --accept / --drop. The ANSWER must be the candidate's own link, on its issue,
+        # quote it, and follow a DECISION of the pass.
+        S = "role-test-role-pass-t"
+        bodies_of = {600: f"**DECISION** · {S} · #42\nwhich?\n", 601: "**ANSWER** · office · #42\nthe owner said so, clearly\n",
+                     602: "**NOTE** · controller · #42\nnot an answer\n", 603: "**ANSWER** · office · #42\nanother answer\n",
+                     612: "**ANSWER** · office · #42\nthe owner said so\n", 613: f"**ANSWER** · {S} · #42\nthe owner said so\n",
+                     614: "**ANSWER** · office · #42\nunrelated text here\n", 615: "**ANSWER** · role-test-role-pass-x · #42\nthe owner said so\n",
+                     616: "ANSWER (from the user): \"the owner said so\"\n", 617: "**ANSWER** · controller · #42\nthe owner said so, via the controller\n"}
+        for n, head in bodies_of.items():
+            with open(os.path.join(bodies, str(n)), "w") as fh:
+                fh.write(head)
+        with open(os.path.join(bodies, "620"), "w") as fh:   # a real ANSWER comment, but not among the issue's own comment list
+            fh.write("**ANSWER** · office · #42\nthe owner said so\n")
+        with open(os.path.join(bodies, "700"), "w") as fh:
+            fh.write("**ANSWER** · office · #7\nthe owner said so\n")
+        with open(os.path.join(bodies, "list-42"), "w") as fh:   # comment 612 has no earlier DECISION of pass U, so it is "before any decision"
+            fh.write("".join(json.dumps({"id": n, "body": b}) + "\n" for n, b in sorted(bodies_of.items())))
+        tl = lambda i, tag, extra="", url=None, quote="the owner said so": (f'- c{i} {today().isoformat()}: Lesson {tag}{extra}. Changes: ask {tag} first. "{quote}" ({url or murl(602)})')
+        set_cands()
+        minute(701, S, tl(1, "T1", url=murl(601)), tl(2, "T2", " (repo: acme-api)", url=murl(601)), tl(3, "T3"), tl(4, "T4"),
+               tl(5, "T5", url=f"https://github.com/acme-co/acme-office/issues/7#issuecomment-700"),
+               tl(6, "T6", url=murl(601), quote="words nobody said"), tl(7, "T7", url=murl(613)),
+               tl(9, "T9", url=murl(615)), tl(10, "T10", url=murl(616)), tl(11, "T11", url=murl(620)),
+               tl(12, "T12", url=murl(601), quote="office"), tl(13, "T13", url=murl(601), quote="ANSWER"),
+               tl(14, "T14", url=murl(614), quote="ANSWER** · office · #42"), tl(15, "T15", url=murl(617)),
+               tl(16, "T16", url=murl(602)), tl(17, "T17", url=murl(601), quote="The Owner Said So"))
+        minute(702, "role-test-role-pass-u", tl(1, "T8", url=murl(612)))
+        expect("apply of the triage minutes", role("apply", "test-role", murl(701)).returncode == 0 and role("apply", "test-role", murl(702)).returncode == 0)
+        # a hand-written line that reuses a recorded candidate's id (and cites a real ANSWER) inherits nothing
+        sh("git", "checkout", "--", MEM)
+        c16 = re.search(r"^- c(\d+) .*Lesson T16\b", open(cpath).read(), re.M).group(1)
+        with open(cpath, "w") as fh:
+            fh.write("".join((tl(int(c16), "T16x", url=murl(601)) if re.match(rf"- c{c16} ", l) else l) + "\n" for l in head_cands().splitlines()))
+        sh("git", "add", "-A")
+        sh("git", "commit", "-q", "-m", "hand edit")
+        cid = lambda tag: re.search(rf"^- c(\d+) .*Lesson {tag}\b", open(cpath).read(), re.M).group(1)
+        c1, c2, c3, c4, c15 = (cid(t) for t in ("T1", "T2", "T3", "T4", "T15"))
+        _json_sources = lambda: json.load(open(os.path.join(ws, ".git", "role-candidate-sources.json")))
+        n0 = n_uses()
+        r = role("triage", "test-role")
+        expect(f"triage (a): a line quoting a verified ANSWER is promoted as one use (rc {r.returncode})",
+               r.returncode == 0 and f"[c{c1}] auto-accepted" in r.stdout and n_uses() == n0 + 2
+               and any("Lesson T1" in l and l.endswith(" answer") for l in head_mem().splitlines()) and f"- c{c1} " not in head_cands())
+        forged = ("T9", "T10", "T11", "T12", "T13", "T14", "T16x", "T17")
+        expect("triage (a) refuses: an ANSWER signed by another name, the legacy `ANSWER (from the user)` form, an ANSWER id not in the issue's comment list, "
+               "a quote of 'office' or 'ANSWER' or only of the header, a case-different quote, and a line that merely reuses a recorded id",
+               all(f"[c{cid(t)}] auto-accepted" not in r.stdout and f"- c{cid(t)} " in head_cands() for t in forged) and not any(f"Lesson {t}." in head_mem() for t in forged))
+        expect("triage (a) accepts an ANSWER signed by the controller", f"[c{c15}] auto-accepted" in r.stdout)
+        expect("a promoted candidate's source is forgotten", c1 not in _json_sources().get("test-role", {}) and c16 in _json_sources().get("test-role", {}))
+        expect("triage (a) refuses forgeries: an ANSWER on another issue, an ANSWER with no earlier DECISION of the pass, a quote the ANSWER does not hold, "
+               "and an ANSWER the pass wrote itself",
+               all(f"[c{cid(t)}] auto-accepted" not in r.stdout and f"- c{cid(t)} " in head_cands() for t in ("T5", "T8", "T6", "T7"))
+               and not any(t in head_mem() for t in ("Lesson T5", "Lesson T6", "Lesson T7", "Lesson T8")))
+        expect("triage (b): a repo lesson is not promoted and becomes a CLAUDE.md PR item",
+               f"[c{c2}] propose a CLAUDE.md PR to acme-api" in r.stdout and f"- c{c2} " in head_cands() and "Lesson T2" not in head_mem())
+        expect("triage (c): anything else is printed with the four-point checklist and left alone",
+               f"[c{c3}]" in r.stdout and "non-derivable? checkable? cites its source? small?" in r.stdout and f"--accept c{c3}" in r.stdout
+               and f"- c{c3} " in head_cands() and "Lesson T3" not in head_mem())
+        expect("promote --trigger answer is refused from the CLI", role("promote", "test-role", f"c{c3}", "--trigger", "answer").returncode != 0
+               and "Lesson T3" not in open(mem).read())
+        expect("apply skips a line already promoted into MEMORY.md (a promoted line is its candidate's text plus a link and marker)",
+               role("apply", "test-role", murl(701)).returncode == 0 and "Lesson T1." not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
+        expect("triage never asks the owner: it leaves no memory diff behind", sh("git", "status", "--porcelain").stdout.strip() == "" and n_uses() == n0 + 2)
+        r = role("triage", "test-role", "--accept", f"c{c3}")
+        expect("--accept needs the guard's trigger (a single link with no generality word is refused, nothing changes)",
+               r.returncode != 0 and n_uses() == n0 + 2 and f"- c{c3} " in head_cands() and sh("git", "status", "--porcelain").stdout.strip() == "")
+        r = role("triage", "test-role", "--accept", f"c{c3}", "--link", murl(603))
+        expect(f"--accept cN --link URL2 promotes it as one use (rc {r.returncode})",
+               r.returncode == 0 and n_uses() == n0 + 3 and "Lesson T3" in head_mem() and f"- c{c3} " not in head_cands())
+        n1 = n_uses()
+        c_before = sh("git", "rev-list", "--count", "HEAD").stdout.strip()
+        r = role("triage", "test-role", "--drop", f"c{c4}")
+        expect("--drop cN removes it with a `role(<role>): candidates` commit, not a use",
+               r.returncode == 0 and f"- c{c4} " not in head_cands() and n_uses() == n1
+               and sh("git", "log", "-1", "--format=%s").stdout.strip() == "role(test-role): candidates"
+               and int(sh("git", "rev-list", "--count", "HEAD").stdout.strip()) == int(c_before) + 1)
+        expect("--accept/--drop of a missing candidate is refused", role("triage", "test-role", "--drop", "c999").returncode != 0
+               and role("triage", "test-role", "--accept", "x1").returncode != 0)
+        set_cands(tl(75, "T5"))
+        role("promote", "test-role", "c75", "--link", murl(603))
+        fl = " ".join(json.loads(role("status", "--json").stdout)["roles"][0]["flags"])
+        expect("status says a waiting diff waits for the controller, never the owner", "waiting for controller triage" in fl and "owner" not in fl)
+        role("reject", "test-role", "--redo")
+        sh("git", "checkout", "--", MEM)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("self-test: " + ("PASS" if ok else "FAIL"))
@@ -1795,7 +2182,7 @@ def self_test():
 
 COMMANDS = {"status": cmd_status, "list": cmd_status, "cost": cmd_cost, "review": cmd_review, "diff": cmd_diff,
             "accept": cmd_accept, "batch": cmd_batch, "reject": cmd_reject, "new": cmd_new, "keep": cmd_keep, "disable": cmd_disable,
-            "enable": cmd_enable, "promote": cmd_promote, "commit-candidates": cmd_commit_candidates, "archive": cmd_archive, "restore": cmd_restore, "run": cmd_run, "check": cmd_check, "install-hook": cmd_install_hook}
+            "enable": cmd_enable, "promote": cmd_promote, "commit-candidates": cmd_commit_candidates, "archive": cmd_archive, "restore": cmd_restore, "apply": cmd_apply, "triage": cmd_triage, "run": cmd_run, "check": cmd_check, "install-hook": cmd_install_hook}
 
 
 def main(argv):

@@ -5,8 +5,8 @@ back after the background daemon restarts. So the room's process is matched by i
 `-n <room>` (the exact name, never a prefix, so another room is never touched), sent SIGTERM, waited for, and SIGKILLed only if it
 ignores TERM past the grace period. A live background session runs as `claude bg-spare --bg-spare <sock>` with no `-n`, so the
 name is resolved first through `claude agents --json` (each background session lists its pid); the `-n <name>` command-line match
-is the fallback for other shapes. A name the agents list knows but whose process cannot be ended is a FAILURE; only a name that is
-neither listed nor running is "already gone". $BUSYBODY_AGENTS_JSON (a file of that JSON) replaces `claude agents --json`;
+is the fallback for other shapes. `is_live` is the one test for "this listed session is running". A name the agents list knows but whose process cannot be matched has nothing to end and counts as stopped
+(a session whose process died still lingers in the list), as does a name that is neither listed nor running. $BUSYBODY_AGENTS_JSON (a file of that JSON) replaces `claude agents --json`;
 $BUSYBODY_PS_FILE (JSON lines {"pid": N, "argv": [...]}) replaces /proc as the process table
 and $BUSYBODY_NO_SIGNAL=1 makes signals no-ops that are only reported (test hooks).
 """
@@ -86,6 +86,22 @@ def names_session(argv, name):
         if a == f"--name={name}":
             return True
     return False
+
+
+DEAD_STATES = ("done", "failed", "stopped", "completed")
+
+
+def is_live(agent, table=None):
+    """True when a `claude agents` entry is a running session: its state is not a finished one AND a claude process backs it (its pid is
+    a claude process, or some claude command line carries `-n <name>`). A listed session with no process is never live, whatever its state says
+    (a blocked or working entry survives its dead process in the list). Pass `table` (processes()) when checking many entries."""
+    if str(agent.get("state", "")).lower() in DEAD_STATES:
+        return False
+    table = table if table is not None else processes()
+    pid, name = agent.get("pid"), agent.get("name")
+    if isinstance(pid, int) and any(p == pid and is_claude(argv) for p, argv in table):
+        return True
+    return bool(name) and any(is_claude(argv) and names_session(argv, name) for _, argv in table)
 
 
 def ancestors():
@@ -181,12 +197,12 @@ def alive(pid, table=None):
 
 def end(name, grace=10.0, poll=0.2, table_fn=None, send=None, agents=None):
     """End the session's process(es). Returns (ok, lines): ok when none is left; lines say what happened (including a SIGKILL).
-    Listed by `claude agents --json` but nothing to end is a failure; only a name that is not listed and has no process is gone."""
+    A listed session with no claude process left (pid missing, gone or not claude) has nothing to end: it is stopped, not a failure."""
     send = send or (lambda pid, sig: None if os.environ.get("BUSYBODY_NO_SIGNAL") == "1" else os.kill(pid, sig))
     pids, listed = find(name, table_fn() if table_fn else None, agents)
     if not pids:
         if listed:
-            return False, [f"{name}: listed by `claude agents` but no claude process could be matched to end (its pid is missing, gone or not a claude process)"]
+            return True, [f"{name}: listed by `claude agents` but no claude process (its pid is missing, gone or not a claude process): nothing to end, treated as stopped"]
         return True, [f"{name}: not listed and no process found (already gone)"]
     return end_pids(name, pids, grace, poll, table_fn, send)
 
@@ -277,7 +293,10 @@ def self_test():
     both = [{"name": "room-a", "pid": 10}, {"name": "room-a", "pid": 11}]
     ok, lines = end("room-a", grace=0.3, poll=0.05, table_fn=lambda: [(p, a) for p, a in table if state.get(p, "up") == "up"], send=send, agents=both)
     eq("TERM then KILL for the one that ignores it", (ok, (11, signal.SIGKILL) in sent, (10, signal.SIGKILL) in sent, any("SIGKILL was sent" in l for l in lines)), (True, True, False, True))
-    eq("listed but nothing endable is a failure", end("room-c", table_fn=lambda: table, send=send, agents=agents)[0], False)
+    eq("listed but no process (pid missing) is stopped, not a failure", end("room-c", table_fn=lambda: table, send=send, agents=agents)[0], True)
+    eq("is_live: a process (pid or -n) and a running state", (is_live({"name": "room-b", "pid": 11, "state": "working"}, table), is_live({"name": "room-d", "state": "working"}, table)), (True, True))
+    eq("is_live: pid-less blocked, finished, dead pid or non-claude pid are not live", [is_live(a, table) for a in (
+        {"name": "room-c", "state": "blocked"}, {"name": "room-a", "pid": 10, "state": "done"}, {"name": "room-f", "pid": 99, "state": "working"}, {"name": "room-e", "pid": 15, "state": "working"})], [False] * 4)
     eq("not listed and not running is gone (success)", end("room-zz", table_fn=lambda: table, send=send, agents=agents)[0], True)
     # a known pid: session_of_pid refuses a pid that is not a room or role claude process
     eq("session_of_pid: listed bg-spare", session_of_pid(10, table, agents), "room-a")
@@ -319,6 +338,10 @@ def self_test():
         r = subprocess.run([sys.executable, "-I", script, str(plain.pid)], env=env, capture_output=True, text=True)
         eq("a pid that is not a session is refused and left alone", (r.returncode != 0, plain.poll() is None), (True, True))
         plain.kill()
+        # a listed session with no process is stopped: end-session says so and returns 0
+        json.dump([{"name": "room-c", "pid": None, "state": "blocked"}], open(f, "w"))
+        r = subprocess.run([sys.executable, "-I", script, "room-c"], env=env, capture_output=True, text=True)
+        eq("end-session on a pid-less listed session returns 0", (r.returncode, "treated as stopped" in r.stdout), (0, True))
     if bad:
         print("sessions self-test: FAILED: " + "; ".join(bad))
         return 1

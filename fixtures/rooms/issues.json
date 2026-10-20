@@ -58,7 +58,13 @@
    }
   ],
   "body": "Goal only",
-  "comments": []
+  "comments": [
+   {
+    "body": "**DECISION** \u00b7 role-scribe-tidy-notes \u00b7 #8\nwhich notes on an issue with no room?\n\nOptions: inbox, archive",
+    "url": "https://github.com/x/y/issues/8#c1",
+    "createdAt": "2026-10-06T02:50:00Z"
+   }
+  ]
  },
  {
   "number": 9,
@@ -73,7 +79,13 @@
    }
   ],
   "body": "## Room\n- room: room-beta\n- repo: acme-api\n",
-  "comments": []
+  "comments": [
+   {
+    "body": "**DECISION** \u00b7 role-scribe-second \u00b7 #9\nand on a room?\n\nOptions: yes, no",
+    "url": "https://github.com/x/y/issues/9#c1",
+    "createdAt": "2026-10-06T02:55:00Z"
+   }
+  ]
  },
  {
   "number": 12,

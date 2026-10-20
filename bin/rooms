@@ -19,9 +19,12 @@ line in the room's own PROGRESS/WAITING minutes, else the last phase while a wat
 phase when the room has posted at most its first minute, else null).
 Top level `decisions[]` = DECISIONs with no later ANSWER, from rooms and from role issues (those carry
 `role` and address the running role session, so an answer from the office nudges it).
-Pass issues (open, title `<role>: <task>`, label `refine` or `<role>-pass`) put their own DECISIONs on the list,
-addressed to `role-<role>-<slug of task>`; the role issue still feeds it for older passes.
-Top level `role_sessions[]` = running `role-<role>-*` sessions, shaped like a room's `lead` (the room lead's status).
+A role pass runs on its initiative's issue: a DECISION there whose header is `**DECISION** · role-<role>-<slug> · #N`
+is addressed to that pass session (never to the room lead), whether or not the initiative has a `## Room` block, and
+leaves the room's own `open_decisions` alone. Older passes had an issue of their own (open, title `<role>: <task>`, label `refine`
+or `<role>-pass`): those, and the role issue, still feed the list.
+Top level `role_sessions[]` = every running `role-<role>-*` session (parallel passes of one role are all listed, each with the initiative
+`issue` it posts on), shaped like a room's `lead` (the room lead's status).
 Top level `stages` = the stage table, most complete first (`parked` last), and `tasks[]` = the tracker, one row per open initiative issue
 (with or without a Room block; a closed one is gone, `stage:complete` is a label on an open one). Role passes are not rows.
 Each row: number, name (`Friendly name (N-issue)`), url, stage (the issue's one `stage:<name>` label, none = idea; `stage_warning` when
@@ -317,11 +320,29 @@ def build_roles(role_doc):
     return [role_entry(r) for r in (role_doc or {}).get("roles", []) if r.get("name")]
 
 
-def active_session(agents, role):
-    """The role's running session (`role-<role>-*`, not finished), newest first, or None."""
-    live = [a for a in agents if (a.get("name") or "").startswith(f"role-{role}-")
-            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
-    return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
+def role_of_session(session, roles):
+    """The role a `role-<role>-<slug>` session belongs to: the longest known role name that prefixes it, else None."""
+    hits = [r for r in roles if (session or "").startswith(f"role-{r}-")]
+    return max(hits, key=len) if hits else None
+
+
+def live_sessions(agents, role, roles):
+    """The role's running sessions (`role-<role>-*`, a live process behind each, not another role's), newest first."""
+    table = sessions.processes()
+    live = [a for a in agents if role_of_session(a.get("name"), roles) == role and sessions.is_live(a, table)]
+    return sorted(live, key=lambda a: -(a.get("startedAt") or 0))
+
+
+def split_decisions(comments, now, roles):
+    """(room, passes): an issue's open DECISIONs, split into the room lead's and the role passes' ([(decision, role)])."""
+    room_d, pass_d = [], []
+    for d in open_decisions(comments, now):
+        role = role_of_session(d.get("who"), roles)
+        if role:
+            pass_d.append((d, role))
+        else:
+            room_d.append(d)
+    return room_d, pass_d
 
 
 def pass_slug(task):
@@ -332,17 +353,25 @@ def pass_slug(task):
 def pass_session(agents, role, task):
     """A pass issue's running session: `role-<role>-<slug>[-n]` from its title, not finished, or None."""
     slug = f"role-{role}-{pass_slug(task)}"
-    live = [a for a in agents if re.fullmatch(re.escape(slug) + r"(-\d+)?", a.get("name") or "")
-            and str(a.get("state", "")).lower() not in ("done", "failed", "stopped", "completed")]
+    table = sessions.processes()
+    live = [a for a in agents if re.fullmatch(re.escape(slug) + r"(-\d+)?", a.get("name") or "") and sessions.is_live(a, table)]
     return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
 
 
-def role_inbox(role_issues, agents, now, pass_issues=None):
+def roles_on_disk():
+    """Standing roles of this workspace: roles/<name>/role.json (a role with no issue is still a role)."""
+    import glob
+    return {os.path.basename(os.path.dirname(f)) for f in glob.glob(os.path.join(WORKSPACE_ROOT, "roles", "*", "role.json"))}
+
+
+def role_inbox(role_issues, agents, now, pass_issues=None, initiatives=(), known_roles=()):
     """(role_sessions[], decisions[]): the sticky notes role sessions have put to the owner, each addressed
     to the running session by name so the office can nudge it; the session entry has the same `lead`
     shape as a room, which is what the nudge reads. Notes come from the pass's own issue (open, titled
-    `<role>: <task>`, labelled `refine` or `<role>-pass`) and from the role issue (older passes)."""
+    `<role>: <task>`, labelled `refine` or `<role>-pass`) and from the role issue (older passes), and, for a pass on an initiative, from
+    that initiative's issue (a minute whose "who" is the pass session), with or without a Room block."""
     sessions, decisions, seen = [], [], set()
+    roles = set(role_issues or {}) | set(known_roles)
 
     def add_session(ag, role, number, comments=()):
         if ag["name"] not in seen:
@@ -364,13 +393,26 @@ def role_inbox(role_issues, agents, now, pass_issues=None):
         for d in open_decisions(iss.get("comments", []), now):
             d.update({"room": name, "issue": iss["number"], "repo": OFFICE.workspace_repo, "role": role})
             decisions.append(d)
-    for role, iss in sorted((role_issues or {}).items()):
-        ag = active_session(agents, role)
-        name = ag["name"] if ag else f"role-{role}"
-        if ag:
-            add_session(ag, role, iss["number"])
-        for d in open_decisions(iss.get("comments", []), now):
+    where = {}  # session -> (initiative issue number, its minutes), from the minutes the session wrote there
+    for iss in initiatives:
+        for c in iss.get("comments", []):
+            who = (parse_minute(c.get("body")) or {}).get("who")
+            if role_of_session(who, roles):
+                where.setdefault(who, (iss["number"], []))[1].append(c)
+    for role in sorted(roles):
+        iss = (role_issues or {}).get(role)
+        live = live_sessions(agents, role, roles)
+        for ag in live:
+            number, own = where.get(ag["name"], (iss["number"] if iss else None, []))
+            add_session(ag, role, number, own)
+        name = live[0]["name"] if live else f"role-{role}"
+        for d in open_decisions(iss.get("comments", []), now) if iss else []:
             d.update({"room": name, "issue": iss["number"], "repo": OFFICE.workspace_repo, "role": role})
+            decisions.append(d)
+    for iss in sorted(initiatives, key=lambda i: i.get("number", 0)):
+        room = parse_room(iss.get("body")) or {}
+        for d, role in split_decisions(iss.get("comments", []), now, roles)[1]:
+            d.update({"room": d["who"], "issue": iss["number"], "repo": room.get("repo") or OFFICE.workspace_repo, "role": role})
             decisions.append(d)
     return sessions, decisions
 
@@ -453,22 +495,23 @@ def build_tasks(doc, issues, now):
 
 
 def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=None, role_issues=None, pass_issues=None,
-          watching=watcher_alive, phases_of=load_phases):
+          watching=watcher_alive, phases_of=load_phases, known_roles=()):
     by_name = {a.get("name"): a for a in agents}
     sl = status_lines(status_text)
+    roles_known = set(role_issues or {}) | set(known_roles)
     caps = costs.get("caps", {"soft": 15.0, "hard": 40.0})
     rooms, decisions = [], []
     for iss in issues:
         room = parse_room(iss.get("body"))
         if not room:
-            continue
+            continue  # no Room block: no room, but a role pass's DECISIONs on it still reach the list (role_inbox)
         name = room["room"]
         labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
         comments = iss.get("comments", [])
         reports = [c for c in comments if classify(c.get("body"))]
         spend = costs.get("rooms", {}).get(name) or {"today": 0.0, "total": 0.0, "mix": {}}
         today = spend.get("today", 0.0)
-        pend = open_decisions(comments, now)
+        pend = split_decisions(comments, now, roles_known)[0]   # a role pass's DECISION is the pass's, not the room lead's
         status = lead_status(by_name.get(name))
         entry = {
             "name": name,
@@ -498,7 +541,7 @@ def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=No
             d.update({"room": name, "issue": iss["number"], "repo": room.get("repo", "")})
             decisions.append(d)
     roles = build_roles(role_doc)
-    role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues)
+    role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues, issues, known_roles)
     decisions += role_decisions
     doc = {
         "generated_at": now.isoformat(),
@@ -558,7 +601,7 @@ def live(now, fresh=False):
     for label in pass_labels:
         pass_issues += mc.issues(label, ("number", "title", "labels", "url", "comments"))
     pass_issues = list({i["number"]: i for i in pass_issues}.values())
-    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues)
+    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues, known_roles=roles_on_disk())
     attach_prs(doc)
     doc["tasks"] = build_tasks(doc, issues, now)   # again: a room's PR decides whether it needs the owner
     doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["needs_you"])
@@ -665,8 +708,12 @@ def self_test():
     load = lambda n: json.load(open(os.path.join(d, n)))
     now = parse_ts("2026-10-06T03:00:00Z")
     status_text = open(os.path.join(d, "status.txt")).read()
+    os.environ["BUSYBODY_PS_FILE"] = os.path.join(d, "ps.jsonl")   # the process table: only pid 7001 (the scribe pass) is running
     got = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, load("roles.json"),
                 None, load("role-issues.json"), load("pass-issues.json"))
+    norole = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, None, None, None, None, known_roles={"scribe"})
+    ghost = live_sessions([a for a in load("agents.json") if a["name"] == "role-scribe-ghost"], "scribe", {"scribe"})
+    os.environ.pop("BUSYBODY_PS_FILE")
     none = build([], [], {}, "", now, None, "bin/role status failed: boom")
     by = {r["name"]: r for r in got["rooms"]}
     alpha, beta = by.get("room-alpha"), by.get("room-beta")
@@ -698,15 +745,25 @@ def self_test():
         ("only the unanswered DECISION is open", [d["first_line"] for d in got["decisions"] if d["room"] == "room-alpha"] == ["DECISION: second question?"]),
         ("role session questions join the sticky notes, addressed to the running session",
          [(d["room"], d["issue"]) for d in got["decisions"] if d.get("role")]
-         == [("role-scribe-tidy-notes", 95), ("role-scribe-tidy-notes", 91)]),
+         == [("role-scribe-tidy-notes", 95), ("role-scribe-second", 91), ("role-scribe-tidy-notes", 8), ("role-scribe-second", 9)]),
+        ("a pass's DECISION on an initiative issue is the pass's: listed with no Room block, addressed to the pass (not the room lead) with one",
+         [(d["first_line"], d["role"], d["repo"]) for d in got["decisions"] if d.get("issue") in (8, 9)]
+         == [("which notes on an issue with no room?", "scribe", "acme-office"), ("and on a room?", "scribe", "acme-api")]
+         and beta and beta["open_decisions"] == 0 and by["room-beta"]["lead"]["status"] == "missing"),
         ("a pass issue's question is addressed to its own running session, on the pass issue; a non-pass issue is ignored",
          [(d["room"], d["issue"], d["role"]) for d in got["decisions"] if d.get("issue") == 95] == [("role-scribe-tidy-notes", 95, "scribe")]
          and not any(d.get("issue") == 96 for d in got["decisions"])),
         ("only a running role session is listed, with the room-shaped lead",
-         [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"]) for s in got["role_sessions"]]
-         == [("role-scribe-tidy-notes", "busy", "sess-scribe")]
-         and got["role_sessions"][0]["issue"] == 95 and none["role_sessions"] == []),
-        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1, "tasks": 6, "needs_you": 2}),
+         [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"], s["issue"]) for s in got["role_sessions"]]
+         == [("role-scribe-tidy-notes", "busy", "sess-scribe", 95), ("role-scribe-second", "busy", "sess-second", 9)]
+         and none["role_sessions"] == []),
+        ("a pid-less blocked role session is not live: not listed, not the active session",
+         "role-scribe-ghost" not in [s["name"] for s in got["role_sessions"]] and ghost == []),
+        ("a role with no role issue is still recognised (known from roles/<name>/role.json): its pass's DECISION and live session are listed",
+         (lambda g: [(d["room"], d["issue"], d["role"]) for d in g["decisions"] if d.get("role")] == [("role-scribe-tidy-notes", 8, "scribe"), ("role-scribe-second", 9, "scribe")]
+          and [s["name"] for s in g["role_sessions"]] == ["role-scribe-second", "role-scribe-tidy-notes"]
+          and none["decisions"] == [])(norole)),
+        ("totals", got["totals"] == {"rooms": 5, "decisions": 6, "today": 7.5, "roles": 2, "memory_reviews": 1, "tasks": 6, "needs_you": 4}),
         ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
          and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
         ("role numbers", roles.get("scribe") and roles["scribe"]["memory"]["index_bytes"] == 2048
@@ -762,13 +819,13 @@ def self_test():
          and got["role_sessions"][0]["team"] == "scribe" and got["role_sessions"][0]["phase"] is None),
         ("tasks: open initiatives (room or not), no role-pass rows; most complete stage first, then most recently updated",
          [(t["number"], t["stage"]) for t in got["tasks"]]
-         == [(12, "ci-deploy"), (9, "review"), (7, "development"), (13, "development"), (14, "idea"), (8, "idea")]
+         == [(12, "ci-deploy"), (9, "review"), (7, "development"), (13, "development"), (8, "idea"), (14, "idea")]
          and not any(t["number"] in (20, 95, 96) for t in got["tasks"]) and got["stages"][0] == "complete" and got["stages"][-1] == "parked"),
         ("tasks: friendly name, room, working flag and age",
          [(t["name"], t["worker"], t["working"], t["age_s"]) for t in got["tasks"] if t["number"] in (7, 8)]
-         == [("Alpha work (7-issue)", "room-alpha", True, 1200), ("No room (8-issue)", None, False, None)]),
+         == [("Alpha work (7-issue)", "room-alpha", True, 1200), ("No room (8-issue)", None, False, 600)]),
         ("tasks: the owner marker is a flag on the row, not a stage or a sort key",
-         [t["number"] for t in got["tasks"] if t["needs_you"]] == [7, 13] and got["totals"]["tasks"] == 6 and got["totals"]["needs_you"] == 2
+         [t["number"] for t in got["tasks"] if t["needs_you"]] == [9, 7, 13, 8] and got["totals"]["tasks"] == 6 and got["totals"]["needs_you"] == 4
          and [t["reason"] for t in got["tasks"] if t["number"] == 7] == ["1 decision to answer"]),
         ("stage labels: none is idea, several or unknown warn, the most complete known one wins, parked is last",
          stage_of([]) == ("idea", None) and stage_of(["stage:review"]) == ("review", None)

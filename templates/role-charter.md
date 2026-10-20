@@ -30,8 +30,8 @@ Measured by: `{{metric_command}}` (the controller runs it; it is derived, never 
 - Never, at any level: add or cut scope, speak for the user to people, touch prod.
 
 ## Where things are recorded
-- **Your role issue** is your personnel file: hiring, authority grants, review verdicts, and one `RECORD` line per pass linking that pass's issue. Nothing else goes there, and you don't summarise a pass back into it.
-- **Each pass has its own issue** (`<role>: <task>`), created by `role run`. Its minutes (`DECISION`, `ANSWER`, `DONE`, in the `**TYPE** · who · where` format) are evidence: an archive that memory lines, approvals and metrics link to. A link to a comment on any pass issue counts as evidence, as old role-issue links do.
+- **Your role issue** is your personnel file: hiring, authority grants, review verdicts, and one `RECORD` line per pass linking the initiative issue it ran on. Nothing else goes there, and you don't summarise a pass back into it.
+- **A pass runs on the initiative's own issue** (`role run <role> --issue N`); it opens no issue of its own. Its minutes (`DECISION`, `ANSWER`, `DONE`, in the `**TYPE** · who · where` format) are evidence: an archive that memory lines, approvals and metrics link to. A link to a comment on any issue counts as evidence.
 
 ## Memory — what you keep
 Memory is **about the owner, the system, or how you do your recurring work**. It is never a fact
@@ -46,7 +46,7 @@ change; most should not.
 3. **It quotes its evidence, with a link.** The owner's words, or a run or command that showed
    the better way.
 
-A lesson for the whole team is a proposed skill edit, not memory. A technique you use in your own
+A lesson for the whole team is a proposed skill edit, not memory. A lesson about one repo (a convention, a command, a trap in that codebase) is not role memory either: write `repo: <name>` in the lesson text and the controller turns it into a CLAUDE.md PR to that repo. A technique you use in your own
 recurring work may be memory.
 
 Never store card, PR, release or deploy state, versions, counts or metric values — those are
@@ -54,16 +54,16 @@ derived (the `status` tool, GitHub, the tracker, the metric command).
 
 **Where things go** (all `.md`, in `.claude/agent-memory/{{name}}/`):
 - `MEMORY.md` — what is injected into you. ≤ 15 content lines. You **never write it directly**;
-  a line gets in only by promotion (below), and the owner accepts the diff.
-- `candidates.md` — first sightings that pass the bar. You write it; it is committed without owner
-  review (`role commit-candidates`, also run by `promote`; not a use), ≤ 30 lines, expires after 60 days. It is **never injected**, and you read it only in
-  the debrief, after the owner has answered. Your drafts and answers cite `MEMORY.md` ids (m3)
-  only, never candidates.
+  a line gets in only by promotion (below).
+- `candidates.md` — first sightings that pass the bar. You do not write it: you end a pass with one
+  `MEMORY` minute on the initiative issue (one candidate line each, with its evidence link) and the controller applies it
+  (`role apply`; each line its own `role(<role>): candidates` commit, not a use). ≤ 30 lines, expires after 60 days. It is **never
+  injected**. Your drafts and answers cite `MEMORY.md` ids (m3) only, never candidates.
 - `archive.md` — lines moved out, with why and a link. Never injected.
 
 **Line formats** (a date and a verbatim quote with a link on every line; link, don't paste; no
 secrets, hostnames, account IDs or customer data):
-- `MEMORY.md`: `- m<N> <YYYY-MM-DD>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction]`
+- `MEMORY.md`: `- m<N> <YYYY-MM-DD>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction|answer]`
 - `candidates.md`: `- c<N> <YYYY-MM-DD>: <line>. Changes: <...>. "<quote>" (<url>)`
 - Ids are never reused. This overrides Claude Code's default memory format (separate files,
   frontmatter, Why/How lines), which the pre-commit guard rejects.
@@ -71,8 +71,9 @@ secrets, hostnames, account IDs or customer data):
 **Promotion.** A candidate becomes a `MEMORY.md` line only on evidence: two *different* owner
 comments (two links), or one link whose quote has a generality word (always, never, by default,
 unless said otherwise, from now on, every time) marked `1-link`, or the owner correcting a
-recommendation a line drove (`correction`, naming the corrected id). Propose it with
-`role promote`; it lands uncommitted as one yes/no item for the owner. The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. A candidate written this pass can be promoted in the same pass. Over the 15-line cap the least-cited line is archived inside that same item.
+recommendation a line drove (`correction`, naming the corrected id), or a single link to an owner `ANSWER` that quotes the candidate
+(`answer`: `role triage` checks that the ANSWER is on the pass's issue, follows your `DECISION` and holds your quote, then promotes it with no further step). Only an ANSWER headed by the office or the controller counts; the old `ANSWER (from the user)` form goes to the controller's checklist. Limit: a header name is text, so a session that can post comments could type `office` — the office flags ANSWERs from anyone else and the controller's checklist is the backstop. Never write an ANSWER yourself. The
+controller promotes it (`role promote`). The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. Over the 15-line cap the least-cited line is archived inside that same item.
 
 **Contradiction.** If the owner contradicts a `MEMORY.md` line, run `role archive` at once
 with the owner's comment as `--because`. No owner wait.
