@@ -15,7 +15,7 @@ Memory-line contract (the busybody:standing-role skill; the owner's bar is in th
               holds a generality word (always, never, by default, unless said otherwise, from now on, every time) |
               `correction` naming a corrected id (`corrects m3`) that is in MEMORY.md or archive.md, (4) reuse no id.
               A line moved back from archive.md (same id and text) is a restore and is exempt from (2) and (3).
-  candidates.md  <= 30 lines, never injected, committed without owner review:
+  candidates.md  <= 30 lines, never injected, written by `role apply` from a pass's MEMORY minute, no owner review:
               - c<N> <date>: <line>. Changes: <...>. "<quote>" (<url>)   (entries older than 60 days are warned about)
   archive.md  never injected: the moved line + ` | archived <date>: <why>, <link>`
 

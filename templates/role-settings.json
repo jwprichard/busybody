@@ -1,5 +1,5 @@
 {
-  "_comment": "Role-session settings template. bin/role run merges the seatbelts of templates/room-settings.json (permissions.deny, minus _unlessProdRead which is always added) with these extras. The `{{tracker.writeDeny}}` entry expands in place to the tracker's write-deny patterns from office.json. A role session runs in the workspace checkout, may only comment on its issue and edit its own memory dir; git writes and the repo's own files are denied. Edit(...) rules are relative to the session cwd.",
+  "_comment": "Role-session settings template. bin/role run merges the seatbelts of templates/room-settings.json (permissions.deny, minus _unlessProdRead which is always added) with these extras. The `{{tracker.writeDeny}}` entry expands in place to the tracker's write-deny patterns from office.json. A role session runs in the workspace checkout, may only comment on its issue and proposes memory in a MEMORY minute (it writes no memory file; the controller runs `role apply`); git writes and the repo's own files are denied. Edit(...) rules are relative to the session cwd.",
   "env": {
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
   },
@@ -18,6 +18,9 @@
     "Bash(git switch*)",
     "Bash(*bin/role accept*)",
     "Bash(*bin/role reject*)",
+    "Bash(*bin/role apply*)",
+    "Bash(*bin/role promote*)",
+    "Bash(*bin/role commit-candidates*)",
     "Bash(*bin/role run*)",
     "Bash(*bin/role disable*)",
     "Bash(*bin/role enable*)",
@@ -40,6 +43,7 @@
     "Edit(fixtures/**)",
     "Edit(mods/**)",
     "Edit(roles/**)",
+    "Edit(.claude/agent-memory/**)",
     "Edit(.claude/agents/**)",
     "Edit(.claude/agents.disabled/**)",
     "Edit(.claude/skills/**)",

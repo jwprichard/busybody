@@ -55,7 +55,7 @@ Do this when the owner asks about the role's area, or the role is due (its `cade
    - `role accept <role> --expect HASH [--items 1,3] --rating-draft R --rating-memory R` (refuses if there is no memory diff — e.g. the owner already accepted it in the office; a use that learned nothing needs `--no-memory`). Add `--confirmed m1,m2 --contradicted m3` for the memory lines the pass cited: the role lists them in its `DONE:`. `role review` flags uses with no such record.
    - `role reject <role> --expect HASH [--redo] --rating-draft R --rating-memory R` (`--redo` restores without recording a use, when the role redoes the pass; plain `reject` keeps held-over items for the next `DONE:`)
    - On an owner contradiction of a `MEMORY.md` line: `role archive <role> mN --because <comment-url>` (commits at once, and works while only `candidates.md` differs).
-   - Candidates are committed without review (`role commit-candidates`) and are never shown as items.
+   - Candidates are never shown as items: a role session proposes them in a `MEMORY` minute and you apply it with `role apply <role> <minute-url>` (one commit per line, through the guard; a line the guard refuses is skipped and reported).
 
    If the use produced drafts the owner approved (e.g. a backlog role's cards), add
    `--drafts approved=N,unedited=M` so the approved and unedited counts are derived from git.
@@ -94,14 +94,14 @@ is done. `--dry-run --show-brief` previews it and launches nothing.
   `ANSWER (from the user): "..."` (old form, still read). If the
   office nudge is blocked, nudge the session yourself: `SendMessage(to: "role-<role>-<slug>", message: "ANSWER: <comment URL>")`
   (see the workspace's `limitations/` for nudges blocked in auto mode). Relay the link only, never the answer.
-- **Hearing the answers is the debrief.** The role records first sightings in `candidates.md` (never `MEMORY.md`),
-  proposes a promotion with `role promote` only on the charter's evidence rule, and posts `DONE:` with at most 5 yes/no items. You don't re-send the answers.
+- **Hearing the answers is the debrief.** The role proposes first sightings in one `MEMORY` minute on the initiative issue (it writes no memory file),
+  then posts `DONE`. You run `role apply <role> <minute-url>` and promote on the charter's evidence rule. You don't re-send the answers.
 - **Workers**: the role spawns its own, named `<role>-c-<task>`. Don't hire for it.
 - **Cost**: billed by session name to the role's line (`role cost <role>`); its `<role>-c-*`
   workers to its worker line.
 - **Memory review**: the diff shows in the office's "memory to review" sticky notes (a memory review is a sticky note on the owner's whiteboard); the owner accepts
-  there, or you run steps 5 as for a subagent. The role session never commits or accepts.
-- **Authority** is still level 0. The session's settings deny git writes, `role accept`, tracker
+  there, or you run steps 5 as for a subagent. The role session never commits, accepts or applies.
+- **Authority** is still level 0. The session's settings deny git writes, `role accept`/`apply`, tracker
   writes and edits to the repo's own files, but only its charter stops a shell redirect: see the workspace's
   `limitations/` on role-session containment.
 - Status: `claude agents` lists the session, `claude logs role-<role>-<slug>` shows it, and

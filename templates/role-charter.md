@@ -54,11 +54,11 @@ derived (the `status` tool, GitHub, the tracker, the metric command).
 
 **Where things go** (all `.md`, in `.claude/agent-memory/{{name}}/`):
 - `MEMORY.md` — what is injected into you. ≤ 15 content lines. You **never write it directly**;
-  a line gets in only by promotion (below), and the owner accepts the diff.
-- `candidates.md` — first sightings that pass the bar. You write it; it is committed without owner
-  review (`role commit-candidates`, also run by `promote`; not a use), ≤ 30 lines, expires after 60 days. It is **never injected**, and you read it only in
-  the debrief, after the owner has answered. Your drafts and answers cite `MEMORY.md` ids (m3)
-  only, never candidates.
+  a line gets in only by promotion (below).
+- `candidates.md` — first sightings that pass the bar. You do not write it: you end a pass with one
+  `MEMORY` minute on the initiative issue (one candidate line each, with its evidence link) and the controller applies it
+  (`role apply`; each line its own `role(<role>): candidates` commit, not a use). ≤ 30 lines, expires after 60 days. It is **never
+  injected**. Your drafts and answers cite `MEMORY.md` ids (m3) only, never candidates.
 - `archive.md` — lines moved out, with why and a link. Never injected.
 
 **Line formats** (a date and a verbatim quote with a link on every line; link, don't paste; no
@@ -71,8 +71,8 @@ secrets, hostnames, account IDs or customer data):
 **Promotion.** A candidate becomes a `MEMORY.md` line only on evidence: two *different* owner
 comments (two links), or one link whose quote has a generality word (always, never, by default,
 unless said otherwise, from now on, every time) marked `1-link`, or the owner correcting a
-recommendation a line drove (`correction`, naming the corrected id). Propose it with
-`role promote`; it lands uncommitted as one yes/no item for the owner. The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. A candidate written this pass can be promoted in the same pass. Over the 15-line cap the least-cited line is archived inside that same item.
+recommendation a line drove (`correction`, naming the corrected id). The
+controller promotes it (`role promote`). The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. Over the 15-line cap the least-cited line is archived inside that same item.
 
 **Contradiction.** If the owner contradicts a `MEMORY.md` line, run `role archive` at once
 with the owner's comment as `--because`. No owner wait.
