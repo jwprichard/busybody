@@ -55,15 +55,12 @@ describe('state parsing', () => {
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect(r.doc.rooms).toHaveLength(3)
-    expect(r.doc.totals).toEqual({ rooms: 3, decisions: 1, today: 61.5, roles: 2, memoryReviews: 1, tasks: 4, needsYou: 2 })
+    expect(r.doc.totals).toEqual({ rooms: 3, decisions: 1, roles: 2, memoryReviews: 1, tasks: 4, needsYou: 2 })
     const a = r.doc.rooms[0]
     expect(a?.name).toBe('room-alpha')
     expect(a?.branch).toBe('feat/alpha')
     expect(a?.lead).toEqual({ status: 'needs_input', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', agentId: 'aaaaaaaa', state: 'needs_input' })
     expect(a?.latest?.ageS).toBe(125)
-    expect(a?.cost?.soft).toBe(15)
-    expect(a?.cost?.hard).toBe(40)
-    expect(a?.openDecisions).toBe(1)
     const b = r.doc.rooms[1]
     expect(b?.capped).toBe(true)
     expect(b?.lead.status).toBe('missing')
@@ -74,15 +71,12 @@ describe('state parsing', () => {
   })
 
   test('tolerates missing fields and unknown statuses', () => {
-    const r = parseOfficeDoc(JSON.stringify({ rooms: [{ name: 'room-x', lead: { status: 'weird' }, room: { caps: 'soft $5/day, hard $9/day' }, cost: { today: 1 } }, { title: 'nameless' }] }))
+    const r = parseOfficeDoc(JSON.stringify({ rooms: [{ name: 'room-x', lead: { status: 'weird' }, room: {} }, { title: 'nameless' }] }))
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect(r.doc.rooms).toHaveLength(1)
     expect(r.doc.rooms[0]?.lead.status).toBe('missing')
-    expect(r.doc.rooms[0]?.cost?.soft).toBe(5)
-    expect(r.doc.rooms[0]?.cost?.hard).toBe(9)
     expect(r.doc.totals.rooms).toBe(1)
-    expect(r.doc.totals.today).toBe(1)
   })
 
   test('rejects text that is not a JSON object', () => {

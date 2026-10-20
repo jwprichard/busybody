@@ -2,7 +2,6 @@
 // small formatters the pane and band share. No `$`, no I/O.
 
 import type {
-  OfficeCost,
   OfficeDecision,
   OfficeDoc,
   OfficeLatest,
@@ -33,13 +32,6 @@ function num(v: unknown, fallback = 0): number {
 }
 function arr(v: unknown): unknown[] {
   return Array.isArray(v) ? v : []
-}
-
-/** `soft $15/day, hard $40/day` → { soft: 15, hard: 40 }. */
-export function parseCapsText(text: string): { soft: number | null; hard: number | null } {
-  const soft = /soft\s*\$?\s*([\d.]+)/i.exec(text)
-  const hard = /hard\s*\$?\s*([\d.]+)/i.exec(text)
-  return { soft: soft ? Number(soft[1]) : null, hard: hard ? Number(hard[1]) : null }
 }
 
 export type MinuteHeader = { verb: string; who: string | null; where: string | null; rest: string }
@@ -78,27 +70,6 @@ function parseLatest(v: unknown): OfficeLatest | null {
   }
 }
 
-function parseCost(v: unknown, capsText: string): OfficeCost | null {
-  if (v === null || typeof v !== 'object') return null
-  const o = obj(v)
-  const caps = obj(o.caps)
-  const fromText = parseCapsText(capsText)
-  const soft = num(caps.soft, fromText.soft ?? 15)
-  const hard = num(caps.hard, fromText.hard ?? 40)
-  const mix: Record<string, number> = {}
-  for (const [k, val] of Object.entries(obj(o.mix))) mix[k] = num(val)
-  const today = num(o.today)
-  return {
-    today,
-    total: num(o.total, today),
-    mix,
-    softPct: num(o.soft_pct, soft > 0 ? (today / soft) * 100 : 0),
-    hardPct: num(o.hard_pct, hard > 0 ? (today / hard) * 100 : 0),
-    soft,
-    hard,
-  }
-}
-
 function parseRoom(v: unknown): OfficeRoom | null {
   const o = obj(v)
   const name = str(o.name)
@@ -125,14 +96,7 @@ function parseRoom(v: unknown): OfficeRoom | null {
     pr: parsePr(o.pr),
     prCheckedAt: typeof o.pr_checked_at === 'number' ? o.pr_checked_at : null,
     prStale: o.pr_stale === true,
-    cost: parseCost(o.cost, str(room.caps)),
-    statusLine: str(o.status_line),
     capped: o.capped === true,
-    state: str(o.state) || null,
-    openDecisions: num(o.open_decisions),
-    team: str(o.team),
-    phases: arr(o.phases).filter((p): p is string => typeof p === 'string'),
-    phase: str(o.phase) || null,
   }
 }
 
@@ -181,6 +145,7 @@ function optNum(v: unknown): number | null {
   return v === null || v === undefined ? null : num(v, 0)
 }
 
+// shortcut: the whole role shape is parsed though the pane shows only name, issue and the memory review; trim when roles get no other use.
 function parseRole(v: unknown): OfficeRole | null {
   const o = obj(v)
   const name = str(o.name)
@@ -288,7 +253,6 @@ export function parseOfficeDoc(text: string): ParseResult {
   const roles = arr(o.roles).map(parseRole).filter((r): r is OfficeRole => r !== null)
   const roleSessions = arr(o.role_sessions).map(parseRoleSession).filter((r): r is OfficeRoleSession => r !== null)
   const totals = obj(o.totals)
-  const today = rooms.reduce((sum, r) => sum + (r.cost?.today ?? 0), 0)
   return {
     ok: true,
     doc: {
@@ -305,7 +269,6 @@ export function parseOfficeDoc(text: string): ParseResult {
       totals: {
         rooms: num(totals.rooms, rooms.length),
         decisions: num(totals.decisions, decisions.length),
-        today: num(totals.today, today),
         roles: num(totals.roles, roles.filter(r => r.enabled).length),
         memoryReviews: num(totals.memory_reviews, roles.filter(r => r.memoryPending).length),
         tasks: num(totals.tasks, tasks.length),

@@ -1,9 +1,9 @@
 // office mod: the task tracker inside Claude Code.
 //
-//   /office            opens the pane: one row per task (open initiative or role
-//                      pass) with its room, state and age, sorted owner-first,
-//                      then the owner's sticky notes and memory reviews, and a
-//                      Start room form
+//   /office            opens the pane: one row per open initiative (the name links
+//                      to its issue) with its stage, an owner marker, its room and
+//                      age, most complete stage first; then the owner's sticky
+//                      notes and memory reviews, and a Start room form
 //   band               🏢 N tasks · M need you
 //   refresh            $.clock every 120 s runs `bin/rooms --json` (no model)
 //
@@ -811,14 +811,18 @@ function drawTaskRow(
       <Box key={`task-row-${t.number}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
         <Text wrap="truncate-end">
           <Text color={C.warn} bold>{t.needsYou ? '◆ ' : '  '}</Text>
-          <Text bold={t.needsYou} dimColor={tone === 'parked'}>{t.name}</Text>
+          {t.url !== '' ? (
+            <Link key={`task-link-${t.number}`} href={t.url} label={t.name} />
+          ) : (
+            <Text bold={t.needsYou} dimColor={tone === 'parked'}>{t.name}</Text>
+          )}
         </Text>
         <Text wrap="truncate-end">
           <Text color={stageColor} bold>{t.stage}</Text>
           {t.needsYou ? <Text color={C.warn}>{` · needs you: ${t.reason}`}</Text> : null}
           <Text color={C.dim}>{` · ${t.worker === null ? 'no room' : `${t.worker}${t.working ? ' (working)' : ''}`} · ${t.ageS === null ? '?' : formatAge(t.ageS)}`}</Text>
         </Text>
-        {v.room === undefined ? (t.url !== '' ? <Link key={`task-link-${t.number}`} href={t.url} label="issue ↗" /> : null) : drawRowButtons(kit, $, v.room, v.pr)}
+        {v.room === undefined ? null : drawRowButtons(kit, $, v.room, v.pr)}
       </Box>
       {t.stageWarning ? <Text color={C.warn} wrap="truncate-end">{`  ⚠ ${t.stageWarning}`}</Text> : null}
       {v.notice ? <Text color={C.dim} wrap="truncate-end">{`  ↳ ${v.notice}`}</Text> : null}

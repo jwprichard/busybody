@@ -16,16 +16,6 @@ export type OfficeLatest = {
   body: string
 }
 
-export type OfficeCost = {
-  today: number
-  total: number
-  mix: Record<string, number>
-  softPct: number
-  hardPct: number
-  soft: number
-  hard: number
-}
-
 export type OfficeRoom = {
   name: string
   issue: number
@@ -44,17 +34,7 @@ export type OfficeRoom = {
   prStale: boolean
   /** agentId: the short id `claude agents` lists and `claude stop`/`attach` take. */
   lead: { status: OfficeLeadStatus; sessionId: string | null; agentId: string | null; state: string | null }
-  cost: OfficeCost | null
-  statusLine: string
   capped: boolean
-  /** bin/rooms `state` (needs_input, capped, done, waiting, working, idle), or null when absent. */
-  state?: string | null
-  openDecisions: number
-  /** The room's recipe (team) name from bin/rooms; '' when an older bin/rooms sent none. */
-  team: string
-  /** The recipe's phases, in order ([] when unknown) and the room's current one (null when unknown). */
-  phases: string[]
-  phase: string | null
 }
 
 export type OfficeDecision = {
@@ -152,7 +132,7 @@ export type OfficeDoc = {
   workspace: OfficeWorkspace | null
   /** The hour's GraphQL use estimated from the gh usage log (no gh call), when the logging shim is installed; else null. */
   ghUsage: { hourPointsEst: number; limit: number } | null
-  totals: { rooms: number; decisions: number; today: number; roles: number; memoryReviews: number; tasks: number; needsYou: number }
+  totals: { rooms: number; decisions: number; roles: number; memoryReviews: number; tasks: number; needsYou: number }
 }
 
 export type OfficeRefresh = {
