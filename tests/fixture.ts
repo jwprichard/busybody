@@ -113,7 +113,7 @@ export const ROOMS_DOC = {
       open_decisions: 0,
     },
   ],
-  stages: ['complete', 'ci-deploy', 'review', 'development', 'design', 'planning', 'research', 'idea', 'parked'],
+  stages: ['complete', 'awaiting-uat', 'ci-deploy', 'review', 'development', 'design', 'planning', 'research', 'idea', 'parked'],
   tasks: [
     { number: 9003, name: 'Gamma (9003-issue)', url: 'https://github.com/acme-co/acme-office/issues/9003', stage: 'ci-deploy', stage_warning: null, needs_you: false, reason: '', worker: 'room-gamma', working: false, age_s: 3600 },
     { number: 9001, name: 'Alpha work (9001-issue)', url: 'https://github.com/acme-co/acme-office/issues/9001', stage: 'development', stage_warning: null, needs_you: true, reason: '1 decision to answer', worker: 'room-alpha', working: true, age_s: 125 },

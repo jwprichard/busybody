@@ -379,7 +379,7 @@ def role_inbox(role_issues, agents, now, pass_issues=None):
 NAME_MAX = 60
 # The ONE table of stages, most complete first, `parked` always last. An issue carries exactly one `stage:<name>` label; the
 # document sends this list as `stages` and the office band reads it from there.
-STAGES = ("complete", "ci-deploy", "review", "development", "design", "planning", "research", "idea", "parked")
+STAGES = ("complete", "awaiting-uat", "ci-deploy", "review", "development", "design", "planning", "research", "idea", "parked")
 STAGE_PREFIX = "stage:"
 PREFIX_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*|[\w-]+(?:\([^)]*\))?!?:\s+)+")
 
