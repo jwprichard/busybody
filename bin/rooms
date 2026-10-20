@@ -22,10 +22,12 @@ Top level `decisions[]` = DECISIONs with no later ANSWER, from rooms and from ro
 Pass issues (open, title `<role>: <task>`, label `refine` or `<role>-pass`) put their own DECISIONs on the list,
 addressed to `role-<role>-<slug of task>`; the role issue still feeds it for older passes.
 Top level `role_sessions[]` = running `role-<role>-*` sessions, shaped like a room's `lead` (the room lead's status).
-Top level `tasks[]` = the task tracker, one row per task: every open initiative issue (with or without a Room block), every open role
-pass issue, any running role session no issue accounts for, and initiatives closed in the last DONE_TTL_S (shown as done, then dropped).
-Each row: number, name (`Friendly name (N-issue)`), url, worker (room or role session, or null), state (needs_you|working|waiting|parked|done),
-reason (one line on why) and age_s (since the last comment, or the close). Sorted needs_you, working, waiting, parked, done.
+Top level `stages` = the stage table, most complete first (`parked` last), and `tasks[]` = the tracker, one row per open initiative issue
+(with or without a Room block; a closed one is gone, `stage:complete` is a label on an open one). Role passes are not rows.
+Each row: number, name (`Friendly name (N-issue)`), url, stage (the issue's one `stage:<name>` label, none = idea; `stage_warning` when
+it has several or an unknown one), needs_you + reason (an unanswered DECISION/BLOCKED, a capped room, a PR waiting on the owner:
+a flag, not a stage), worker (its room, if any) and working, age_s (since the last comment, or the close). Sorted by stage, most
+complete first, then most recently updated first.
 Top level `roles[]` = every standing role from `bin/role status --json` (reshaped, no model calls);
 `roles_error` says why it is empty when `bin/role` failed. Never breaks the rest of the document.
 """
@@ -368,9 +370,11 @@ def role_inbox(role_issues, agents, now, pass_issues=None):
 
 
 # ---- the task tracker: one row per task -------------------------------------------------------
-DONE_TTL_S = 24 * 3600          # a closed initiative shows as done this long, then drops off the tracker
 NAME_MAX = 40
-TASK_STATES = ("needs_you", "working", "waiting", "parked", "done")
+# The ONE table of stages, most complete first, `parked` always last. An issue carries exactly one `stage:<name>` label; the
+# document sends this list as `stages` and the office band reads it from there.
+STAGES = ("complete", "ci-deploy", "review", "development", "planning", "design", "research", "idea", "parked")
+STAGE_PREFIX = "stage:"
 PREFIX_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*|[\w-]+(?:\([^)]*\))?!?:\s+)+")
 
 
@@ -383,32 +387,34 @@ def friendly_name(title, number):
     return f"{t} ({number}-issue)"
 
 
-def task_state(closed, open_decisions, room_state_, lead, last_own, pr, labels, busy=False):
-    """(state, reason) for one task, owner-first. `room_state_` is a room's `state` (None without a room), `lead` its lead status,
-    `last_own` the verb of the room's own latest minute, `pr` its PR dict or None, `busy` a running role session mid-turn."""
-    if closed:
-        return "done", "closed"
+def stage_of(labels):
+    """(stage, warning|None) from the `stage:<name>` labels: none = idea; several or an unknown one warn and the first in table order wins."""
+    names = sorted({l[len(STAGE_PREFIX):] for l in labels if l.startswith(STAGE_PREFIX)})
+    known = [n for n in STAGES if n in names]
+    unknown = [n for n in names if n not in STAGES]
+    warn = None
+    if len(names) > 1:
+        warn = f"{len(names)} stage labels: {', '.join(names)}"
+    elif unknown:
+        warn = f"unknown stage label: {unknown[0]}"
+    return (known[0] if known else "idea"), warn
+
+
+def owner_reason(open_decisions, room_state_, lead, last_own, pr, busy=False):
+    """Why the owner is needed ('' = not): an unanswered DECISION or BLOCKED, a capped room, a PR waiting on the owner."""
     if open_decisions:
-        return "needs_you", f"{open_decisions} decision{'s' if open_decisions != 1 else ''} to answer"
+        return f"{open_decisions} decision{'s' if open_decisions != 1 else ''} to answer"
     if room_state_ == "needs_input" or (last_own == "BLOCKED" and not busy and lead != "busy"):
-        return "needs_you", "blocked, needs input"
+        return "blocked, needs input"
     if room_state_ == "capped":
-        return "needs_you", "over its spend cap"
+        return "over its spend cap"
     if room_state_ == "done" and pr and pr.get("state") == "OPEN":
-        return "needs_you", "draft PR to review" if pr.get("isDraft") else "PR ready to merge"
-    if room_state_ == "working" or busy:
-        return "working", "at work"
-    if room_state_ == "waiting":
-        return "waiting", "waiting on CI, deploy or someone"
-    if room_state_ == "done":
-        return "waiting", "done, awaiting merge or deploy"
-    if "blocked" in labels:
-        return "parked", "blocked"
-    return "parked", "no one on it" if room_state_ is None else "idle"
+        return "draft PR to review" if pr.get("isDraft") else "PR ready to merge"
+    return ""
 
 
 def task_sort_key(t):
-    return (TASK_STATES.index(t["state"]), t["age_s"] if t["age_s"] is not None else 1 << 40)
+    return (STAGES.index(t["stage"]), t["age_s"] if t["age_s"] is not None else 1 << 40)
 
 
 def last_own_verb(comments):
@@ -421,55 +427,25 @@ def age_of(comments, now, field="createdAt"):
     return max(0, int((now - parse_ts(max(ts))).total_seconds())) if ts else None
 
 
-def build_tasks(doc, issues, pass_issues, closed_issues, now):
-    """The tracker rows from a built document plus the raw issues: open initiatives, open role passes, role sessions no
-    issue accounts for, and recently closed initiatives."""
+def build_tasks(doc, issues, now):
+    """The tracker rows: every open initiative issue (with or without a Room block); a closed one is simply gone. Role passes are not rows. Sorted by stage, most complete first, then most recently updated first."""
     rooms = {r["issue"]: r for r in doc["rooms"]}
-    sess = {s["issue"]: s for s in doc["role_sessions"]}
-    # a role's question may sit on the role's own issue yet address the pass session: it counts on the session's row
-    cnt = lambda n, worker: sum(1 for d in doc["decisions"] if d["issue"] == n or (d.get("role") and worker and d["room"] == worker))
     rows, seen = [], set()
-
-    def row(iss, worker, state_args, comments):
-        st, why = task_state(*state_args)
-        seen.add(iss["number"])
-        rows.append({"number": iss["number"], "name": friendly_name(iss.get("title"), iss["number"]), "url": iss.get("url", ""),
-                     "worker": worker, "state": st, "reason": why, "age_s": age_of(comments, now)})
-
     for iss in issues:
         n, comments = iss["number"], iss.get("comments", [])
         labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
-        r, s = rooms.get(n), sess.get(n)
-        busy = bool(s and s["lead"]["status"] == "busy")
-        worker = (r or {}).get("name") or (s or {}).get("name")
-        row(iss, worker,
-            (False, cnt(n, worker), (r or {}).get("state"), (r or {}).get("lead", {}).get("status"), last_own_verb(comments),
-             (r or {}).get("pr"), labels, busy), comments)
-    for iss in pass_issues or []:
-        n = iss.get("number")
-        s = sess.get(n)
-        worker = s["name"] if s else None
-        if n in seen or not (s or cnt(n, None)):
-            continue    # a pass issue is a task only while its session runs or it has a question for the owner
-        comments = iss.get("comments", [])
-        row(iss, worker, (False, cnt(n, worker), None, None, last_own_verb(comments), None, [], bool(s and s["lead"]["status"] == "busy")), comments)
-    for n, s in sorted(sess.items()):
-        if n in seen:
-            continue    # a role's own issue: the role is the task
-        iss = {"number": n, "title": f"{s['role']} pass"}
-        row(iss, s["name"], (False, cnt(n, s["name"]), None, None, None, None, [], s["lead"]["status"] == "busy"), [])
-    for iss in closed_issues or []:
-        ts = iss.get("closedAt") or iss.get("closed_at")
-        age = max(0, int((now - parse_ts(ts)).total_seconds())) if ts else None
-        if iss.get("number") in seen or age is None or age > DONE_TTL_S:
-            continue
-        rows.append({"number": iss["number"], "name": friendly_name(iss.get("title"), iss["number"]), "url": iss.get("url") or iss.get("html_url", ""),
-                     "worker": None, "state": "done", "reason": "closed", "age_s": age})
+        r = rooms.get(n) or {}
+        stage, warn = stage_of(labels)
+        why = owner_reason(r.get("open_decisions", 0), r.get("state"), r.get("lead", {}).get("status"), last_own_verb(comments), r.get("pr"))
+        seen.add(n)
+        rows.append({"number": n, "name": friendly_name(iss.get("title"), n), "url": iss.get("url", ""), "stage": stage, "stage_warning": warn,
+                     "needs_you": bool(why), "reason": why, "worker": r.get("name"), "working": r.get("lead", {}).get("status") == "busy",
+                     "age_s": age_of(comments, now)})
     return sorted(rows, key=task_sort_key)
 
 
 def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=None, role_issues=None, pass_issues=None,
-          watching=watcher_alive, phases_of=load_phases, closed_issues=None):
+          watching=watcher_alive, phases_of=load_phases):
     by_name = {a.get("name"): a for a in agents}
     sl = status_lines(status_text)
     caps = costs.get("caps", {"soft": 15.0, "hard": 40.0})
@@ -532,9 +508,10 @@ def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=No
             "memory_reviews": sum(1 for r in roles if r["memory_pending"]),
         },
     }
-    doc["tasks"] = build_tasks(doc, issues, pass_issues, closed_issues, now)
+    doc["stages"] = list(STAGES)
+    doc["tasks"] = build_tasks(doc, issues, now)
     doc["totals"]["tasks"] = len(doc["tasks"])
-    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["state"] == "needs_you")
+    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["needs_you"])
     return doc
 
 
@@ -557,17 +534,6 @@ def load_roles():
         return None, "bin/role status printed no JSON"
 
 
-def load_closed(now):
-    """Initiatives closed within DONE_TTL_S (one REST call; [] when it fails: the tracker just shows no done rows)."""
-    since = datetime.fromtimestamp(now.timestamp() - DONE_TTL_S, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        items = json.loads(run(["gh", "api", f"repos/{REPO}/issues?labels=initiative&state=closed&since={since}&per_page=30"]) or "[]")
-    except ValueError:
-        return []
-    return [{"number": i["number"], "title": i.get("title", ""), "url": i.get("html_url", ""), "closedAt": i.get("closed_at")}
-            for i in items if isinstance(i, dict) and "pull_request" not in i and i.get("closed_at")]
-
-
 def live(now, fresh=False):
     agents = json.loads(run(["claude", "agents", "--json"]) or "[]")
     costs = json.loads(run([os.path.join(ENGINE_ROOT, "bin", "room-cost"), "--all", "--json"]) or "{}")
@@ -584,11 +550,10 @@ def live(now, fresh=False):
     for label in pass_labels:
         pass_issues += mc.issues(label, ("number", "title", "labels", "url", "comments"))
     pass_issues = list({i["number"]: i for i in pass_issues}.values())
-    closed = load_closed(now)
-    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues, closed_issues=closed)
+    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues)
     attach_prs(doc)
-    doc["tasks"] = build_tasks(doc, issues, pass_issues, closed, now)   # again: a room's PR decides whether it needs the owner
-    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["state"] == "needs_you")
+    doc["tasks"] = build_tasks(doc, issues, now)   # again: a room's PR decides whether it needs the owner
+    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["needs_you"])
     # Live room and role sessions, whatever their issue says: `--leftovers` lists the ones whose issue is no longer open
     # Whatever the state says, a session counts when its pid is alive (done and stopped sessions with live pids are the leftovers) and
     # its cwd is under this workspace's data root.
@@ -693,7 +658,7 @@ def self_test():
     now = parse_ts("2026-10-06T03:00:00Z")
     status_text = open(os.path.join(d, "status.txt")).read()
     got = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, load("roles.json"),
-                None, load("role-issues.json"), load("pass-issues.json"), closed_issues=load("closed-issues.json"))
+                None, load("role-issues.json"), load("pass-issues.json"))
     none = build([], [], {}, "", now, None, "bin/role status failed: boom")
     by = {r["name"]: r for r in got["rooms"]}
     alpha, beta = by.get("room-alpha"), by.get("room-beta")
@@ -733,7 +698,7 @@ def self_test():
          [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"]) for s in got["role_sessions"]]
          == [("role-scribe-tidy-notes", "busy", "sess-scribe")]
          and got["role_sessions"][0]["issue"] == 95 and none["role_sessions"] == []),
-        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1, "tasks": 8, "needs_you": 3}),
+        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1, "tasks": 6, "needs_you": 2}),
         ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
          and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
         ("role numbers", roles.get("scribe") and roles["scribe"]["memory"]["index_bytes"] == 2048
@@ -787,33 +752,34 @@ def self_test():
          and not watcher_alive("") and not watcher_alive("/no/such/dir")),
         ("a role pass shows the role's recipe", ROLE_TEAMS["analyst"] == "refine"
          and got["role_sessions"][0]["team"] == "scribe" and got["role_sessions"][0]["phase"] is None),
-        ("tasks: one row per open initiative (room or not), the open role pass, and the recently closed one; sorted owner-first, done last",
-         [(t["number"], t["state"]) for t in got["tasks"]]
-         == [(7, "needs_you"), (95, "needs_you"), (13, "needs_you"), (12, "waiting"), (14, "parked"), (8, "parked"), (9, "parked"), (20, "done")]
-         and not any(t["number"] in (21, 96) for t in got["tasks"])),
-        ("tasks: friendly names, the worker, the age; a role question on the role's issue counts on the pass row",
-         [(t["name"], t["worker"], t["age_s"]) for t in got["tasks"] if t["number"] in (7, 95, 8, 20)]
-         == [("Alpha work (7-issue)", "room-alpha", 1200), ("Tidy notes (95-issue)", "role-scribe-tidy-notes", 1200),
-             ("No room (8-issue)", None, None), ("Shipped thing (20-issue)", None, 7200)]
-         and got["tasks"][1]["reason"] == "2 decisions to answer"),
-        ("tasks: totals count them and the ones that need the owner", got["totals"]["tasks"] == 8 and got["totals"]["needs_you"] == 3),
+        ("tasks: open initiatives (room or not), no role-pass rows; most complete stage first, then most recently updated",
+         [(t["number"], t["stage"]) for t in got["tasks"]]
+         == [(12, "ci-deploy"), (9, "review"), (7, "development"), (13, "development"), (14, "idea"), (8, "idea")]
+         and not any(t["number"] in (20, 95, 96) for t in got["tasks"]) and got["stages"][0] == "complete" and got["stages"][-1] == "parked"),
+        ("tasks: friendly name, room, working flag and age",
+         [(t["name"], t["worker"], t["working"], t["age_s"]) for t in got["tasks"] if t["number"] in (7, 8)]
+         == [("Alpha work (7-issue)", "room-alpha", True, 1200), ("No room (8-issue)", None, False, None)]),
+        ("tasks: the owner marker is a flag on the row, not a stage or a sort key",
+         [t["number"] for t in got["tasks"] if t["needs_you"]] == [7, 13] and got["totals"]["tasks"] == 6 and got["totals"]["needs_you"] == 2
+         and [t["reason"] for t in got["tasks"] if t["number"] == 7] == ["1 decision to answer"]),
+        ("stage labels: none is idea, several or unknown warn, the most complete known one wins, parked is last",
+         stage_of([]) == ("idea", None) and stage_of(["stage:review"]) == ("review", None)
+         and stage_of(["stage:design", "stage:review"]) == ("review", "2 stage labels: design, review")
+         and stage_of(["stage:nope"]) == ("idea", "unknown stage label: nope") and stage_of(["bug"]) == ("idea", None)
+         and sorted(["parked", "idea", "complete"], key=STAGES.index) == ["complete", "idea", "parked"]),
         ("friendly name strips prefixes, trims, caps and never goes bare",
          friendly_name("role: analyst pass", 5) == "Analyst pass (5-issue)" and friendly_name("feat(web)!: [x] add thing", 6) == "Add thing (6-issue)"
          and friendly_name("", 7) == "Untitled (7-issue)" and len(friendly_name("a" * 90, 8)) == NAME_MAX + len(" (8-issue)")),
-        ("task state: needs you first, then working, waiting, parked",
-         task_state(False, 1, "working", "busy", None, None, [])[0] == "needs_you"
-         and task_state(False, 0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": True}, [])[0] == "needs_you"
-         and task_state(False, 0, "done", "idle", "DONE", None, [])[0] == "waiting"
-         and task_state(False, 0, "idle", "idle", "BLOCKED", None, [])[0] == "needs_you"
-         and task_state(False, 0, "capped", "idle", None, None, [])[0] == "needs_you"
-         and task_state(False, 0, "working", "busy", None, None, [])[0] == "working"
-         and task_state(False, 0, None, None, None, None, [], busy=True)[0] == "working"
-         and task_state(False, 0, "waiting", "idle", "WAITING", None, [])[0] == "waiting"
-         and task_state(False, 0, None, None, None, None, ["blocked"]) == ("parked", "blocked")
-         and task_state(True, 3, "working", "busy", None, None, [])[0] == "done"),
-        ("a closed initiative drops off after DONE_TTL_S",
-         [t["number"] for t in build_tasks({"rooms": [], "role_sessions": [], "decisions": []}, [], [],
-          [{"number": 1, "title": "a", "closedAt": "2026-10-06T02:00:00Z"}, {"number": 2, "title": "b", "closedAt": "2026-10-04T02:00:00Z"}], now)] == [1]),
+        ("owner reason: a decision, blocked, capped, a PR waiting on the owner; otherwise none",
+         owner_reason(1, "working", "busy", None, None) == "1 decision to answer"
+         and owner_reason(0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": True}) == "draft PR to review"
+         and owner_reason(0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": False}) == "PR ready to merge"
+         and owner_reason(0, "idle", "idle", "BLOCKED", None) == "blocked, needs input"
+         and owner_reason(0, "capped", "idle", None, None) == "over its spend cap"
+         and owner_reason(0, "working", "busy", None, None) == "" and owner_reason(0, "done", "idle", "DONE", None) == ""),
+        ("a stage:complete label on an open issue shows it at the top",
+         [(t["number"], t["stage"]) for t in build_tasks({"rooms": []}, [{"number": 1, "title": "a", "labels": ["stage:complete"], "comments": []},
+          {"number": 2, "title": "b", "labels": ["stage:idea"], "comments": []}], now)] == [(1, "complete"), (2, "idea")]),
         ("a live job between turns is idle", lead_status({"state": "working", "status": "idle"}) == "idle"),
     ]
     import tempfile

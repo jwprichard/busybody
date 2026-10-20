@@ -1,4 +1,0 @@
-[
- {"number": 20, "title": "feat(web): Shipped thing", "url": "https://github.com/x/y/issues/20", "closedAt": "2026-10-06T01:00:00Z"},
- {"number": 21, "title": "Closed long ago", "url": "https://github.com/x/y/issues/21", "closedAt": "2026-09-01T01:00:00Z"}
-]
