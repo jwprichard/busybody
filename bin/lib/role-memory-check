@@ -9,11 +9,12 @@ Checks what is STAGED under .claude/agent-memory/<role>/:
 
 Memory-line contract (the busybody:standing-role skill; the owner's bar is in the role charter):
   MEMORY.md   <= 15 content lines (# headers exempt). A line is a PROMOTION from candidates.md:
-              - m<N> <date>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction]
+              - m<N> <date>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction|answer]
               it must (1) have an id, a quote and a link, (2) start with the same text as a candidates.md entry
               (HEAD or this change), (3) carry trigger evidence: two DIFFERENT urls (no marker) | `1-link` whose quote
               holds a generality word (always, never, by default, unless said otherwise, from now on, every time) |
-              `correction` naming a corrected id (`corrects m3`) that is in MEMORY.md or archive.md, (4) reuse no id.
+              `correction` naming a corrected id (`corrects m3`) that is in MEMORY.md or archive.md | `answer` (the single link is a recorded
+              owner ANSWER minute; `bin/role triage` checks that), (4) reuse no id.
               A line moved back from archive.md (same id and text) is a restore and is exempt from (2) and (3).
   candidates.md  <= 30 lines, never injected, written by `role apply` from a pass's MEMORY minute, no owner review:
               - c<N> <date>: <line>. Changes: <...>. "<quote>" (<url>)   (entries older than 60 days are warned about)
@@ -42,8 +43,8 @@ ARCH_SUFFIX = re.compile(r" \| archived (20\d\d-[01]\d-[0-3]\d): \S.*$")
 QUOTE = re.compile(r'"([^"\n]{3,})"')
 URL = re.compile(r"https?://[^\s)\"]+")
 GENERAL = re.compile(r"\b(always|never|by default|unless said otherwise|from now on|every time)\b", re.I)
-MARKER = re.compile(r"\s(1-link|correction)\s*$")
-REMAINDER = re.compile(r"^( \(https?://[^\s)\"]+\))?( (1-link|correction))?$")
+MARKER = re.compile(r"\s(1-link|correction|answer)\s*$")
+REMAINDER = re.compile(r"^( \(https?://[^\s)\"]+\))?( (1-link|correction|answer))?$")
 CORRECTS = re.compile(r"\bcorrects (m\d+)\b")
 
 SECRETS = [
@@ -190,15 +191,17 @@ def evaluate(role, new, old, today=None):
             bad("MEMORY.md", "not promoted from a candidates.md entry (same text as a cN line)", ln)
             continue
         if not extra_ok:
-            bad("MEMORY.md", "carries text beyond its candidate (only ` (<url2>)` and `1-link`/`correction` may follow)", ln)
+            bad("MEMORY.md", "carries text beyond its candidate (only ` (<url2>)` and `1-link`/`correction`/`answer` may follow)", ln)
             continue
         urls = {u.rstrip(".,;") for u in URL.findall(text)}
         mk = MARKER.search(text)
         marker = mk.group(1) if mk else None
         if marker is None and len(urls) < 2:
-            bad("MEMORY.md", "one link and no trigger: needs a second distinct link, `1-link` (with a generality word) or `correction`", ln)
+            bad("MEMORY.md", "one link and no trigger: needs a second distinct link, `1-link` (with a generality word), `correction` or `answer`", ln)
         elif marker == "1-link" and not any(GENERAL.search(q) for q in QUOTE.findall(cb)):
             bad("MEMORY.md", "`1-link` needs a generality word in the candidate's quote (always, never, by default, unless said otherwise, from now on, every time)", ln)
+        elif marker == "answer":
+            pass   # the single link is a recorded owner ANSWER minute: `bin/role triage` resolved it through gh before adding the marker (the guard has no network)
         elif marker == "correction":
             c = CORRECTS.search(cb)
             if not c or c.group(1)[1:] not in (mem_ids | arch_ids) - {mid}:
@@ -322,6 +325,8 @@ def self_test():
     c2 = cand(1, quote="always list it as A1")
     case("1-link with a generality word", '- m1 2026-10-01: Fact 1. Changes: ask A1 first. "always list it as A1" (%s) 1-link' % U1, [c2], None)
     case("1-link without a generality word", base.format(U1) + " 1-link", [c1], "generality word")
+    case("answer: a single link with the answer marker promotes", base.format(U1) + " answer", [c1], None)
+    case("answer marker plus a second link is still fine", base.format(U1) + f" ({U2}) answer", [c1], None)
     om = '- m3 2026-09-01: Old. Changes: ask old first. "q q q" (%s) (%s)\n' % (U1, U2)
     cc = lambda t: f'- m4 2026-10-01: Fact 1. Changes: ask A1 first{t}. "the owner said so" ({U1}) correction'
     cx = lambda t: [c1.replace("ask A1 first", "ask A1 first" + t)]
