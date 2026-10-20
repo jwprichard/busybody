@@ -73,7 +73,7 @@ State is derived, not kept: uses and ratings come from `role(<role>): use N` com
 `Role-Value:` trailer; enabled/disabled from where the charter lives; cost from transcripts.
 roles/<role>/role.json holds only config and decisions (budget, metric, authority, pilot, issue).
 """
-import glob, importlib.machinery, json, os, re, shutil, subprocess, sys, tempfile
+import contextlib, fcntl, glob, importlib.machinery, json, os, re, shutil, subprocess, sys, tempfile
 from datetime import datetime, timedelta
 
 HERE = ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -81,7 +81,6 @@ sys.path.insert(0, os.path.join(HERE, "bin", "lib"))
 from officeroot import invoked_root, workspace_root, bb_env, selftest_reexec  # noqa: E402
 selftest_reexec(ENGINE_ROOT)
 import officeconfig  # noqa: E402
-import sessions  # noqa: E402
 from tracker import Tracker  # noqa: E402
 WS = bb_env(None, "ROLE_WS", "SCH_ROLE_WS") or workspace_root(ENGINE_ROOT, invoked=invoked_root())   # BUSYBODY_ROLE_WS is a test hook
 import costlib  # noqa: E402
@@ -122,6 +121,33 @@ def git(*a, check=True):
     if check and r.returncode:
         die(f"git {' '.join(a[:3])} failed: {(r.stderr or r.stdout).strip()[:300]}")
     return r
+
+
+_LOCK = {"fh": None, "n": 0}
+
+
+@contextlib.contextmanager
+def _locked():
+    """One lock for every command that commits memory (apply, triage, promote, accept, reject, commit-candidates, archive, restore, run):
+    two sessions' commits take turns instead of colliding on the index. Re-entrant, so triage may call promote."""
+    if _LOCK["n"] == 0:
+        _LOCK["fh"] = open(_lock_path(), "w")
+        fcntl.flock(_LOCK["fh"], fcntl.LOCK_EX)
+    _LOCK["n"] += 1
+    try:
+        yield
+    finally:
+        _LOCK["n"] -= 1
+        if _LOCK["n"] == 0:
+            _LOCK["fh"].close()
+
+
+def locked(fn):
+    def wrapper(*a, **kw):
+        with _locked():
+            return fn(*a, **kw)
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 def today():
@@ -783,6 +809,7 @@ def commit_candidates(name):
     return True
 
 
+@locked
 def cmd_commit_candidates(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -824,6 +851,7 @@ def commit_cand_pending(name):
     return bool(auto["candidates.md"]["add"] or auto["candidates.md"]["del"])
 
 
+@locked
 def cmd_accept(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -837,6 +865,7 @@ def cmd_accept(argv):
     _settle(name, argv, reject=False)
 
 
+@locked
 def cmd_reject(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -876,6 +905,7 @@ def _record_source(name, cid, issue, session):
     os.replace(_sources_path() + ".tmp", _sources_path())
 
 
+@locked
 def cmd_apply(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -894,30 +924,45 @@ def cmd_apply(argv):
     if not hd:
         die(f"not a MEMORY minute of role {name} (line 1 must be `**MEMORY** · role-{name}-<slug> · #N`)")
     session, issue = hd.group(1), int(hd.group(2))
+    if issue != int(m.group(2)):
+        die(f"the minute's header says #{issue} but its link is on issue #{m.group(2)}")
+    if not _pass_session_ok(name, session, role_names()):
+        die(f"{session} is not a session of role {name} (another role's name starts with {name}-)")
+    if session not in {a.get("name") for a in agents_list()}:
+        die(f"{session} is not a known session (`claude agents --json --all`): refusing a minute from an unknown author")
     proposed = [l.strip() for l in lines[1:] if re.match(r"^\s*- c\d+ ", l)]
     if not proposed:
         print(f"{name}: the minute proposes no candidate lines")
         return
-    import fcntl
-    with open(_lock_path(), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)   # two passes' proposals apply in sequence: each takes the next free id after the other's commit
-        for ln in proposed:
-            _guard_index(name)
-            cands = read_disk(name, "candidates.md")
-            body = re.sub(r"^- c\d+ ", "", ln)
-            if any(re.sub(r"^- c\d+ ", "", c) == body for c in cands):
-                print(f"skipped (already applied): {ln[:100]}")
-                continue
-            nid = max([line_id(c, "c") or 0 for c in cands + read_head(name, "candidates.md")] or [0]) + 1
-            new = f"- c{nid} {body}"
-            write_lines(name, "candidates.md", cands + [new], existed_in_head=bool(read_head(name, "candidates.md")))
-            try:
-                commit_candidates(name)
-                _record_source(name, nid, issue, session)
-                print(f"applied: {new[:100]}")
-            except SystemExit as e:
-                write_lines(name, "candidates.md", cands, existed_in_head=bool(read_head(name, "candidates.md")))
-                print(f"skipped (guard refused): {ln[:100]}\n  {str(e.code).replace(chr(10), ' ')[:300]}")
+    strip_id = lambda l: re.sub(r"^- [cm]\d+ ", "", l)
+    for ln in proposed:  # the lock is held by @locked: two passes' proposals apply in sequence, each taking the next free id
+        _guard_index(name)
+        cands = read_disk(name, "candidates.md")
+        body = strip_id(ln)
+        have = [strip_id(c) for c in cands + read_head(name, "candidates.md")]
+        done = [strip_id(l).split(" | archived ")[0] for f in ("MEMORY.md", "archive.md") for l in read_disk(name, f) + read_head(name, f)]
+        if body in have or any(d.startswith(body) for d in done):  # a promoted line is its candidate's text plus a link and a marker
+            print(f"skipped (already applied): {ln[:100]}")
+            continue
+        nid = max([line_id(c, "c") or 0 for c in cands + read_head(name, "candidates.md")] or [0]) + 1
+        new = f"- c{nid} {body}"
+        write_lines(name, "candidates.md", cands + [new], existed_in_head=bool(read_head(name, "candidates.md")))
+        try:
+            commit_candidates(name)
+        except SystemExit as e:
+            write_lines(name, "candidates.md", cands, existed_in_head=bool(read_head(name, "candidates.md")))
+            why = str(e.code).replace(chr(10), " ")[:300]
+            if "index.lock" in why or "update-index" in why:   # git itself failed: an error to fix and re-run, not a line the guard turned down
+                die(f"error applying {ln[:80]}: {why}")
+            print(f"skipped (guard refused): {ln[:100]}\n  {why}")
+            continue
+        _record_source(name, nid, issue, session)
+        print(f"applied: {new[:100]}")
+
+
+def _pass_session_ok(name, session, roles):
+    """A role-<name>-<slug> session that is not really another role's (`a` must not claim role-a-b-x when a role `a-b` exists)."""
+    return session.startswith(f"role-{name}-") and not any(r != name and r.startswith(name + "-") and session.startswith(f"role-{r}-") for r in roles)
 
 
 # ---- triage: the controller settles candidates; the owner is not asked ---------------------------
@@ -969,6 +1014,7 @@ def _promote_and_settle(name, cid, extra):
     return True, ""
 
 
+@locked
 def cmd_triage(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -1123,6 +1169,7 @@ def _propose(name, mem, cand, arch, keep_ids):
         die("the guard refuses this proposal:\n" + err)
 
 
+@locked
 def cmd_promote(argv, from_triage=False):
     name = argv[0] if argv else None
     need_role(name)
@@ -1161,6 +1208,7 @@ def cmd_promote(argv, from_triage=False):
     print(f"proposed (uncommitted): {new}\nnext: bin/role batch {name}")
 
 
+@locked
 def cmd_archive(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -1191,6 +1239,7 @@ def cmd_archive(argv):
     print(f"role({name}): archive {pos[0]}")
 
 
+@locked
 def cmd_restore(argv):
     name = argv[0] if argv else None
     need_role(name)
@@ -1451,7 +1500,8 @@ def cmd_run(argv):
     if not hook_installed():
         die("the memory guard is not installed: run bin/role install-hook")
     if not dry:
-        commit_candidates(name)
+        with _locked():
+            commit_candidates(name)
     role_issue, issue = cfg.get("issue"), int(issue)
     issue_url = f"https://github.com/{REPO}/issues/{issue}"
     team_powers = ""
@@ -1537,8 +1587,8 @@ def self_test():
         def sh(*a, **kw):
             return subprocess.run(list(a), cwd=ws, env=env, capture_output=True, text=True, **kw)
 
-        def role(*a):
-            return sh(os.path.join(ws, "engine", "bin", "role"), *a)
+        def role(*a, **kw):
+            return sh(os.path.join(ws, "engine", "bin", "role"), *a, **kw)
 
         r = subprocess.run([os.path.join(HERE, "bin", "lib", "role-memory-check"), "--self-test"], capture_output=True, text=True)
         print(r.stdout.rstrip())
@@ -1982,6 +2032,9 @@ def self_test():
                int(sh("git", "rev-list", "--count", "HEAD").stdout.strip()) - int(c0) == 4
                and set(sh("git", "log", "-4", "--format=%s").stdout.split("\n")) - {""} == {"role(test-role): candidates"}
                and sh("git", "status", "--porcelain").stdout.strip() == "" and "Lesson B3" in head_cands())
+        expect("session matching is exact: role a does not claim a session of role a-b",
+               _pass_session_ok("test", "role-test-role-x", ["test"]) and not _pass_session_ok("test", "role-test-role-x", ["test", "test-role"])
+               and _pass_session_ok("test-role", "role-test-role-x", ["test", "test-role"]))
         again = role("apply", "test-role", murl(555))
         expect("applying a minute twice adds nothing", again.returncode == 0 and again.stdout.count("already applied") == 2 and open(cpath).read().splitlines() == got)
         minute(557, "role-other-x", ln(1, "O1"))
@@ -1990,6 +2043,33 @@ def self_test():
         expect("a minute of another role, or not a MEMORY minute, is refused",
                role("apply", "test-role", murl(557)).returncode != 0 and role("apply", "test-role", murl(558)).returncode != 0
                and role("apply", "test-role", "https://example.com/x").returncode != 0 and "Lesson O1" not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
+        with open(os.path.join(bodies, "704"), "w") as fh:
+            fh.write("**MEMORY** · role-test-role-pass-a · #43\n1\n\n" + ln(1, "H1") + "\n")
+        minute(705, "role-test-role-ghost", ln(1, "G1"))
+        expect("apply refuses a header #N that is not its link's issue, and a session `claude agents` does not know",
+               role("apply", "test-role", murl(704)).returncode != 0 and role("apply", "test-role", murl(705)).returncode != 0
+               and "Lesson H1" not in open(cpath).read() and "Lesson G1" not in open(cpath).read())
+        # a git index.lock collision is an error to re-run, never "skipped (guard refused)"
+        minute(706, "role-test-role-pass-a", ln(1, "L1"))
+        open(os.path.join(ws, ".git", "index.lock"), "w").close()
+        r = role("apply", "test-role", murl(706))
+        os.remove(os.path.join(ws, ".git", "index.lock"))
+        expect("an index.lock collision is reported as an error, the line is not applied, and nothing is left on disk",
+               r.returncode != 0 and "guard refused" not in r.stdout and "index.lock" in r.stderr and "Lesson L1" not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
+        # every committing command takes the one lock
+        import fcntl as _fc
+        with open(os.path.join(ws, ".git", "role-apply.lock"), "w") as held:
+            _fc.flock(held, _fc.LOCK_EX)
+            blocked = []
+            for cmd in (("commit-candidates", "test-role"), ("triage", "test-role"), ("promote", "test-role", "c1")):
+                try:
+                    role(*cmd, timeout=2)
+                    blocked.append(False)
+                except subprocess.TimeoutExpired:
+                    blocked.append(True)
+        expect("commit-candidates, triage and promote wait for the lock another commit holds", blocked == [True, True, True])
         sh("git", "checkout", "--", MEM)
         # triage: (a) a line whose evidence is a verified ANSWER is promoted at once, (b) a repo lesson becomes a CLAUDE.md item,
         # (c) the rest is printed with the checklist for --accept / --drop. The ANSWER must be the candidate's own link, on its issue,
@@ -2030,6 +2110,9 @@ def self_test():
                and f"- c{c3} " in head_cands() and "Lesson T3" not in head_mem())
         expect("promote --trigger answer is refused from the CLI", role("promote", "test-role", f"c{c3}", "--trigger", "answer").returncode != 0
                and "Lesson T3" not in open(mem).read())
+        expect("apply skips a line already promoted into MEMORY.md (a promoted line is its candidate's text plus a link and marker)",
+               role("apply", "test-role", murl(701)).returncode == 0 and "Lesson T1" not in open(cpath).read())
+        sh("git", "checkout", "--", MEM)
         expect("triage never asks the owner: it leaves no memory diff behind", sh("git", "status", "--porcelain").stdout.strip() == "" and n_uses() == n0 + 1)
         r = role("triage", "test-role", "--accept", f"c{c3}")
         expect("--accept needs the guard's trigger (a single link with no generality word is refused, nothing changes)",
