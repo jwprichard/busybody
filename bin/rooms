@@ -346,14 +346,20 @@ def pass_session(agents, role, task):
     return sorted(live, key=lambda a: -(a.get("startedAt") or 0))[0] if live else None
 
 
-def role_inbox(role_issues, agents, now, pass_issues=None, initiatives=()):
+def roles_on_disk():
+    """Standing roles of this workspace: roles/<name>/role.json (a role with no issue is still a role)."""
+    import glob
+    return {os.path.basename(os.path.dirname(f)) for f in glob.glob(os.path.join(WORKSPACE_ROOT, "roles", "*", "role.json"))}
+
+
+def role_inbox(role_issues, agents, now, pass_issues=None, initiatives=(), known_roles=()):
     """(role_sessions[], decisions[]): the sticky notes role sessions have put to the owner, each addressed
     to the running session by name so the office can nudge it; the session entry has the same `lead`
     shape as a room, which is what the nudge reads. Notes come from the pass's own issue (open, titled
     `<role>: <task>`, labelled `refine` or `<role>-pass`) and from the role issue (older passes), and, for a pass on an initiative, from
     that initiative's issue (a minute whose "who" is the pass session), with or without a Room block."""
     sessions, decisions, seen = [], [], set()
-    roles = set(role_issues or {})
+    roles = set(role_issues or {}) | set(known_roles)
 
     def add_session(ag, role, number, comments=()):
         if ag["name"] not in seen:
@@ -381,13 +387,14 @@ def role_inbox(role_issues, agents, now, pass_issues=None, initiatives=()):
             who = (parse_minute(c.get("body")) or {}).get("who")
             if role_of_session(who, roles):
                 where.setdefault(who, (iss["number"], []))[1].append(c)
-    for role, iss in sorted((role_issues or {}).items()):
+    for role in sorted(roles):
+        iss = (role_issues or {}).get(role)
         live = live_sessions(agents, role, roles)
         for ag in live:
-            number, own = where.get(ag["name"], (iss["number"], []))
+            number, own = where.get(ag["name"], (iss["number"] if iss else None, []))
             add_session(ag, role, number, own)
         name = live[0]["name"] if live else f"role-{role}"
-        for d in open_decisions(iss.get("comments", []), now):
+        for d in open_decisions(iss.get("comments", []), now) if iss else []:
             d.update({"room": name, "issue": iss["number"], "repo": OFFICE.workspace_repo, "role": role})
             decisions.append(d)
     for iss in sorted(initiatives, key=lambda i: i.get("number", 0)):
@@ -399,10 +406,10 @@ def role_inbox(role_issues, agents, now, pass_issues=None, initiatives=()):
 
 
 def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=None, role_issues=None, pass_issues=None,
-          watching=watcher_alive, phases_of=load_phases):
+          watching=watcher_alive, phases_of=load_phases, known_roles=()):
     by_name = {a.get("name"): a for a in agents}
     sl = status_lines(status_text)
-    roles_known = set(role_issues or {})
+    roles_known = set(role_issues or {}) | set(known_roles)
     caps = costs.get("caps", {"soft": 15.0, "hard": 40.0})
     rooms, decisions = [], []
     for iss in issues:
@@ -445,7 +452,7 @@ def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=No
             d.update({"room": name, "issue": iss["number"], "repo": room.get("repo", "")})
             decisions.append(d)
     roles = build_roles(role_doc)
-    role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues, issues)
+    role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues, issues, known_roles)
     decisions += role_decisions
     return {
         "generated_at": now.isoformat(),
@@ -500,7 +507,7 @@ def live(now, fresh=False):
     for label in pass_labels:
         pass_issues += mc.issues(label, ("number", "title", "labels", "url", "comments"))
     pass_issues = list({i["number"]: i for i in pass_issues}.values())
-    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues)
+    doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues, known_roles=roles_on_disk())
     attach_prs(doc)
     # Live room and role sessions, whatever their issue says: `--leftovers` lists the ones whose issue is no longer open
     # Whatever the state says, a session counts when its pid is alive (done and stopped sessions with live pids are the leftovers) and
@@ -608,6 +615,7 @@ def self_test():
     os.environ["BUSYBODY_PS_FILE"] = os.path.join(d, "ps.jsonl")   # the process table: only pid 7001 (the scribe pass) is running
     got = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, load("roles.json"),
                 None, load("role-issues.json"), load("pass-issues.json"))
+    norole = build(load("issues.json"), load("agents.json"), load("costs.json"), status_text, now, None, None, None, None, known_roles={"scribe"})
     ghost = live_sessions([a for a in load("agents.json") if a["name"] == "role-scribe-ghost"], "scribe", {"scribe"})
     os.environ.pop("BUSYBODY_PS_FILE")
     none = build([], [], {}, "", now, None, "bin/role status failed: boom")
@@ -655,6 +663,10 @@ def self_test():
          and none["role_sessions"] == []),
         ("a pid-less blocked role session is not live: not listed, not the active session",
          "role-scribe-ghost" not in [s["name"] for s in got["role_sessions"]] and ghost == []),
+        ("a role with no role issue is still recognised (known from roles/<name>/role.json): its pass's DECISION and live session are listed",
+         (lambda g: [(d["room"], d["issue"], d["role"]) for d in g["decisions"] if d.get("role")] == [("role-scribe-tidy-notes", 8, "scribe"), ("role-scribe-second", 9, "scribe")]
+          and [s["name"] for s in g["role_sessions"]] == ["role-scribe-second", "role-scribe-tidy-notes"]
+          and none["decisions"] == [])(norole)),
         ("totals", got["totals"] == {"rooms": 5, "decisions": 6, "today": 7.5, "roles": 2, "memory_reviews": 1}),
         ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
          and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
