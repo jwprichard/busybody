@@ -5,7 +5,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, ProcessRunResult } from 'claude-code'
 
-import { nameHash } from '../hooks/office/sprites'
+import { nameHash } from '../hooks/office/parse'
 import { ROLE_BATCH, ROOMS_DOC, ROOMS_JSON } from './fixture'
 
 const WS = '/ws'
@@ -13,21 +13,28 @@ const WS = '/ws'
 const ENGINE = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 const SURFACES = ['terminal', 'desktop'] as const
 
-type World = { calls: string[][]; sends: Array<{ to: string; text: string }>; roleFails: string | null; batch: string }
+type World = { copies: string[]; toasts: string[]; calls: string[][]; sends: Array<{ to: string; text: string }>; roleFails: string | null; batch: string }
 
 function ok(stdout: string): { value: ProcessRunResult } {
   return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
 }
 
 function world(on: On, roomsJson: string = ROOMS_JSON): World {
-  const w: World = { calls: [], sends: [], roleFails: null, batch: ROLE_BATCH }
+  const w: World = { copies: [], toasts: [], calls: [], sends: [], roleFails: null, batch: ROLE_BATCH }
   mock.clock(on, { now: 1_800_000_000_000 })
   mock.env(on, { COLORTERM: 'truecolor', BUSYBODY_CONTROLLER: 'orchestrator' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: 'engine' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
-  on('ui.blit', () => ({ value: {} }))
+  on('ui.copy', ($, e) => {
+    w.copies.push(e.text)
+    return { value: { isCopied: true as const } }
+  })
+  on('ui.toast', ($, e) => {
+    w.toasts.push(e.text)
+    return { value: {} }
+  })
   on('fs.stat', ($, e) => {
     if (e.path === `${WS}/office.json`) return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
     return { deny: `ENOENT ${e.path}` }
@@ -85,34 +92,29 @@ test('session start finds the workspace, refreshes from bin/rooms, mutates nothi
   expect(w.calls.some(c => c[0] === `${ENGINE}/bin/rooms` && c[1] === '--json')).toBe(true)
   expect(w.calls.some(c => c[0] === 'gh')).toBe(false)   // the band asks the engine for everything GitHub-shaped
   expect(w.calls.filter(MUTATING)).toEqual([])
-  expect(await ui.find({ type: 'Text', text: 'room-alpha' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'room-beta' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /CAPPED/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /NEEDS INPUT/ })).toBeDefined()
+  expect(await ui.find({ type: 'Link', label: /\(9001-issue\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Link', label: /\(9004-issue\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2 need you · 4 tasks/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /needs you: over its spend cap/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2 stage labels: development, review/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'Which levels of the tree get sorted A→Z?' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Recommends/ })).toBeDefined()
-  // the room stopped after DONE sits on the done shelf, not as a stalled desk
-  expect(await ui.find({ type: 'Text', text: /DONE project rooms · awaiting merge\/release \(1\)/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /CONTROL ROOM/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /PROJECT ROOMS/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /CORNER OFFICE/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /acme-web#9999 open/ })).toBeDefined()
-  expect(await ui.find({ key: `stop-${ID('room-gamma')}` })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /STALLED/ })).toBeUndefined()
-  // truecolor terminal: pixel sprites
-  expect(await ui.find({ type: 'Raster', key: `spr-${ID('room-alpha')}` })).toBeDefined()
+  // the office look is gone: no rooms, desks or sprites
+  expect(await ui.find({ type: 'Text', text: /PROJECT ROOMS|STAFF ROOMS/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Raster' })).toBeUndefined()
   await ui.unmount()
 })
 
-test('pane draws on terminal and desktop, text-art where there is no Raster', async ($, on) => {
+test('pane draws the tracker on terminal and desktop at every width', async ($, on) => {
   world(on)
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   for (const surface of SURFACES) {
     for (const cols of [60, 110, 150]) {
       const ui = await $.ui.mount({ plugin: 'busybody', surface, component: 'Pane', requestId: 'office', props: paneProps(cols) })
-      expect(await ui.find({ type: 'Text', text: 'room-alpha' })).toBeDefined()
+      expect(await ui.find({ type: 'Link', label: /\(9001-issue\)/ })).toBeDefined()
       expect(await ui.find({ key: `stop-${ID('room-alpha')}` })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: /dev-team · build/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /room-alpha \(working\)/ })).toBeDefined()
       if (surface === 'desktop') expect(await ui.find({ type: 'Raster' })).toBeUndefined()
       await ui.unmount()
     }
@@ -228,17 +230,31 @@ test('Stop asks first; only "Yes" runs claude stop', async ($, on) => {
   await ui.unmount()
 })
 
-test('Attach shows the command and runs nothing; capped Resume is refused', async ($, on) => {
+test('attach copies the command and toasts; a room with no live session opens its issue; nothing mutates; capped Resume is refused', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ plugin: 'busybody', surface: 'terminal', component: 'Pane', requestId: 'office', props: paneProps(110) })
   const before = w.calls.length
   await ui.press({ key: `attach-${ID('room-alpha')}` })
   expect(w.calls.length).toBe(before)
-  expect(await ui.find({ type: 'Text', text: 'claude attach room-alpha' })).toBeDefined()
+  expect(w.copies).toEqual(['claude attach room-alpha'])
+  expect(w.toasts).toEqual(['Copied: claude attach room-alpha'])
+  // room-beta has no live session: its attach press opens the issue (gh --web), copies nothing
+  await ui.press({ key: `attach-${ID('room-beta')}` })
+  expect(w.copies).toEqual(['claude attach room-alpha'])
+  expect(w.calls.slice(before)).toEqual([['gh', 'issue', 'view', '9002', '-R', 'acme-co/acme-office', '--web']])
   await ui.press({ key: `resume-${ID('room-beta')}` })
   expect(w.calls.filter(MUTATING)).toEqual([])
   expect(await ui.find({ type: 'Text', text: /is capped/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a row name links to its issue', async ($, on) => {
+  world(on)
+  await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ plugin: 'busybody', surface: 'terminal', component: 'Pane', requestId: 'office', props: paneProps(110) })
+  expect(await ui.find({ type: 'Link', label: /\(9001-issue\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Link', label: /\(9004-issue\)/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -274,7 +290,7 @@ test('the pane title is the workspace name from office.json, with Busybody besid
   await ui.unmount()
 })
 
-test('band: rooms, decisions and spend; hidden with no rooms', async ($, on) => {
+test('band: tasks and how many need you; hidden with no tasks', async ($, on) => {
   world(on)
   const band = {
     hasSurvey: false,
@@ -291,30 +307,11 @@ test('band: rooms, decisions and spend; hidden with no rooms', async ($, on) => 
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: 'busybody', surface, component: 'AbovePrompt', props: band })
-    expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('🏢 2 rooms · 1 sticky note · $61.50 today · ✓ 1 done')
+    expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('🏢 4 tasks · 2 need you')
     await ui.unmount()
   }
 })
 
-
-test('staff: a desk per enabled role, the disabled one on the shelf', async ($, on) => {
-  world(on)
-  await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
-  for (const cols of [60, 110, 150]) {
-    const ui = await $.ui.mount({ plugin: 'busybody', surface: 'terminal', component: 'Pane', requestId: 'office', props: paneProps(cols) })
-    expect(await ui.find({ type: 'Text', text: 'scribe' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'auditor' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /pilot 1\/6 uses · day 4\/21/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /· kept/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /memory 2\.0\/8\.0 KB/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /\$3\.50\/\$15 month/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'hot desks (workers) $1.25/$20' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '⚠ unused 40 days' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /DISABLED roles \(1\)/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /retired · not worth it/ })).toBeDefined()
-    await ui.unmount()
-  }
-})
 
 const ROLE = (action: string, items: string | null, draft: string, memory: string) => [
   `${ENGINE}/bin/role`,
@@ -443,6 +440,6 @@ test('band: counts roles and memory waiting for review', async ($, on) => {
   await $.session.start({ cwd: WS, surface: 'terminal', isInteractive: true })
   const band = { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 140, scroll: { offset: 0, bodyRows: 6 }, view: {} }
   const ui = await $.ui.mount({ plugin: 'busybody', surface: 'terminal', component: 'AbovePrompt', props: band })
-  expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('· 2 roles · 📝 1 memory to review')
+  expect((await ui.find({ type: 'Text', text: /🏢/ }))?.text).toContain('· 📝 1 memory to review')
   await ui.unmount()
 })

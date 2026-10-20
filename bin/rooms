@@ -22,6 +22,12 @@ Top level `decisions[]` = DECISIONs with no later ANSWER, from rooms and from ro
 Pass issues (open, title `<role>: <task>`, label `refine` or `<role>-pass`) put their own DECISIONs on the list,
 addressed to `role-<role>-<slug of task>`; the role issue still feeds it for older passes.
 Top level `role_sessions[]` = running `role-<role>-*` sessions, shaped like a room's `lead` (the room lead's status).
+Top level `stages` = the stage table, most complete first (`parked` last), and `tasks[]` = the tracker, one row per open initiative issue
+(with or without a Room block; a closed one is gone, `stage:complete` is a label on an open one). Role passes are not rows.
+Each row: number, name (`Friendly name (N-issue)`), url, stage (the issue's one `stage:<name>` label, none = idea; `stage_warning` when
+it has several or an unknown one), needs_you + reason (an unanswered DECISION/BLOCKED, a capped room, a PR waiting on the owner:
+a flag, not a stage), worker (its room, if any) and working, age_s (since the last comment). Sorted by stage, most
+complete first, then most recently updated first.
 Top level `roles[]` = every standing role from `bin/role status --json` (reshaped, no model calls);
 `roles_error` says why it is empty when `bin/role` failed. Never breaks the rest of the document.
 """
@@ -46,7 +52,7 @@ VERBS = tuple(TYPES.split("|"))
 # New minute: first line `**TYPE** · who · where`, then a one-line summary. Old: `TYPE:` / `TYPE (…):` prefix.
 HEADER_RE = re.compile(rf"^\s*\*\*({TYPES})\*\*\s*·\s*([^·\n]*?)\s*(?:·\s*(.*?))?\s*$", re.I)
 VERB_RE = re.compile(rf"^\s*({TYPES})\b[^:\n]*:", re.I)
-ANSWER_WRITERS = ("controller", "office")
+ANSWER_WRITERS = ("controller", "office", "owner")   # the office posts the owner's answers as `owner`
 # Rooms' reply types: a controller NOTE/RECORD/ANSWER is not the room speaking.
 CONTROL_TYPES = ("NOTE", "RECORD", "ANSWER")
 
@@ -164,10 +170,15 @@ def status_lines(text):
 DECISION_RECORD_RE = re.compile(r"^\s*DECISION\s*\(", re.I)
 
 
+URL_RE = re.compile(r"https?://[^\s)>\]]+")
+
+
 def open_decisions(comments, now):
     """DECISION comments with no later ANSWER comment. An attributed `DECISION (user|MAD|…):`
     (old) or a `RECORD` records a decision already made, so it is not a sticky note for the owner.
-    An ANSWER from anyone but the controller or the office is flagged and does not close anything."""
+    A later ANSWER closes every earlier open DECISION, unless it links (a url) a DECISION comment on the issue:
+    then it closes only the ones it links. An ANSWER from anyone but the controller or the office is flagged and closes nothing."""
+    decisions = [c.get("url") for c in comments if (parse_minute(c.get("body")) or {}).get("type") == "DECISION" and c.get("url")]
     pending = []
     for c in comments:
         p = parse_minute(c.get("body")) or {}
@@ -175,7 +186,8 @@ def open_decisions(comments, now):
         if v == "DECISION" and not DECISION_RECORD_RE.match(c.get("body") or ""):
             pending.append(c)
         elif v == "ANSWER" and not p["flags"]:
-            pending = []
+            linked = {u.rstrip(".,;:") for u in URL_RE.findall(c.get("body") or "")} & set(decisions)
+            pending = [d for d in pending if d.get("url") not in linked] if linked else []
     return [report(c, now) for c in pending]
 
 
@@ -363,6 +375,83 @@ def role_inbox(role_issues, agents, now, pass_issues=None):
     return sessions, decisions
 
 
+# ---- the task tracker: one row per task -------------------------------------------------------
+NAME_MAX = 60
+# The ONE table of stages, most complete first, `parked` always last. An issue carries exactly one `stage:<name>` label; the
+# document sends this list as `stages` and the office band reads it from there.
+STAGES = ("complete", "ci-deploy", "review", "development", "design", "planning", "research", "idea", "parked")
+STAGE_PREFIX = "stage:"
+PREFIX_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*|[\w-]+(?:\([^)]*\))?!?:\s+)+")
+
+
+def friendly_name(title, number):
+    """`Friendly name (N-issue)`: the title without `role:` / `type(scope):` / `[tag]` prefixes, trimmed and capped, first letter up."""
+    t = PREFIX_RE.sub("", title or "").strip() or (title or "").strip() or "Untitled"
+    t = t[0].upper() + t[1:]
+    if len(t) > NAME_MAX:    # cut at a word boundary so it still reads as a name
+        t = t[:NAME_MAX - 1].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…" if " " in t[:NAME_MAX - 1] else t[:NAME_MAX - 1] + "…"
+    return f"{t} ({number}-issue)"
+
+
+def stage_of(labels):
+    """(stage, warning|None) from the `stage:<name>` labels: none = idea; several or an unknown one warn and the first in table order wins."""
+    names = sorted({l[len(STAGE_PREFIX):] for l in labels if l.startswith(STAGE_PREFIX)})
+    known = [n for n in STAGES if n in names]
+    unknown = [n for n in names if n not in STAGES]
+    warn = None
+    if len(names) > 1:
+        warn = f"{len(names)} stage labels: {', '.join(names)}"
+    elif unknown:
+        warn = f"unknown stage label: {unknown[0]}"
+    return (known[0] if known else "idea"), warn
+
+
+def owner_reason(open_decisions, room_state_, lead, last_own, pr, busy=False):
+    """Why the owner is needed ('' = not): an unanswered DECISION or BLOCKED, a capped room, a PR waiting on the owner."""
+    if open_decisions:
+        return f"{open_decisions} decision{'s' if open_decisions != 1 else ''} to answer"
+    if room_state_ == "needs_input" or (last_own == "BLOCKED" and not busy and lead != "busy"):
+        return "blocked, needs input"
+    if room_state_ == "capped":
+        return "over its spend cap"
+    if pr and pr.get("state") == "OPEN":
+        if not pr.get("isDraft"):
+            return "PR ready to merge"
+        if room_state_ in ("done", "waiting"):
+            return "draft PR to review"
+    return ""
+
+
+def task_sort_key(t):
+    return (STAGES.index(t["stage"]), t["age_s"] if t["age_s"] is not None else 1 << 40)
+
+
+def last_own_verb(comments):
+    own = [classify(c.get("body")) for c in comments if classify(c.get("body")) not in (None,) + CONTROL_TYPES]
+    return own[-1] if own else None
+
+
+def age_of(comments, now, field="createdAt"):
+    ts = [c.get(field) for c in comments if c.get(field)]
+    return max(0, int((now - parse_ts(max(ts))).total_seconds())) if ts else None
+
+
+def build_tasks(doc, issues, now):
+    """The tracker rows: every open initiative issue (with or without a Room block); a closed one is simply gone. Role passes are not rows. Sorted by stage, most complete first, then most recently updated first."""
+    rooms = {r["issue"]: r for r in doc["rooms"]}
+    rows = []
+    for iss in issues:
+        n, comments = iss["number"], iss.get("comments", [])
+        labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
+        r = rooms.get(n) or {}
+        stage, warn = stage_of(labels)
+        why = owner_reason(len(open_decisions(comments, now)), r.get("state"), r.get("lead", {}).get("status"), last_own_verb(comments), r.get("pr"))
+        rows.append({"number": n, "name": friendly_name(iss.get("title"), n), "url": iss.get("url", ""), "stage": stage, "stage_warning": warn,
+                     "needs_you": bool(why), "reason": why, "worker": r.get("name"), "working": r.get("lead", {}).get("status") == "busy",
+                     "age_s": age_of(comments, now)})
+    return sorted(rows, key=task_sort_key)
+
+
 def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=None, role_issues=None, pass_issues=None,
           watching=watcher_alive, phases_of=load_phases):
     by_name = {a.get("name"): a for a in agents}
@@ -411,7 +500,7 @@ def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=No
     roles = build_roles(role_doc)
     role_sessions, role_decisions = role_inbox(role_issues, agents, now, pass_issues)
     decisions += role_decisions
-    return {
+    doc = {
         "generated_at": now.isoformat(),
         "rooms": rooms,
         "decisions": decisions,
@@ -427,6 +516,11 @@ def build(issues, agents, costs, status_text, now, role_doc=None, roles_error=No
             "memory_reviews": sum(1 for r in roles if r["memory_pending"]),
         },
     }
+    doc["stages"] = list(STAGES)
+    doc["tasks"] = build_tasks(doc, issues, now)
+    doc["totals"]["tasks"] = len(doc["tasks"])
+    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["needs_you"])
+    return doc
 
 
 def load_roles():
@@ -466,6 +560,8 @@ def live(now, fresh=False):
     pass_issues = list({i["number"]: i for i in pass_issues}.values())
     doc = build(issues, agents, costs, status_text, now, role_doc, roles_error, role_issues, pass_issues)
     attach_prs(doc)
+    doc["tasks"] = build_tasks(doc, issues, now)   # again: a room's PR decides whether it needs the owner
+    doc["totals"]["needs_you"] = sum(1 for t in doc["tasks"] if t["needs_you"])
     # Live room and role sessions, whatever their issue says: `--leftovers` lists the ones whose issue is no longer open
     # Whatever the state says, a session counts when its pid is alive (done and stopped sessions with live pids are the leftovers) and
     # its cwd is under this workspace's data root.
@@ -610,7 +706,7 @@ def self_test():
          [(s["name"], s["lead"]["status"], s["lead"]["agent"]["sessionId"]) for s in got["role_sessions"]]
          == [("role-scribe-tidy-notes", "busy", "sess-scribe")]
          and got["role_sessions"][0]["issue"] == 95 and none["role_sessions"] == []),
-        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1}),
+        ("totals", got["totals"] == {"rooms": 5, "decisions": 4, "today": 7.5, "roles": 2, "memory_reviews": 1, "tasks": 6, "needs_you": 2}),
         ("roles reshaped, disabled kept", [r["name"] for r in got["roles"]] == ["scribe", "auditor", "retired"]
          and [r["status"] for r in got["roles"]] == ["probation", "kept", "disabled"]),
         ("role numbers", roles.get("scribe") and roles["scribe"]["memory"]["index_bytes"] == 2048
@@ -664,6 +760,57 @@ def self_test():
          and not watcher_alive("") and not watcher_alive("/no/such/dir")),
         ("a role pass shows the role's recipe", ROLE_TEAMS["analyst"] == "refine"
          and got["role_sessions"][0]["team"] == "scribe" and got["role_sessions"][0]["phase"] is None),
+        ("tasks: open initiatives (room or not), no role-pass rows; most complete stage first, then most recently updated",
+         [(t["number"], t["stage"]) for t in got["tasks"]]
+         == [(12, "ci-deploy"), (9, "review"), (7, "development"), (13, "development"), (14, "idea"), (8, "idea")]
+         and not any(t["number"] in (20, 95, 96) for t in got["tasks"]) and got["stages"][0] == "complete" and got["stages"][-1] == "parked"),
+        ("tasks: friendly name, room, working flag and age",
+         [(t["name"], t["worker"], t["working"], t["age_s"]) for t in got["tasks"] if t["number"] in (7, 8)]
+         == [("Alpha work (7-issue)", "room-alpha", True, 1200), ("No room (8-issue)", None, False, None)]),
+        ("tasks: the owner marker is a flag on the row, not a stage or a sort key",
+         [t["number"] for t in got["tasks"] if t["needs_you"]] == [7, 13] and got["totals"]["tasks"] == 6 and got["totals"]["needs_you"] == 2
+         and [t["reason"] for t in got["tasks"] if t["number"] == 7] == ["1 decision to answer"]),
+        ("stage labels: none is idea, several or unknown warn, the most complete known one wins, parked is last",
+         stage_of([]) == ("idea", None) and stage_of(["stage:review"]) == ("review", None)
+         and stage_of(["stage:design", "stage:review"]) == ("review", "2 stage labels: design, review")
+         and stage_of(["stage:nope"]) == ("idea", "unknown stage label: nope") and stage_of(["bug"]) == ("idea", None)
+         and sorted(["parked", "idea", "complete"], key=STAGES.index) == ["complete", "idea", "parked"]),
+        ("friendly name strips prefixes, trims, caps and never goes bare",
+         friendly_name("role: analyst pass", 5) == "Analyst pass (5-issue)" and friendly_name("feat(web)!: [x] add thing", 6) == "Add thing (6-issue)"
+         and friendly_name("", 7) == "Untitled (7-issue)" and len(friendly_name("a" * 90, 8)) == NAME_MAX + len(" (8-issue)")
+         and friendly_name("Contracting tools for the orchard managers and their growers across every region of the country", 9)
+         == "Contracting tools for the orchard managers and their… (9-issue)"),
+        ("owner reason also flags a ready PR in any room state, and a draft PR only when the room is done or waiting",
+         owner_reason(0, "working", "busy", None, {"state": "OPEN", "isDraft": False}) == "PR ready to merge"
+         and owner_reason(0, "waiting", "idle", "WAITING", {"state": "OPEN", "isDraft": True}) == "draft PR to review"
+         and owner_reason(0, "working", "busy", None, {"state": "OPEN", "isDraft": True}) == ""
+         and owner_reason(0, "done", "idle", "DONE", {"state": "MERGED", "isDraft": False}) == ""),
+        ("a room-less initiative's own open DECISION makes the row need you",
+         [(t["needs_you"], t["reason"]) for t in build_tasks({"rooms": []}, [{"number": 3, "title": "t", "labels": [], "comments": [
+             {"body": "**DECISION** · x · #3\nwhich?", "url": "https://github.com/acme-co/acme-office/issues/3#c1", "createdAt": "2026-10-06T01:00:00Z"}]}], now)]
+         == [(True, "1 decision to answer")]),
+        ("an ANSWER by the controller or office closes the earlier DECISIONs, whatever its header shape",
+         all(not open_decisions([{"body": "**DECISION** · r · #1\nq?", "url": "https://github.com/acme-co/acme-office/issues/1#c1"},
+                                 {"body": ans, "url": "https://github.com/acme-co/acme-office/issues/1#c2"}], now)
+             for ans in ("**ANSWER** · owner · control room\n(to https://github.com/acme-co/acme-office/issues/1#c1) go with A",
+                         "**ANSWER** · office · #1\ngo with A", "**ANSWER** · controller · #1\n(to https://github.com/acme-co/acme-office/issues/1#c1)"))),
+        ("an ANSWER linking a DIFFERENT decision leaves this one open; a stranger's ANSWER closes nothing",
+         [d["url"] for d in open_decisions([
+             {"body": "**DECISION** · r · #1\nfirst?", "url": "https://github.com/acme-co/acme-office/issues/1#c1"},
+             {"body": "**DECISION** · r · #1\nsecond?", "url": "https://github.com/acme-co/acme-office/issues/1#c2"},
+             {"body": "**ANSWER** · owner · control room\n(to https://github.com/acme-co/acme-office/issues/1#c2) B", "url": "https://github.com/acme-co/acme-office/issues/1#c3"}], now)]
+         == ["https://github.com/acme-co/acme-office/issues/1#c1"]
+         and len(open_decisions([{"body": "**DECISION** · r · #1\nq?", "url": "u1"}, {"body": "**ANSWER** · stranger · #1\nok", "url": "u2"}], now)) == 1),
+        ("owner reason: a decision, blocked, capped, a PR waiting on the owner; otherwise none",
+         owner_reason(1, "working", "busy", None, None) == "1 decision to answer"
+         and owner_reason(0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": True}) == "draft PR to review"
+         and owner_reason(0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": False}) == "PR ready to merge"
+         and owner_reason(0, "idle", "idle", "BLOCKED", None) == "blocked, needs input"
+         and owner_reason(0, "capped", "idle", None, None) == "over its spend cap"
+         and owner_reason(0, "working", "busy", None, None) == "" and owner_reason(0, "done", "idle", "DONE", None) == ""),
+        ("a stage:complete label on an open issue shows it at the top",
+         [(t["number"], t["stage"]) for t in build_tasks({"rooms": []}, [{"number": 1, "title": "a", "labels": ["stage:complete"], "comments": []},
+          {"number": 2, "title": "b", "labels": ["stage:idea"], "comments": []}], now)] == [(1, "complete"), (2, "idea")]),
         ("a live job between turns is idle", lead_status({"state": "working", "status": "idle"}) == "idle"),
     ]
     import tempfile

@@ -1,9 +1,10 @@
-// office mod v0: the project rooms as a little office inside Claude Code.
+// office mod: the task tracker inside Claude Code.
 //
-//   /office            opens the pane: the control room (the owner's whiteboard
-//                      with sticky notes), the staff rooms, the project rooms,
-//                      controls, and a Start room form
-//   band               🏢 N rooms · M sticky notes · $X today
+//   /office            opens the pane: one row per open initiative (the name links
+//                      to its issue) with its stage, an owner marker, its room and
+//                      age, most complete stage first; then the owner's sticky
+//                      notes and memory reviews, and a Start room form
+//   band               🏢 N tasks · M need you
 //   refresh            $.clock every 120 s runs `bin/rooms --json` (no model)
 //
 // Nothing mutating runs on its own: every gh/claude/lead-start call that
@@ -18,7 +19,6 @@ import type {
   EngineInterface,
   InputProps,
   LinkProps,
-  RasterProps,
   Register,
   RenderElement,
   SelectProps,
@@ -29,16 +29,15 @@ import type {
   OfficeConfirm,
   OfficeDecision,
   OfficeDoc,
-  OfficeGraphics,
   OfficeOutput,
   OfficePrLookup,
   OfficeRating,
   OfficeRefresh,
   OfficeRole,
-  OfficePose,
   OfficeRoom,
   OfficeSend,
   OfficeStartForm,
+  OfficeTask,
   OfficeWorkspace,
 } from '../types'
 import {
@@ -49,15 +48,7 @@ import {
   parseDecision,
 } from './office/decisions'
 import {
-  contractorsLine,
-  costLine,
   batchSignature,
-  draftsText,
-  isRoleBusy,
-  lastUseText,
-  memoryLine,
-  pilotText,
-  ratioBar,
   RATINGS,
   batchActionable,
   parseBatch,
@@ -81,34 +72,15 @@ import {
 import {
   bandAlerts,
   bandText,
-  chooseLayout,
   formatAge,
-  formatMoney,
-  parseOfficeDoc,
-  minuteSummary,
-  recipeLabel,
-  roomDisplay,
-  roomPose,
-  spendBar,
-  workspaceCandidates,
-  type BarSegment,
-  type Layout,
-  type RoomDisplay,
-} from './office/parse'
-import {
-  hex,
   nameHash,
-  pickGraphics,
-  spriteRaster,
-  STATUS_COLOR,
-  STATUS_GLYPH,
-  textArt,
-  type GraphicsMode,
-} from './office/sprites'
-
+  parseOfficeDoc,
+  stageTone,
+  trackerHeadline,
+  workspaceCandidates,
+} from './office/parse'
 const PANE = 'office'
 const REFRESH_MS = 120_000
-const FRAME_MS = 650
 
 const DEFAULT_FORM: OfficeStartForm = { repo: '', slug: '', model: 'sonnet', ref: '', liaison: '' }
 
@@ -121,7 +93,6 @@ const confirmA = atom({ plugin: 'busybody', key: 'confirm' } as const, null)
 const outputA = atom({ plugin: 'busybody', key: 'output' } as const, null)
 const showFormA = atom({ plugin: 'busybody', key: 'showForm' } as const, false)
 const formA = atom({ plugin: 'busybody', key: 'form' } as const, DEFAULT_FORM)
-const graphicsA = atom({ plugin: 'busybody', key: 'graphics' } as const, 'auto')
 const prsA = atom({ plugin: 'busybody', key: 'prs' } as const, {})
 const noticesA = atom({ plugin: 'busybody', key: 'notices' } as const, {})
 const roleBatchesA = atom({ plugin: 'busybody', key: 'roleBatches' } as const, {})
@@ -138,7 +109,7 @@ type Kit = {
   Link: ElementConstructor<LinkProps>
   Input: ElementConstructor<InputProps> | null
   Select: ElementConstructor<SelectProps> | null
-  Raster: ElementConstructor<RasterProps> | null
+  surface: string
 }
 
 const C = {
@@ -152,15 +123,6 @@ const C = {
   gold: '#e3b341',
 }
 
-const TONE: Record<BarSegment['tone'], string> = {
-  ok: C.ok,
-  warn: C.warn,
-  over: C.danger,
-  empty: '#30363d',
-  soft: C.warn,
-  hard: C.danger,
-}
-
 function firstLine(s: string): string {
   return (s.split('\n').find(l => l.trim() !== '') ?? '').trim()
 }
@@ -171,29 +133,6 @@ function errText(err: unknown): string {
 
 // Module variables: rebuilt on every (re)load; nothing durable lives here.
 let isRefreshing = false
-let isPaneOpen = false
-let frame = 0
-let graphicsMode: GraphicsMode = 'text'
-let drawn: Array<{ key: string; name: string; status: OfficePose; capped: boolean }> = []
-
-/** What the terminal says about itself; unreadable reads as unknown. */
-async function terminalEnv($: $T): Promise<{ colorterm?: string; termProgram?: string; term?: string }> {
-  try {
-    const [colorterm, termProgram, wt, term] = await Promise.all([
-      $.env.get('COLORTERM'),
-      $.env.get('TERM_PROGRAM'),
-      $.env.get('WT_SESSION'),
-      $.env.get('TERM'),
-    ])
-    return {
-      ...(colorterm ? { colorterm } : {}),
-      ...(termProgram ? { termProgram } : wt ? { termProgram: 'windowsterminal' } : {}),
-      ...(term ? { term } : {}),
-    }
-  } catch {
-    return {}
-  }
-}
 
 // ---- state helpers --------------------------------------------------------
 
@@ -212,27 +151,6 @@ function setOutput($: $T, out: OfficeOutput | null) {
 
 // ---- refresh: bin/rooms --json through $.process, never the model ---------
 
-/**
- * A room's watcher is alive when `<worktree>/.claude/watch.json` names a running pid.
- * Read-only: one `sh` per room prints `alive` and nothing else counts.
- */
-const WATCH_PROBE =
-  'f="$1/.claude/watch.json"; [ -f "$f" ] || exit 0; ' +
-  'p=$(tr -d " \\n" < "$f" | sed -n \'s/.*"pid":\\([0-9][0-9]*\\).*/\\1/p\'); ' +
-  '[ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo alive; exit 0'
-
-async function probeWatchers($: $T, rooms: OfficeRoom[]): Promise<void> {
-  for (const room of rooms) {
-    if (room.watcherAlive || room.worktree === '') continue
-    try {
-      const res = await $.process.run(['sh', '-c', WATCH_PROBE, 'sh', room.worktree], { timeoutMs: 5_000 })
-      if (res.exitCode === 0 && res.stdout.trim() === 'alive') room.watcherAlive = true
-    } catch {
-      // unreadable: no watcher
-    }
-  }
-}
-
 // `fresh` (after an answer, a command or the Refresh button) passes --fresh: skip bin/rooms' 60 s document cache so the change shows now.
 async function refresh($: $T, fresh = false): Promise<void> {
   if (isRefreshing) return
@@ -249,7 +167,6 @@ async function refresh($: $T, fresh = false): Promise<void> {
         : ({ ok: false, error: firstLine(res.stderr) || `bin/rooms exited ${res.exitCode}` } as const)
     const t1 = await $.clock.now()
     if (parsed.ok) {
-      await probeWatchers($, parsed.doc.rooms)
       await update($, docA, () => parsed.doc)
       const first = parsed.doc.workspace?.repos[0]?.name
       if (first !== undefined) await update($, formA, f => (f.repo === '' ? { ...f, repo: first } : f))
@@ -308,22 +225,6 @@ async function syncPrs($: $T): Promise<void> {
   const next: Record<string, OfficePrLookup> = {}
   for (const room of doc.rooms) next[room.name] = { pr: room.pr, checkedAt: (room.prCheckedAt ?? 0) * 1000, stale: room.prStale }
   await update($, prsA, () => next)
-}
-
-// ---- animation: repaint the pixel sprites in place ------------------------
-
-async function tick($: $T): Promise<void> {
-  if (!isPaneOpen || graphicsMode !== 'pixel' || drawn.length === 0) return
-  frame = (frame + 1) % 1024
-  for (const d of drawn) {
-    if (d.status === 'missing' && !d.capped) continue
-    const r = spriteRaster(d.name, d.status, frame, d.capped)
-    try {
-      await $.ui.blit({ requestId: PANE, key: d.key, cells: r.cells, columns: r.columns, rows: r.rows })
-    } catch {
-      // not mounted (pane redrawn or closed): the next draw catches up
-    }
-  }
 }
 
 // ---- running commands (only ever from a press) ----------------------------
@@ -387,10 +288,12 @@ async function onConfirmYes($: $T): Promise<void> {
   void refresh($, true)
 }
 
-async function onRoomAction($: $T, action: RoomAction, name: string): Promise<void> {
+async function onRoomAction($: $T, action: RoomAction, name: string, surface = 'terminal'): Promise<void> {
   const doc = await read($, docA)
   const room = doc?.rooms.find(r => r.name === name)
   if (!room) return
+  // The mod API cannot switch sessions or open a terminal: attach copies the command; a room with no live session opens its issue instead.
+  if (action === 'attach' && room.lead.status === 'missing') action = 'issue'
   const prs = await read($, prsA)
   let plan: Plan = planRoomAction(action, room, { pr: prs[name], workspace: doc?.workspace ?? null })
   if (plan.kind === 'lookup') {
@@ -415,10 +318,18 @@ async function onRoomAction($: $T, action: RoomAction, name: string): Promise<vo
     case 'disabled':
       await setNotice($, name, plan.reason)
       return
-    case 'show':
+    case 'show': {
       await setNotice($, name, null)
+      let copied = false
+      try {
+        copied = (await $.ui.copy({ text: plan.text, surface: surface as never })).isCopied
+      } catch {
+        copied = false
+      }
+      await $.ui.toast(copied ? `Copied: ${plan.text}` : `Could not copy; run: ${plan.text}`)
       await setOutput($, { title: plan.title, command: '', text: plan.text, status: 'ok' })
       return
+    }
     case 'run':
       await setNotice($, name, null)
       if (plan.confirm !== null) {
@@ -593,38 +504,19 @@ async function onStart($: $T, isDryRun: boolean): Promise<void> {
 function drawHeader(
   kit: Kit,
   $: $T,
-  v: {
-    doc: OfficeDoc | null
-    refreshState: OfficeRefresh | null
-    now: number
-    width: number
-    graphicsPref: OfficeGraphics
-    graphicsMode: GraphicsMode
-    ws: string | null
-  },
+  v: { doc: OfficeDoc | null; refreshState: OfficeRefresh | null; now: number },
 ): RenderElement {
   const { Box, Text, Button } = kit
-  const n = v.doc?.rooms.length ?? 0
-  const dec = v.doc?.decisions.length ?? 0
-  const today = v.doc?.totals.today ?? 0
-  const busy = v.doc?.rooms.filter(r => r.lead.status === 'busy').length ?? 0
-  const active = v.doc?.rooms.filter(r => roomDisplay(r).isActive).length ?? 0
+  const needs = v.doc?.totals.needsYou ?? 0
   const ago = v.refreshState ? formatAge(Math.max(0, (v.now - v.refreshState.at) / 1000)) : null
-  const nextGraphics: OfficeGraphics = v.graphicsPref === 'auto' ? 'pixel' : v.graphicsPref === 'pixel' ? 'text' : 'auto'
-  const skyline = '▁▃▅▂▇▃▆▂▄▇▅▂▃▆▁▅▃▇▂▄'
   return (
     <Box key="hdr" flexDirection="column">
       <Box key="hdr-row" flexDirection="row" justifyContent="space-between">
         <Text>
-          <Text color={C.accent} bold>{'▛▀▜ '}</Text>
           <Text bold>{`${(v.doc?.workspace?.name || 'OFFICE').toUpperCase()}`}</Text>
           <Text color={C.dim}>{' Busybody'}</Text>
           <Text color={C.dim}>{'  '}</Text>
-          <Text color={C.ok}>{`${busy}/${active} at work${n > active ? ` · ✓ ${n - active} done` : ''}`}</Text>
-          <Text color={C.dim}>{' · '}</Text>
-          <Text color={dec > 0 ? C.warn : C.dim} bold={dec > 0}>{`${dec} sticky note${dec === 1 ? '' : 's'} for you`}</Text>
-          <Text color={C.dim}>{' · '}</Text>
-          <Text color={C.gold}>{`${formatMoney(today)} today`}</Text>
+          <Text color={needs > 0 ? C.warn : C.ok} bold>{`${needs} need${needs === 1 ? 's' : ''} you`}</Text>
         </Text>
         <Text color={v.refreshState?.ok === false ? C.danger : C.dim} wrap="truncate-end">
           {v.refreshState === null
@@ -634,7 +526,6 @@ function drawHeader(
               : `↻ failed: ${v.refreshState.error ?? ''}`}
         </Text>
       </Box>
-      <Text color="#30363d">{skyline.repeat(Math.ceil(v.width / skyline.length)).slice(0, v.width)}</Text>
       <Box key="hdr-btns" flexDirection="row" gap={1}>
         <Button key="refresh" label="↻ Refresh" hotkey="r" onPress={() => void refresh($, true)} />
         <Button
@@ -642,13 +533,6 @@ function drawHeader(
           label="＋ Start room"
           hotkey="n"
           onPress={() => void update($, showFormA, s => !s)}
-        />
-        <Button
-          key="graphics"
-          label={`sprites: ${v.graphicsPref}${v.graphicsPref === 'auto' ? ` (${v.graphicsMode})` : ''}`}
-          hotkey="g"
-          dimColor
-          onPress={() => void update($, graphicsA, () => nextGraphics)}
         />
       </Box>
     </Box>
@@ -904,365 +788,83 @@ function drawReview(
   )
 }
 
-/** What a sprite needs: a room's lead, or a role dressed as one. */
-type SpriteSubject = { name: string; capped: boolean; lead: { status: OfficeRoom['lead']['status'] }; pose?: OfficePose }
-
-function drawSprite(kit: Kit, room: SpriteSubject, f: number, compact: boolean): RenderElement {
-  const { Box, Text, Raster } = kit
-  const pose = room.pose ?? room.lead.status
-  const key = `spr-${nameHash(room.name).toString(36)}`
-  if (compact) {
-    const color = room.capped ? C.danger : hex(STATUS_COLOR[pose])
-    return <Text color={color} bold>{room.capped ? '■' : STATUS_GLYPH[pose]}</Text>
-  }
-  if (graphicsMode === 'pixel' && Raster !== null) {
-    const r = spriteRaster(room.name, pose, f, room.capped)
-    drawn.push({ key, name: room.name, status: pose, capped: room.capped })
-    return (
-      <Box key={`${key}-box`} width={r.columns} flexShrink={0}>
-        <Raster key={key} columns={r.columns} rows={r.rows} cells={r.cells} />
-      </Box>
-    )
-  }
-  const lines = textArt(room.name, pose, f, room.capped)
-  return (
-    <Box key={`${key}-box`} flexDirection="column" width={16} flexShrink={0}>
-      {lines.map(segs => (
-        <Text>
-          {segs.map(s => (s.color === null ? s.text : <Text color={s.color}>{s.text}</Text>))}
-        </Text>
-      ))}
-    </Box>
-  )
-}
-
-function drawBar(kit: Kit, room: OfficeRoom, width: number): RenderElement {
-  const { Text } = kit
-  if (room.cost === null) return <Text color={C.dim}>spend: unknown</Text>
-  const c = room.cost
-  const segs = spendBar(c.today, c.soft, c.hard, width)
-  return (
-    <Text>
-      <Text color={C.gold}>{`${formatMoney(c.today)} `}</Text>
-      {segs.map(s => (
-        <Text color={TONE[s.tone]}>{s.text}</Text>
-      ))}
-      <Text color={C.dim}>{` soft ${formatMoney(c.soft)} · hard ${formatMoney(c.hard)}`}</Text>
-    </Text>
-  )
-}
-
-function warningFor(d: RoomDisplay): { text: string; color: string } | null {
-  if (d.warning === null) return null
-  return { text: d.warning.text, color: d.warning.tone === 'danger' ? C.danger : C.warn }
-}
-
-const DISPLAY_GLYPH: Record<RoomDisplay['kind'], string> = {
-  busy: STATUS_GLYPH.busy,
-  idle: STATUS_GLYPH.idle,
-  needs_input: STATUS_GLYPH.needs_input,
-  stalled: STATUS_GLYPH.missing,
-  watching: STATUS_GLYPH.watching,
-  waiting: STATUS_GLYPH.waiting,
-  capped: '■',
-  done: '✓',
-}
-
-function drawButtons(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | undefined, short: boolean): RenderElement {
+/** Small per-row buttons for a task whose worker is a project room; other rows just link to the issue. */
+function drawRowButtons(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | undefined): RenderElement {
   const { Box, Button } = kit
   const id = nameHash(room.name).toString(36)
-  const prLabel = (pr?.pr ? `PR #${pr.pr.number}` : 'PR') + (pr?.stale ? ' (stale)' : '')
-  const btn = (action: RoomAction, label: string, shortLabel: string, dim = false) => (
-    <Button
-      key={`${action}-${id}`}
-      label={short ? shortLabel : label}
-      dimColor={dim}
-      onPress={() => onRoomAction($, action, room.name)}
-    />
+  const prLabel = (pr?.pr ? `pr #${pr.pr.number}` : 'pr') + (pr?.stale ? ' (stale)' : '')
+  const btn = (action: RoomAction, label: string, dim = false) => (
+    <Button key={`${action}-${id}`} label={label} dimColor={dim} onPress={() => onRoomAction($, action, room.name, kit.surface)} />
   )
   const isMissing = room.lead.status === 'missing'
   return (
     <Box key={`btns-${id}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
-      {btn('stop', '■ Stop', 'stop', isMissing)}
-      {btn('resume', '▶ Resume', 'resume', !isMissing || room.capped)}
-      {btn('attach', '⧉ Attach', 'attach')}
-      {btn('issue', `# Issue ${room.issue}`, `#${room.issue}`)}
-      {btn('pr', `⇡ ${prLabel}`, prLabel.toLowerCase(), pr !== undefined && pr.pr === null)}
+      {btn('stop', 'stop', isMissing)}
+      {btn('resume', 'resume', !isMissing || room.capped)}
+      {btn('attach', isMissing ? 'open' : 'attach')}
+      {btn('issue', `#${room.issue}`)}
+      {btn('pr', prLabel, pr !== undefined && pr.pr === null)}
     </Box>
   )
 }
 
-function drawRoom(
+function drawTaskRow(
   kit: Kit,
   $: $T,
-  room: OfficeRoom,
-  v: { width: number; layout: Layout; pr: OfficePrLookup | undefined; notice: string | null; frame: number },
+  t: OfficeTask,
+  v: { stages: string[]; room: OfficeRoom | undefined; pr: OfficePrLookup | undefined; notice: string | null },
 ): RenderElement {
-  const { Box, Text } = kit
-  const id = nameHash(room.name).toString(36)
-  const status = roomPose(room)
-  const color = room.capped ? C.danger : hex(STATUS_COLOR[status])
-  const display = roomDisplay(room)
-  const warn = warningFor(display)
-  const latest = room.latest
-  const compact = v.layout === 'compact'
-  const inner = Math.max(20, v.width - 4)
-  const textWidth = compact ? inner : Math.max(16, inner - 18)
-  const barWidth = Math.max(6, Math.min(24, textWidth - 34))
-  const leadLine = (
-    <Text wrap="truncate-end">
-      <Text color={color} bold>{`${DISPLAY_GLYPH[display.kind]} ${display.label}`}</Text>
-      <Text color={C.dim}>{` · ${room.model || 'head desk'}`}</Text>
-      {recipeLabel(room) ? <Text color={C.dim}>{` · ${recipeLabel(room)}`}</Text> : null}
-      {room.cost && Object.keys(room.cost.mix).length > 1 ? (
-        <Text color={C.dim}>{` · mix ${Object.entries(room.cost.mix)
-          .map(([m, x]) => `${m} ${formatMoney(x)}`)
-          .join(' + ')}`}</Text>
-      ) : null}
-    </Text>
-  )
-  const reportLine = latest ? (
-    <Text wrap="truncate-end">
-      <Text color={latest.verb === 'DECISION' || latest.verb === 'BLOCKED' ? C.warn : latest.verb === 'DONE' ? C.ok : C.info} bold>
-        {latest.verb || 'NOTE'}
-      </Text>
-      <Text color={C.dim}>{` ${formatAge(latest.ageS)} ago · `}</Text>
-      {minuteSummary(latest)}
-    </Text>
-  ) : (
-    <Text color={C.dim}>no report yet</Text>
-  )
-  const title = (
-    <Box key={`title-${id}`} flexDirection="row" justifyContent="space-between">
-      <Text wrap="truncate-end">
-        {compact ? drawSprite(kit, { ...room, pose: status }, v.frame, true) : null}
-        {compact ? ' ' : ''}
-        <Text bold color={room.capped ? C.danger : undefined}>{room.name}</Text>
-      </Text>
-      <Text color={C.dim}>{`#${room.issue} · ${room.repo}`}</Text>
-    </Box>
-  )
-  if (compact) {
-    return (
-      <Box key={`room-${id}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={v.width}>
-        {title}
-        {recipeLabel(room) ? <Text color={C.dim} wrap="truncate-end">{recipeLabel(room)}</Text> : null}
-        {reportLine}
-        {drawBar(kit, room, Math.max(6, Math.min(16, inner - 34)))}
-        {warn ? <Text color={warn.color} wrap="truncate-end">{warn.text}</Text> : null}
-        {v.notice ? <Text color={C.dim} wrap="truncate-end">{`↳ ${v.notice}`}</Text> : null}
-        {drawButtons(kit, $, room, v.pr, true)}
-      </Box>
-    )
-  }
+  const { Box, Text, Link } = kit
+  const tone = stageTone(t.stage, v.stages)
+  const stageColor = tone === 'done' ? C.ok : tone === 'parked' ? C.dim : C.info
   return (
-    <Box
-      key={`room-${id}`}
-      flexDirection="column"
-      borderStyle={room.capped ? 'bold' : 'round'}
-      borderColor={color}
-      paddingX={1}
-      width={v.width}
-    >
-      {title}
-      <Box key={`desk-${id}`} flexDirection="row" gap={2}>
-        {drawSprite(kit, { ...room, pose: status }, v.frame, false)}
-        <Box key={`info-${id}`} flexDirection="column" flexGrow={1} width={textWidth}>
-          {leadLine}
-          {reportLine}
-          {drawBar(kit, room, barWidth)}
-          {warn ? <Text color={warn.color} wrap="truncate-end">{warn.text}</Text> : null}
-        </Box>
-      </Box>
-      {v.notice ? <Text color={C.dim} wrap="truncate-end">{`↳ ${v.notice}`}</Text> : null}
-      {drawButtons(kit, $, room, v.pr, false)}
-    </Box>
-  )
-}
-
-function drawRooms(
-  kit: Kit,
-  $: $T,
-  v: {
-    rooms: OfficeRoom[]
-    layout: Layout
-    width: number
-    prs: Record<string, OfficePrLookup>
-    notices: Record<string, string>
-    frame: number
-  },
-): RenderElement {
-  const { Box, Text } = kit
-  if (v.rooms.length === 0) {
-    return (
-      <Box key="floor" flexDirection="column" borderStyle="round" borderColor="#30363d" paddingX={1}>
-        <Text color={C.accent} bold>{'🏗 PROJECT ROOMS'}</Text>
-        <Text color={C.dim}>No project rooms: no open initiative has a room. ＋ Start room opens one.</Text>
-      </Box>
-    )
-  }
-  const cardWidth = v.layout === 'wide' ? Math.floor((v.width - 1) / 2) : v.width
-  const active = v.rooms.filter(r => roomDisplay(r).isActive)
-  const done = v.rooms.filter(r => !roomDisplay(r).isActive)
-  return (
-    <Box key="floor-all" flexDirection="column">
-      <Text>
-        <Text color={C.accent} bold>{'🏗 PROJECT ROOMS'}</Text>
-        <Text color={C.dim}>{`  head desk: the room lead · ${active.length} at work`}</Text>
-      </Text>
-      {active.length > 0 ? (
-        <Box key="floor" flexDirection="row" flexWrap="wrap" columnGap={1}>
-          {active.map(room =>
-            drawRoom(kit, $, room, {
-              width: cardWidth,
-              layout: v.layout,
-              pr: v.prs[room.name],
-              notice: v.notices[room.name] ?? null,
-              frame: v.frame,
-            }),
+    <Box key={`task-${t.number}`} flexDirection="column">
+      <Box key={`task-row-${t.number}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
+        <Text wrap="truncate-end">
+          <Text color={C.warn} bold>{t.needsYou ? '◆ ' : '  '}</Text>
+          {t.url !== '' ? (
+            <Link key={`task-link-${t.number}`} href={t.url} label={t.name} />
+          ) : (
+            <Text bold={t.needsYou} dimColor={tone === 'parked'}>{t.name}</Text>
           )}
-        </Box>
-      ) : (
-        <Text color={C.dim}>No project room is at work right now.</Text>
-      )}
-      {done.length > 0 ? (
-        <Box key="done-shelf" flexDirection="column" borderStyle="single" borderColor="#30363d" borderDimColor paddingX={1}>
-          <Text color={C.dim}>{`✓ DONE project rooms · awaiting merge/release (${done.length})`}</Text>
-          {done.map(room => drawDone(kit, $, room, v.prs[room.name], v.notices[room.name] ?? null))}
-        </Box>
-      ) : null}
-    </Box>
-  )
-}
-
-/** A finished room: one dimmed, collapsed row group at the bottom. */
-function drawDone(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | undefined, notice: string | null): RenderElement {
-  const { Box, Text, Button, Link } = kit
-  const id = nameHash(room.name).toString(36)
-  const status = room.statusLine.split('\n').map(l => l.trim()).filter(l => l !== '')
-  return (
-    <Box key={`done-${id}`} flexDirection="column" marginTop={1}>
-      <Box key={`done-head-${id}`} flexDirection="row" justifyContent="space-between">
-        <Text wrap="truncate-end">
-          <Text color={C.ok}>{'✓ '}</Text>
-          <Text dimColor bold>{room.name}</Text>
-          <Text color={C.dim}>{' · Done · awaiting merge/release'}</Text>
         </Text>
-        <Text color={C.dim}>{`#${room.issue} · ${room.repo}${room.latest ? ` · ${formatAge(room.latest.ageS)} ago` : ''}`}</Text>
-      </Box>
-      {status.map(line => (
-        <Text color={C.dim} wrap="truncate-end">{`  ${line}`}</Text>
-      ))}
-      {pr?.pr ? (
-        <Box key={`done-pr-${id}`} paddingLeft={2}>
-          <Link href={pr.pr.url} label={`PR #${pr.pr.number} (${pr.pr.isDraft ? 'draft' : pr.pr.state.toLowerCase()}) ↗`} />
-        </Box>
-      ) : null}
-      {notice ? <Text color={C.dim} wrap="truncate-end">{`  ↳ ${notice}`}</Text> : null}
-      <Box key={`done-btns-${id}`} flexDirection="row" columnGap={1} paddingLeft={2}>
-        <Button key={`issue-${id}`} label={`# Issue ${room.issue}`} dimColor onPress={() => onRoomAction($, 'issue', room.name)} />
-        <Button
-          key={`pr-${id}`}
-          label={pr?.pr ? `⇡ PR #${pr.pr.number}` : '⇡ PR'}
-          dimColor
-          onPress={() => onRoomAction($, 'pr', room.name)}
-        />
-      </Box>
-    </Box>
-  )
-}
-
-// ---- staff: one fixed desk per enabled role, disabled ones on a shelf -------
-
-function drawRoleDesk(kit: Kit, $: $T, role: OfficeRole, v: { width: number; layout: Layout; now: number; frame: number }): RenderElement {
-  const { Box, Text } = kit
-  const id = nameHash(role.name).toString(36)
-  const isBusy = isRoleBusy(role, v.now)
-  const compact = v.layout === 'compact'
-  const subject: SpriteSubject = { name: `role:${role.name}`, capped: false, lead: { status: isBusy ? 'busy' : 'idle' } }
-  const color = role.memoryPending ? C.accent : isBusy ? C.ok : C.wall
-  const inner = Math.max(20, v.width - 4)
-  const textWidth = compact ? inner : Math.max(16, inner - 18)
-  const barWidth = Math.max(6, Math.min(16, textWidth - 40))
-  const tone = (segs: BarSegment[]) => segs.map(s => <Text color={TONE[s.tone]}>{s.text}</Text>)
-  const mem = role.memory
-  const memTone = mem.indexBytes >= mem.capIndex ? C.danger : C.dim
-  const info = (
-    <Box key={`rinfo-${id}`} flexDirection="column" flexGrow={1} width={textWidth}>
-      <Text wrap="truncate-end">
-        <Text color={isBusy ? C.ok : C.info} bold>{isBusy ? '⌨ at work' : '☕ idle'}</Text>
-        <Text color={C.dim}>{` · ${pilotText(role)}`}</Text>
-      </Text>
-      {role.goal !== '' ? <Text color={C.dim} wrap="truncate-end">{role.goal}</Text> : null}
-      <Text wrap="truncate-end">
-        <Text color={memTone}>{`${memoryLine(role)} `}</Text>
-        {tone(ratioBar(mem.indexBytes, mem.capIndex, barWidth))}
-      </Text>
-      <Text wrap="truncate-end">
-        <Text color={C.gold}>{`${costLine(role)} `}</Text>
-        {tone(ratioBar(role.cost.month, role.cost.budget, barWidth))}
-      </Text>
-      <Text color={C.dim} wrap="truncate-end">{contractorsLine(role)}</Text>
-      <Text color={C.dim} wrap="truncate-end">
-        {[lastUseText(role), `${role.useCount} use${role.useCount === 1 ? '' : 's'}`, draftsText(role)].filter(s => s !== null).join(' · ')}
-      </Text>
-      {role.flags.map(flag => (
-        <Text color={C.warn} wrap="truncate-end">{`⚠ ${flag}`}</Text>
-      ))}
-    </Box>
-  )
-  return (
-    <Box key={`role-${id}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={v.width}>
-      <Box key={`rtitle-${id}`} flexDirection="row" justifyContent="space-between">
         <Text wrap="truncate-end">
-          {compact ? drawSprite(kit, subject, v.frame, true) : null}
-          {compact ? ' ' : ''}
-          <Text bold>{role.name}</Text>
-          {role.memoryPending ? <Text color={C.accent}>{' 📝'}</Text> : null}
+          <Text color={stageColor} bold>{t.stage}</Text>
+          {t.needsYou ? <Text color={C.warn}>{` · needs you: ${t.reason}`}</Text> : null}
+          <Text color={C.dim}>{` · ${t.worker === null ? 'no room' : `${t.worker}${t.working ? ' (working)' : ''}`} · ${t.ageS === null ? '?' : formatAge(t.ageS)}`}</Text>
         </Text>
-        <Text color={C.dim}>{role.issue === null ? 'staff room' : `staff room · #${role.issue}`}</Text>
+        {v.room === undefined ? null : drawRowButtons(kit, $, v.room, v.pr)}
       </Box>
-      {compact ? (
-        info
-      ) : (
-        <Box key={`rdesk-${id}`} flexDirection="row" gap={2}>
-          {drawSprite(kit, subject, v.frame, false)}
-          {info}
-        </Box>
-      )}
+      {t.stageWarning ? <Text color={C.warn} wrap="truncate-end">{`  ⚠ ${t.stageWarning}`}</Text> : null}
+      {v.notice ? <Text color={C.dim} wrap="truncate-end">{`  ↳ ${v.notice}`}</Text> : null}
     </Box>
   )
 }
 
-function drawStaff(kit: Kit, $: $T, v: { roles: OfficeRole[]; layout: Layout; width: number; now: number; frame: number }): RenderElement | null {
+function drawTracker(
+  kit: Kit,
+  $: $T,
+  v: { doc: OfficeDoc | null; prs: Record<string, OfficePrLookup>; notices: Record<string, string> },
+): RenderElement {
   const { Box, Text } = kit
-  const staff = v.roles.filter(r => r.enabled)
-  const off = v.roles.filter(r => !r.enabled)
-  if (staff.length === 0 && off.length === 0) return null
-  const cardWidth = v.layout === 'wide' ? Math.floor((v.width - 1) / 2) : v.width
+  const tasks = v.doc?.tasks ?? []
   return (
-    <Box key="staff" flexDirection="column">
+    <Box key="tracker" flexDirection="column">
       <Text>
-        <Text color={C.accent} bold>{'👤 STAFF ROOMS'}</Text>
-        <Text color={C.dim}>{`  roles with memory · ${staff.length} at their head desks`}</Text>
+        <Text color={C.accent} bold>{'TASKS'}</Text>
+        <Text color={C.dim}>{'  '}</Text>
+        <Text color={(v.doc?.totals.needsYou ?? 0) > 0 ? C.warn : C.ok} bold>{trackerHeadline(tasks)}</Text>
       </Text>
-      {staff.length > 0 ? (
-        <Box key="staff-desks" flexDirection="row" flexWrap="wrap" columnGap={1}>
-          {staff.map(role => drawRoleDesk(kit, $, role, { width: cardWidth, layout: v.layout, now: v.now, frame: v.frame }))}
-        </Box>
-      ) : (
-        <Text color={C.dim}>No role is enabled.</Text>
-      )}
-      {off.length > 0 ? (
-        <Box key="staff-shelf" flexDirection="column" borderStyle="single" borderColor="#30363d" borderDimColor paddingX={1}>
-          <Text color={C.dim}>{`○ DISABLED roles (${off.length}) · memory frozen in git`}</Text>
-          {off.map(role => (
-            <Text color={C.dim} wrap="truncate-end">
-              {`  ${role.name} · ${role.disabledReason ?? 'no reason on record'} · ${lastUseText(role)}`}
-            </Text>
-          ))}
-        </Box>
-      ) : null}
+      {tasks.length === 0 ? <Text color={C.dim}>No open initiative. ＋ Start room opens one.</Text> : null}
+      {tasks.map(t => {
+        const room = t.worker === null ? undefined : v.doc?.rooms.find(r => r.name === t.worker)
+        return drawTaskRow(kit, $, t, {
+          stages: v.doc?.stages ?? [],
+          room,
+          pr: room ? v.prs[room.name] : undefined,
+          notice: room ? (v.notices[room.name] ?? null) : null,
+        })
+      })}
     </Box>
   )
 }
@@ -1384,7 +986,6 @@ async function locateWorkspace($: $T, cwd: string): Promise<void> {
     clocksStarted = true
     void refresh($)
     $.clock.every(REFRESH_MS, () => void refresh($))
-    $.clock.every(FRAME_MS, () => void tick($))
   }
 }
 
@@ -1392,7 +993,7 @@ export const register: Register = on => {
   // ---- events ---------------------------------------------------------------
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'office', description: 'Open the office: control room, staff rooms, project rooms and controls' })
+    await $.command.register({ name: 'office', description: 'Open the task tracker: one row per task, what needs you first' })
     const out = await next(e)
     await locateWorkspace($, e.cwd)
     const liaison = (await $.env.get('BUSYBODY_CONTROLLER')) || (await $.env.get('SCH_LIAISON_SESSION')) // the old name is an alias
@@ -1404,8 +1005,7 @@ export const register: Register = on => {
     // The mod can load after session.start (enabled or hot-reloaded mid-session), so the
     // workspace may never have been looked for. Look again from the mod's own folder.
     if ((await read($, workspaceA)) === null) await locateWorkspace($, '')
-    const opened = await $.ui.open({ id: PANE, title: '🏢 Office', focus: true })
-    isPaneOpen = opened.isPlaced
+    await $.ui.open({ id: PANE, title: '🏢 Office', focus: true })
     void refresh($)
     const ws = await read($, workspaceA)
     if (ws === null) return { text: 'Office opened, but no workspace with office.json was found above this session.' }
@@ -1413,8 +1013,6 @@ export const register: Register = on => {
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
-    isPaneOpen = false
-    drawn = []
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -1439,9 +1037,7 @@ export const register: Register = on => {
           plain
           dimColor
           onPress={() => {
-            void $.ui.open({ id: PANE, title: '🏢 Office', focus: true }).then(r => {
-              isPaneOpen = r.isPlaced
-            })
+            void $.ui.open({ id: PANE, title: '🏢 Office', focus: true })
           }}
         />
       </Box>
@@ -1451,7 +1047,6 @@ export const register: Register = on => {
   // ---- the pane ------------------------------------------------------------
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    isPaneOpen = true
     const t = $.ui.resolve(e) as unknown as Record<string, unknown>
     const kit: Kit = {
       Box: t.Box as Kit['Box'],
@@ -1460,10 +1055,10 @@ export const register: Register = on => {
       Link: t.Link as Kit['Link'],
       Input: e.surface === 'mobile' ? null : (t.Input as Kit['Input']),
       Select: e.surface === 'mobile' ? null : (t.Select as Kit['Select']),
-      Raster: e.surface === 'terminal' ? (t.Raster as Kit['Raster']) : null,
+      surface: e.surface,
     }
     const { Box, Text } = kit
-    const [doc, refreshState, ws, drafts, sends, confirm, output, showForm, form, graphicsPref, prs, notices, roleBatches, roleItems, roleRatings, roleRuns] =
+    const [doc, refreshState, ws, drafts, sends, confirm, output, showForm, form, prs, notices, roleBatches, roleItems, roleRatings, roleRuns] =
       await Promise.all([
         read($, docA),
         read($, refreshA),
@@ -1474,7 +1069,6 @@ export const register: Register = on => {
         read($, outputA),
         read($, showFormA),
         read($, formA),
-        read($, graphicsA),
         read($, prsA),
         read($, noticesA),
         read($, roleBatchesA),
@@ -1483,18 +1077,12 @@ export const register: Register = on => {
         read($, roleRunsA),
       ])
     const now = await $.clock.now()
-    graphicsMode = pickGraphics(graphicsPref, e.surface, await terminalEnv($))
-    if (kit.Raster === null) graphicsMode = 'text'
     const width = Math.max(30, e.props.bodyColumns)
-    const rooms = doc?.rooms ?? []
-    const layout = chooseLayout(width, rooms.filter(r => roomDisplay(r).isActive).length)
-    drawn = []
 
-    const header = drawHeader(kit, $, { doc, refreshState, now, width, graphicsPref, graphicsMode, ws })
+    const header = drawHeader(kit, $, { doc, refreshState, now })
     const confirmBox = confirm ? drawConfirm(kit, $, confirm) : null
     const inbox = drawInbox(kit, $, { doc, drafts, sends, width, now, ws, roleBatches, roleItems, roleRatings, roleRuns })
-    const staff = drawStaff(kit, $, { roles: doc?.roles ?? [], layout, width, now, frame })
-    const roomsView = drawRooms(kit, $, { rooms, layout, width, prs, notices, frame })
+    const tracker = drawTracker(kit, $, { doc, prs, notices })
     const form$ = showForm ? drawForm(kit, $, { form, notice: notices.start ?? null, width, workspace: doc?.workspace ?? null }) : null
     const console$ = output ? drawOutput(kit, $, output, e.surface) : null
 
@@ -1502,12 +1090,11 @@ export const register: Register = on => {
       <Box key="office" flexDirection="column" width={width}>
         {header}
         {confirmBox}
+        {tracker}
         {inbox}
-        {staff}
-        {roomsView}
         {form$}
         {console$}
-        {doc === null && refreshState === null && ws !== null ? <Text color={C.dim}>Walking the floor… (bin/rooms --json)</Text> : null}
+        {doc === null && refreshState === null && ws !== null ? <Text color={C.dim}>Reading the tasks… (bin/rooms --json)</Text> : null}
         {ws === null ? (
           <Text color={C.warn}>No workspace found: no office.json above this session's directory or the engine's.</Text>
         ) : null}
