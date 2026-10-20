@@ -109,6 +109,7 @@ type Kit = {
   Link: ElementConstructor<LinkProps>
   Input: ElementConstructor<InputProps> | null
   Select: ElementConstructor<SelectProps> | null
+  surface: string
 }
 
 const C = {
@@ -287,10 +288,12 @@ async function onConfirmYes($: $T): Promise<void> {
   void refresh($, true)
 }
 
-async function onRoomAction($: $T, action: RoomAction, name: string): Promise<void> {
+async function onRoomAction($: $T, action: RoomAction, name: string, surface = 'terminal'): Promise<void> {
   const doc = await read($, docA)
   const room = doc?.rooms.find(r => r.name === name)
   if (!room) return
+  // The mod API cannot switch sessions or open a terminal: attach copies the command; a room with no live session opens its issue instead.
+  if (action === 'attach' && room.lead.status === 'missing') action = 'issue'
   const prs = await read($, prsA)
   let plan: Plan = planRoomAction(action, room, { pr: prs[name], workspace: doc?.workspace ?? null })
   if (plan.kind === 'lookup') {
@@ -315,10 +318,18 @@ async function onRoomAction($: $T, action: RoomAction, name: string): Promise<vo
     case 'disabled':
       await setNotice($, name, plan.reason)
       return
-    case 'show':
+    case 'show': {
       await setNotice($, name, null)
+      let copied = false
+      try {
+        copied = (await $.ui.copy({ text: plan.text, surface: surface as never })).isCopied
+      } catch {
+        copied = false
+      }
+      await $.ui.toast(copied ? `Copied: ${plan.text}` : `Could not copy; run: ${plan.text}`)
       await setOutput($, { title: plan.title, command: '', text: plan.text, status: 'ok' })
       return
+    }
     case 'run':
       await setNotice($, name, null)
       if (plan.confirm !== null) {
@@ -783,14 +794,14 @@ function drawRowButtons(kit: Kit, $: $T, room: OfficeRoom, pr: OfficePrLookup | 
   const id = nameHash(room.name).toString(36)
   const prLabel = (pr?.pr ? `pr #${pr.pr.number}` : 'pr') + (pr?.stale ? ' (stale)' : '')
   const btn = (action: RoomAction, label: string, dim = false) => (
-    <Button key={`${action}-${id}`} label={label} dimColor={dim} onPress={() => onRoomAction($, action, room.name)} />
+    <Button key={`${action}-${id}`} label={label} dimColor={dim} onPress={() => onRoomAction($, action, room.name, kit.surface)} />
   )
   const isMissing = room.lead.status === 'missing'
   return (
     <Box key={`btns-${id}`} flexDirection="row" flexWrap="wrap" columnGap={1}>
       {btn('stop', 'stop', isMissing)}
       {btn('resume', 'resume', !isMissing || room.capped)}
-      {btn('attach', 'attach')}
+      {btn('attach', isMissing ? 'open' : 'attach')}
       {btn('issue', `#${room.issue}`)}
       {btn('pr', prLabel, pr !== undefined && pr.pr === null)}
     </Box>
@@ -1044,6 +1055,7 @@ export const register: Register = on => {
       Link: t.Link as Kit['Link'],
       Input: e.surface === 'mobile' ? null : (t.Input as Kit['Input']),
       Select: e.surface === 'mobile' ? null : (t.Select as Kit['Select']),
+      surface: e.surface,
     }
     const { Box, Text } = kit
     const [doc, refreshState, ws, drafts, sends, confirm, output, showForm, form, prs, notices, roleBatches, roleItems, roleRatings, roleRuns] =
