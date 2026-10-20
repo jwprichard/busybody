@@ -31,7 +31,8 @@
                                     line is archived in the same batch
   bin/role triage <role> [--accept cN [--link URL2] | --drop cN]
                                     the controller's memory triage (no owner review). For each candidate: (a) its evidence link is a recorded
-                                    `**ANSWER** ·` minute: promoted to MEMORY.md at once, one use; (b) `repo: <name>` in the line: it is a
+                                    owner `**ANSWER** ·` minute (header author office or the controller; checked against the issue's
+                                    comments, the quote and an earlier DECISION of the pass): promoted at once, one use; (b) `repo: <name>` in the line: it is a
                                     repo lesson, not role memory: prints a "propose a CLAUDE.md PR to <name>" item and promotes nothing;
                                     (c) otherwise prints the item with the four-point checklist (non-derivable, checkable, cites its
                                     source, small). `--accept cN` promotes it as one use (needs the guard's trigger: --link URL2, a
@@ -897,12 +898,22 @@ def _sources():
         return {}
 
 
-def _record_source(name, cid, issue, session):
-    d = _sources()
-    d.setdefault(name, {})[str(cid)] = {"issue": issue, "session": session}
+def _save_sources(d):
     with open(_sources_path() + ".tmp", "w") as fh:
         json.dump(d, fh)
     os.replace(_sources_path() + ".tmp", _sources_path())
+
+
+def _record_source(name, cid, issue, session, body):
+    d = _sources()
+    d.setdefault(name, {})[str(cid)] = {"issue": issue, "session": session, "body": body}
+    _save_sources(d)
+
+
+def _drop_source(name, cid):
+    d = _sources()
+    if d.get(name, {}).pop(str(cid), None) is not None:
+        _save_sources(d)
 
 
 @locked
@@ -956,7 +967,7 @@ def cmd_apply(argv):
                 die(f"error applying {ln[:80]}: {why}")
             print(f"skipped (guard refused): {ln[:100]}\n  {why}")
             continue
-        _record_source(name, nid, issue, session)
+        _record_source(name, nid, issue, session, body)
         print(f"applied: {new[:100]}")
 
 
@@ -967,38 +978,42 @@ def _pass_session_ok(name, session, roles):
 
 # ---- triage: the controller settles candidates; the owner is not asked ---------------------------
 
-ANSWER_HEAD = re.compile(r"^(\*\*ANSWER\*\* ·|ANSWER \(from the user\))")
 CHECKLIST = "non-derivable? checkable? cites its source? small?"
 
 
+def _answer_writers():
+    """Who may sign an ANSWER the office and the role brief accept: the office, the controller, the configured controller session."""
+    return {"office", "controller", bb_env(None, "CONTROLLER", "SCH_LIAISON_SESSION")} - {None, ""}
+
+
 def _answer_evidence(name, line):
-    """The candidate's own evidence link, if it is a recorded ANSWER: the link is the line's last `(url)`, on the issue the candidate was
-    applied from (`role apply` records it), the ANSWER is not the pass's own, quotes the candidate's words verbatim, and comes after a
-    DECISION of that pass's session on that issue. Anything else (or a failed gh read) is None."""
+    """The candidate's own evidence link, if it is a recorded owner ANSWER. All of: the line is exactly the text `role apply` recorded
+    (so a hand-written or renumbered line inherits nothing), the link is the line's last `(url)` and one of the comments of the issue it
+    was applied from, its header author is the office or the controller (never the pass itself), the quote (>= 15 characters, >= 3 words) is
+    in the ANSWER's body below the header, verbatim and case-sensitive, and a DECISION of that pass's session came before it.
+    Limit: the header name is text, and a pass that can post comments can type `office`; the office flags ANSWERs from anyone else and the
+    controller's checklist is the backstop. Anything else, or a failed gh read, is None."""
     src = _sources().get(name, {}).get(str(line_id(line, "c")))
     m = re.search(r'"([^"\n]{3,})" \((https://github\.com/([^/\s]+/[^/\s]+)/issues/(\d+)#issuecomment-(\d+))\)\s*$', line)
-    if not src or not m or m.group(3) != REPO or int(m.group(4)) != src["issue"]:
+    if not src or not m or m.group(3) != REPO or int(m.group(4)) != src["issue"] or re.sub(r"^- c\d+ ", "", line) != src.get("body"):
         return None
     quote, url, aid = m.group(1), m.group(2), int(m.group(5))
-
-    def api(*a):
-        r = subprocess.run(["gh", "api", *a], capture_output=True, text=True)
-        return r.stdout if r.returncode == 0 else None
-    body = api(f"repos/{REPO}/issues/comments/{aid}", "--jq", ".body")
-    if body is None or not ANSWER_HEAD.match(body) or quote not in body:
+    if len(quote) < 15 or len(quote.split()) < 3:
         return None
-    who = re.match(r"^\*\*ANSWER\*\* · (\S+) ·", body)
-    if who and who.group(1) == src["session"]:
-        return None  # a pass does not answer itself
-    decision = re.compile(rf"^\*\*DECISION\*\* · {re.escape(src['session'])} · ")
-    for ln in (api(f"repos/{REPO}/issues/{src['issue']}/comments", "--paginate", "--jq", ".[] | @json") or "").splitlines():
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/issues/{src['issue']}/comments", "--paginate", "--jq", ".[] | @json"], capture_output=True, text=True)
+    comments = {}
+    for ln in (r.stdout if r.returncode == 0 else "").splitlines():
         try:
             c = json.loads(ln)
-        except ValueError:
+            comments[c["id"]] = c.get("body") or ""
+        except (ValueError, KeyError, TypeError):
             continue
-        if c.get("id", aid) < aid and decision.match(c.get("body") or ""):
-            return url
-    return None
+    head, _, rest = comments.get(aid, "").partition("\n")
+    who = re.match(r"^\*\*ANSWER\*\* · (\S+) ·", head)
+    if not who or who.group(1) == src["session"] or who.group(1) not in _answer_writers() or quote not in rest:
+        return None
+    decision = re.compile(rf"^\*\*DECISION\*\* · {re.escape(src['session'])} · ")
+    return url if any(i < aid and decision.match(b) for i, b in comments.items()) else None
 
 
 def _promote_and_settle(name, cid, extra):
@@ -1039,6 +1054,7 @@ def cmd_triage(argv):
         if drop:
             write_lines(name, "candidates.md", [l for l in read_disk(name, "candidates.md") if l != src])
             commit_candidates(name)
+            _drop_source(name, cid)
             return
         ok, why = _promote_and_settle(name, cid, ["--link", link] if link else [])
         if not ok:
@@ -1205,6 +1221,7 @@ def cmd_promote(argv, from_triage=False):
     cand.remove(src)
     mem.append(new)
     _propose(name, mem, cand, arch, {f"m{line_id(new, 'm')}"})
+    _drop_source(name, cid)
     print(f"proposed (uncommitted): {new}\nnext: bin/role batch {name}")
 
 
@@ -2077,10 +2094,14 @@ def self_test():
         S = "role-test-role-pass-t"
         bodies_of = {600: f"**DECISION** · {S} · #42\nwhich?\n", 601: "**ANSWER** · office · #42\nthe owner said so, clearly\n",
                      602: "**NOTE** · controller · #42\nnot an answer\n", 603: "**ANSWER** · office · #42\nanother answer\n",
-                     612: "**ANSWER** · office · #42\nthe owner said so\n", 613: f"**ANSWER** · {S} · #42\nthe owner said so\n"}
+                     612: "**ANSWER** · office · #42\nthe owner said so\n", 613: f"**ANSWER** · {S} · #42\nthe owner said so\n",
+                     614: "**ANSWER** · office · #42\nunrelated text here\n", 615: "**ANSWER** · role-test-role-pass-x · #42\nthe owner said so\n",
+                     616: "ANSWER (from the user): \"the owner said so\"\n", 617: "**ANSWER** · controller · #42\nthe owner said so, via the controller\n"}
         for n, head in bodies_of.items():
             with open(os.path.join(bodies, str(n)), "w") as fh:
                 fh.write(head)
+        with open(os.path.join(bodies, "620"), "w") as fh:   # a real ANSWER comment, but not among the issue's own comment list
+            fh.write("**ANSWER** · office · #42\nthe owner said so\n")
         with open(os.path.join(bodies, "700"), "w") as fh:
             fh.write("**ANSWER** · office · #7\nthe owner said so\n")
         with open(os.path.join(bodies, "list-42"), "w") as fh:   # comment 612 has no earlier DECISION of pass U, so it is "before any decision"
@@ -2089,16 +2110,34 @@ def self_test():
         set_cands()
         minute(701, S, tl(1, "T1", url=murl(601)), tl(2, "T2", " (repo: acme-api)", url=murl(601)), tl(3, "T3"), tl(4, "T4"),
                tl(5, "T5", url=f"https://github.com/acme-co/acme-office/issues/7#issuecomment-700"),
-               tl(6, "T6", url=murl(601), quote="words nobody said"), tl(7, "T7", url=murl(613)))
+               tl(6, "T6", url=murl(601), quote="words nobody said"), tl(7, "T7", url=murl(613)),
+               tl(9, "T9", url=murl(615)), tl(10, "T10", url=murl(616)), tl(11, "T11", url=murl(620)),
+               tl(12, "T12", url=murl(601), quote="office"), tl(13, "T13", url=murl(601), quote="ANSWER"),
+               tl(14, "T14", url=murl(614), quote="ANSWER** · office · #42"), tl(15, "T15", url=murl(617)),
+               tl(16, "T16", url=murl(602)), tl(17, "T17", url=murl(601), quote="The Owner Said So"))
         minute(702, "role-test-role-pass-u", tl(1, "T8", url=murl(612)))
         expect("apply of the triage minutes", role("apply", "test-role", murl(701)).returncode == 0 and role("apply", "test-role", murl(702)).returncode == 0)
+        # a hand-written line that reuses a recorded candidate's id (and cites a real ANSWER) inherits nothing
+        sh("git", "checkout", "--", MEM)
+        c16 = re.search(r"^- c(\d+) .*Lesson T16\b", open(cpath).read(), re.M).group(1)
+        with open(cpath, "w") as fh:
+            fh.write("".join((tl(int(c16), "T16x", url=murl(601)) if re.match(rf"- c{c16} ", l) else l) + "\n" for l in head_cands().splitlines()))
+        sh("git", "add", "-A")
+        sh("git", "commit", "-q", "-m", "hand edit")
         cid = lambda tag: re.search(rf"^- c(\d+) .*Lesson {tag}\b", open(cpath).read(), re.M).group(1)
-        c1, c2, c3, c4 = (cid(t) for t in ("T1", "T2", "T3", "T4"))
+        c1, c2, c3, c4, c15 = (cid(t) for t in ("T1", "T2", "T3", "T4", "T15"))
+        _json_sources = lambda: json.load(open(os.path.join(ws, ".git", "role-candidate-sources.json")))
         n0 = n_uses()
         r = role("triage", "test-role")
         expect(f"triage (a): a line quoting a verified ANSWER is promoted as one use (rc {r.returncode})",
-               r.returncode == 0 and f"[c{c1}] auto-accepted" in r.stdout and n_uses() == n0 + 1
+               r.returncode == 0 and f"[c{c1}] auto-accepted" in r.stdout and n_uses() == n0 + 2
                and any("Lesson T1" in l and l.endswith(" answer") for l in head_mem().splitlines()) and f"- c{c1} " not in head_cands())
+        forged = ("T9", "T10", "T11", "T12", "T13", "T14", "T16x", "T17")
+        expect("triage (a) refuses: an ANSWER signed by another name, the legacy `ANSWER (from the user)` form, an ANSWER id not in the issue's comment list, "
+               "a quote of 'office' or 'ANSWER' or only of the header, a case-different quote, and a line that merely reuses a recorded id",
+               all(f"[c{cid(t)}] auto-accepted" not in r.stdout and f"- c{cid(t)} " in head_cands() for t in forged) and not any(f"Lesson {t}." in head_mem() for t in forged))
+        expect("triage (a) accepts an ANSWER signed by the controller", f"[c{c15}] auto-accepted" in r.stdout)
+        expect("a promoted candidate's source is forgotten", c1 not in _json_sources().get("test-role", {}) and c16 in _json_sources().get("test-role", {}))
         expect("triage (a) refuses forgeries: an ANSWER on another issue, an ANSWER with no earlier DECISION of the pass, a quote the ANSWER does not hold, "
                "and an ANSWER the pass wrote itself",
                all(f"[c{cid(t)}] auto-accepted" not in r.stdout and f"- c{cid(t)} " in head_cands() for t in ("T5", "T8", "T6", "T7"))
@@ -2111,15 +2150,15 @@ def self_test():
         expect("promote --trigger answer is refused from the CLI", role("promote", "test-role", f"c{c3}", "--trigger", "answer").returncode != 0
                and "Lesson T3" not in open(mem).read())
         expect("apply skips a line already promoted into MEMORY.md (a promoted line is its candidate's text plus a link and marker)",
-               role("apply", "test-role", murl(701)).returncode == 0 and "Lesson T1" not in open(cpath).read())
+               role("apply", "test-role", murl(701)).returncode == 0 and "Lesson T1." not in open(cpath).read())
         sh("git", "checkout", "--", MEM)
-        expect("triage never asks the owner: it leaves no memory diff behind", sh("git", "status", "--porcelain").stdout.strip() == "" and n_uses() == n0 + 1)
+        expect("triage never asks the owner: it leaves no memory diff behind", sh("git", "status", "--porcelain").stdout.strip() == "" and n_uses() == n0 + 2)
         r = role("triage", "test-role", "--accept", f"c{c3}")
         expect("--accept needs the guard's trigger (a single link with no generality word is refused, nothing changes)",
-               r.returncode != 0 and n_uses() == n0 + 1 and f"- c{c3} " in head_cands() and sh("git", "status", "--porcelain").stdout.strip() == "")
+               r.returncode != 0 and n_uses() == n0 + 2 and f"- c{c3} " in head_cands() and sh("git", "status", "--porcelain").stdout.strip() == "")
         r = role("triage", "test-role", "--accept", f"c{c3}", "--link", murl(603))
         expect(f"--accept cN --link URL2 promotes it as one use (rc {r.returncode})",
-               r.returncode == 0 and n_uses() == n0 + 2 and "Lesson T3" in head_mem() and f"- c{c3} " not in head_cands())
+               r.returncode == 0 and n_uses() == n0 + 3 and "Lesson T3" in head_mem() and f"- c{c3} " not in head_cands())
         n1 = n_uses()
         c_before = sh("git", "rev-list", "--count", "HEAD").stdout.strip()
         r = role("triage", "test-role", "--drop", f"c{c4}")

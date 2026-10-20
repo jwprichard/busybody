@@ -72,7 +72,7 @@ secrets, hostnames, account IDs or customer data):
 comments (two links), or one link whose quote has a generality word (always, never, by default,
 unless said otherwise, from now on, every time) marked `1-link`, or the owner correcting a
 recommendation a line drove (`correction`, naming the corrected id), or a single link to an owner `ANSWER` that quotes the candidate
-(`answer`: `role triage` checks that the ANSWER is on the pass's issue, follows your `DECISION` and holds your quote, then promotes it with no further step). The
+(`answer`: `role triage` checks that the ANSWER is on the pass's issue, follows your `DECISION` and holds your quote, then promotes it with no further step). Only an ANSWER headed by the office or the controller counts; the old `ANSWER (from the user)` form goes to the controller's checklist. Limit: a header name is text, so a session that can post comments could type `office` — the office flags ANSWERs from anyone else and the controller's checklist is the backstop. Never write an ANSWER yourself. The
 controller promotes it (`role promote`). The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. Over the 15-line cap the least-cited line is archived inside that same item.
 
 **Contradiction.** If the owner contradicts a `MEMORY.md` line, run `role archive` at once
