@@ -14,7 +14,6 @@ import type {
   OfficeRoleStatus,
   OfficeRoom,
   OfficeTask,
-  OfficeTaskState,
   OfficeWorkspace,
 } from '../../types'
 
@@ -154,21 +153,21 @@ function parseRoom(v: unknown): OfficeRoom | null {
   }
 }
 
-const TASK_STATES: readonly OfficeTaskState[] = ['needs_you', 'working', 'waiting', 'parked', 'done']
-
 function parseTask(v: unknown): OfficeTask | null {
   const o = obj(v)
   const number = num(o.number, 0)
   const name = str(o.name)
   if (name === '' || number === 0) return null
-  const state = str(o.state)
   return {
     number,
     name,
     url: str(o.url),
-    worker: str(o.worker) || null,
-    state: (TASK_STATES as readonly string[]).includes(state) ? (state as OfficeTaskState) : 'parked',
+    stage: str(o.stage, 'idea'),
+    stageWarning: str(o.stage_warning) || null,
+    needsYou: o.needs_you === true,
     reason: str(o.reason),
+    worker: str(o.worker) || null,
+    working: o.working === true,
     ageS: typeof o.age_s === 'number' && Number.isFinite(o.age_s) ? o.age_s : null,
   }
 }
@@ -312,6 +311,7 @@ export function parseOfficeDoc(text: string): ParseResult {
     doc: {
       generatedAt: str(o.generated_at),
       rooms,
+      stages: arr(o.stages).filter((x): x is string => typeof x === 'string'),
       tasks,
       decisions,
       roles,
@@ -326,10 +326,20 @@ export function parseOfficeDoc(text: string): ParseResult {
         roles: num(totals.roles, roles.filter(r => r.enabled).length),
         memoryReviews: num(totals.memory_reviews, roles.filter(r => r.memoryPending).length),
         tasks: num(totals.tasks, tasks.length),
-        needsYou: num(totals.needs_you, tasks.filter(t => t.state === 'needs_you').length),
+        needsYou: num(totals.needs_you, tasks.filter(t => t.needsYou).length),
       },
     },
   }
+}
+
+/** A stable small hash of a name, for stable UI keys. */
+export function nameHash(name: string): number {
+  let h = 2166136261
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
 }
 
 export function formatAge(seconds: number | null): string {
@@ -348,20 +358,16 @@ function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
-/** Row order and labels of the tracker, owner-first. */
-export const TASK_STATE_LABEL: Record<OfficeTaskState, string> = {
-  needs_you: 'needs you',
-  working: 'working',
-  waiting: 'waiting',
-  parked: 'parked',
-  done: 'done',
+/** The tracker's headline: how many need the owner, out of how many tasks. */
+export function trackerHeadline(tasks: readonly OfficeTask[]): string {
+  const n = tasks.filter(t => t.needsYou).length
+  return `${n} need${n === 1 ? 's' : ''} you · ${plural(tasks.length, 'task', 'tasks')}`
 }
 
-/** The tracker's headline: how many need the owner first, then the other states that have rows. */
-export function trackerHeadline(tasks: readonly OfficeTask[]): string {
-  const n = (s: OfficeTaskState) => tasks.filter(t => t.state === s).length
-  const parts = TASK_STATES.filter(s => s !== 'needs_you' && n(s) > 0).map(s => `${n(s)} ${TASK_STATE_LABEL[s]}`)
-  return [`${n('needs_you')} need${n('needs_you') === 1 ? 's' : ''} you`, ...parts].join(' · ')
+/** A stage's tone from its place in the engine's table: the first is done, the last is parked, the rest are in flight. */
+export function stageTone(stage: string, stages: readonly string[]): 'done' | 'parked' | 'active' {
+  const i = stages.indexOf(stage)
+  return i === 0 ? 'done' : i === stages.length - 1 && i > 0 ? 'parked' : 'active'
 }
 
 /**
@@ -371,16 +377,10 @@ export function trackerHeadline(tasks: readonly OfficeTask[]): string {
 export function bandText(doc: OfficeDoc | null): string | null {
   if (doc === null) return null
   const reviews = doc.roles.filter(r => r.memoryPending).length
-  const open = doc.tasks.filter(t => t.state !== 'done').length
   if (doc.tasks.length === 0 && reviews === 0) return null
   const parts: string[] = []
-  if (doc.tasks.length > 0) {
-    parts.push(`🏢 ${plural(open, 'task', 'tasks')}`, `${doc.totals.needsYou} need you`)
-    const done = doc.tasks.length - open
-    if (done > 0) parts.push(`✓ ${done} done`)
-  } else {
-    parts.push('🏢 office')
-  }
+  if (doc.tasks.length > 0) parts.push(`🏢 ${plural(doc.tasks.length, 'task', 'tasks')}`, `${doc.totals.needsYou} need you`)
+  else parts.push('🏢 office')
   if (reviews > 0) parts.push(`📝 ${reviews} memory to review`)
   return parts.join(' · ')
 }

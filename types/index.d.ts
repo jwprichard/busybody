@@ -123,24 +123,30 @@ export type OfficeWorkspace = {
   tracker: { type: string; name: string; cardUrlRegex: string | null }
 }
 
-export type OfficeTaskState = 'needs_you' | 'working' | 'waiting' | 'parked' | 'done'
-
-/** One tracker row from `bin/rooms` `tasks[]`: an initiative (or role pass) with its state, already sorted owner-first. */
+/** One tracker row from `bin/rooms` `tasks[]`: an open initiative, already sorted (most complete stage first). */
 export type OfficeTask = {
   number: number
   /** `Friendly name (N-issue)`. */
   name: string
   url: string
-  /** The room or role session on it, or null. */
-  worker: string | null
-  state: OfficeTaskState
+  /** The issue's `stage:<name>` label (one of the document's `stages`); idea when unlabelled. */
+  stage: string
+  /** Several or unknown stage labels, else null. */
+  stageWarning: string | null
+  /** Waiting on the owner: a flag, not a stage. */
+  needsYou: boolean
   reason: string
+  /** The project room on it, or null. */
+  worker: string | null
+  working: boolean
   ageS: number | null
 }
 
 export type OfficeDoc = {
   generatedAt: string
   rooms: OfficeRoom[]
+  /** The stage table from bin/rooms, most complete first, parked last. */
+  stages: string[]
   tasks: OfficeTask[]
   decisions: OfficeDecision[]
   roles: OfficeRole[]

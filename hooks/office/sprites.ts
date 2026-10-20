@@ -3,6 +3,7 @@
 // for surfaces or terminals without it. Pose and colour follow the lead's
 // status; a capped room gets a red desk and a blinking alarm lamp.
 
+import { nameHash } from './parse'
 import type { OfficeGraphics, OfficePose } from '../../types'
 
 export const SPRITE_W = 16
@@ -198,16 +199,6 @@ export const STATUS_GLYPH: Record<OfficePose, string> = {
 
 const HAIRS = [0x2b1d14, 0x5a3825, 0xc9a227, 0x1c1c1c, 0x8c3b1e, 0x9aa0a6]
 const SKINS = [0xf2c9a0, 0xd9a274, 0xa86b45, 0x7a4a2e, 0xffd9b8]
-
-/** A stable small hash of a name, so each lead keeps its own look. */
-export function nameHash(name: string): number {
-  let h = 2166136261
-  for (let i = 0; i < name.length; i++) {
-    h ^= name.charCodeAt(i)
-    h = Math.imul(h, 16777619)
-  }
-  return h >>> 0
-}
 
 export function hex(c: number): string {
   return `#${c.toString(16).padStart(6, '0')}`
