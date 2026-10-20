@@ -8,11 +8,9 @@ session by its process). See `docs/design.md`; `CLAUDE.md` is the developer guid
 
 ## The office band
 
-The office inside Claude Code: the control room (the owner's whiteboard with
-its sticky notes), the staff rooms, the project rooms (each with its room lead
-at the head desk, at work or not), spend bars against the caps, the room
-controls, and a one-line band above the prompt. Vocabulary:
-see `docs/room-lifecycle.md`.
+A task tracker inside Claude Code: `/office` opens a pane with one row per open initiative (its stage, who is
+working on it, whether it needs you), the owner's sticky notes and memory reviews under it, the room controls,
+and a one-line band above the prompt. Vocabulary: see `docs/room-lifecycle.md`.
 
 ## Install
 
@@ -96,33 +94,27 @@ tsc -p .   # needs .claude-plugin/types/, which the engine lays at load (gitigno
 
 ## What it shows
 
-- **Band above the prompt:** `🏢 N rooms · M sticky notes · $X today`, where N
-  counts active rooms only, then `✓ K done` when any room is finished, `R roles`
-  (enabled roles), `📝 N memory to review` when any role has a pending memory
-  diff, and `✋ needs input` / `⛔ capped` counts when any. Hidden when there are
-  no rooms and no memory to review (roles alone don't open it). With memory to
-  review but no rooms it reads `🏢 office · R roles · 📝 N memory to review`.
-- **Header:** how many project rooms are at work, sticky notes for you, today's spend, and
-  when the last refresh ran (or why it failed).
-- **Control room (the owner's whiteboard):** every sticky note: an open DECISION
+- **Task tracker (the pane):** one row per open initiative issue, whether or not it has a
+  room. A row has the friendly name (`Contracting tools (109-issue)`: the issue title without its
+  `role:` / `type(scope):` / `[tag]` prefix, capped, plus the number), its **stage**, a `◆ needs you: <why>`
+  marker, the project room on it (`(working)` while its lead is mid-turn) and the age since the last comment. A closed issue is gone.
+  Role passes are not rows.
+  - **Stage** is the issue's one `stage:<name>` label, read as is: `complete`, `ci-deploy`, `review`,
+    `development`, `planning`, `design`, `research`, `idea`, `parked`, most complete first, `parked` always last;
+    unlabelled is `idea`. The table lives once, in `bin/rooms` (`STAGES`), and comes to the pane as `stages`. Two or more
+    stage labels, or an unknown `stage:*` one, show a `⚠` warning on the row (the most complete known stage is used).
+  - **Order:** by stage, then most recently updated first.
+  - **Needs you** is a flag, not a stage and not a sort key: an unanswered DECISION or BLOCKED, a room over its cap,
+    or a PR waiting on you (the room reported DONE and its PR is open). The header and the pane top say `N need you`.
+  - **Row buttons** (rows with a room): stop, resume, attach, `#issue`, `pr` (the commands below); a row without a room links to its issue.
+- **Band above the prompt:** `🏢 N tasks · M need you`, then `📝 N memory to review` when any role has a pending
+  memory diff, and a GitHub-budget warning when the hour's GraphQL estimate passes 70%. Hidden when there are no
+  tasks and no memory to review.
+- **Header:** how many need you, and when the last refresh ran (or why it failed).
+- **Control room (the owner's whiteboard), under the tracker:** every sticky note: an open DECISION
   with no later ANSWER, plus the memory reviews below. The question, numbered options and the recommendation are read from the
   comment; a comment without that shape is shown as written. Each one has a
   text field and **Send**, plus a preview of exactly what will be posted.
-- **Staff rooms** (between the control room and the project rooms; initiative
-  a standing role's issue): one fixed bordered head desk per **enabled role**, each a staff room (see
-  `docs/room-lifecycle.md`; teams are not shown yet, and
-  hot desks only as a spend line, because `bin/role` reports no per-worker data). Each desk has the role's sprite (`role:<name>` seeds it), then:
-  - at work (green) when the role's transcripts moved in the last 5 minutes,
-    else idle (blue); the border is purple while a memory diff waits
-  - `pilot 1/6 uses · day 4/21` on probation, `kept` once kept
-  - the goal, a memory bar against the 8 KB index cap (red at the cap, amber from
-    80%, stale lines noted), a `$` bar against `budget_usd_month`, a hot desks (workers)
-    line against `contractor_budget_usd_month`
-  - last use, use count, card drafts approved / unedited
-  - each `bin/role` flag as a `⚠` warning
-  Disabled roles sit on a dim `DISABLED roles` shelf at the bottom of the
-  section with their reason. If `bin/role` fails the section is empty and the
-  control room says `staff rooms unavailable: <why>`; rooms are unaffected.
 - **Memory reviews** (sticky notes of a second kind, in the control room under the decisions): one item per
   role with a pending memory diff, showing the yes/no items `bin/role batch <role>`
   prints (at most 5, each a PROMOTE, ARCHIVE or RESTORE; the overflow waits for
@@ -140,50 +132,6 @@ tsc -p .   # needs .claude-plugin/types/, which the engine lays at load (gitigno
   accept or reject of its own: it only calls these `bin/role` commands, and
   never decides anything by itself. If `bin/role accept` is refused (the memory
   guard), its message is shown and the items stay.
-- **PROJECT ROOMS: one bordered room per initiative:** room name, issue (the minutes), repo, and the room lead at the head desk as a
-  sprite whose pose and colour follow its status:
-  - working (green): typing, the screen scrolling code
-  - idle (blue): leaning back with a coffee, the screen asleep
-  - watching (cyan): idle, and its watcher is alive (`.claude/watch.json` in the
-    room worktree names a running pid, probed read-only on each refresh): eyes on a PR screen
-  - waiting (violet): the last minute is WAITING (`**WAITING** · who · where`, or the old
-    `WAITING:`) but no watcher is alive, for example after a restart: asleep on the desk
-  - needs input (amber): standing with a hand up and a `!` bubble
-  - not running: an empty chair, the screen off
-  - capped: red desk, blinking alarm lamp, bold red border
-
-  Minutes are read in the new `**TYPE** · who · where` header (summary on the next line)
-  and the old `TYPE:` form; a gone lead that is waiting or watched is not STALLED.
-
-  Each desk also shows its **recipe and phase**, `dev-team · build`, dim after the model (its own line
-  in the compact card). `bin/rooms` sends `team` (the Room block's `- team: <name>`, dev-team when
-  absent), `phases` (from `teams/<team>/team.json`) and `phase`: the last valid `Phase: <name>` line in the
-  room's own PROGRESS/WAITING minutes, else the last phase while a watcher is alive, else the first phase
-  while the room has posted at most its first minute. Unknown shows `?`; with no recipe the label is hidden.
-
-  Beside it: the last report line (verb, age, first line), the spend bar
-  (filled to today's spend, `│` at the soft cap, `┃` at the hard cap; green,
-  amber past soft, red past hard), the model mix, and a capped / needs-input /
-  over-soft-cap warning.
-- **Room state** (`roomDisplay` in `hooks/office/parse.ts`) comes from the room lead's
-  status and the latest report verb together:
-  - room lead gone **and** the latest report is `DONE` → **Done · awaiting
-    merge/release**: no warning, moved to a dimmed, collapsed "DONE" shelf at
-    the bottom of the pane with its `bin/status` line, the PR link and Issue/PR
-    buttons only. It isn't counted as an active room.
-  - room lead gone **without** a `DONE` → **not running**, with a `STALLED?`
-    warning (read the minutes, then Resume).
-  - capped → `⛔ CAPPED`; needs input → `✋ NEEDS INPUT`; a running room lead that
-    already reported DONE shows `working · reported DONE`.
-- **Graphics:** pixel-art sprites drawn with `Raster` (two pixels a cell) when
-  the surface is the terminal and it reports true colour (`COLORTERM`,
-  `TERM_PROGRAM`, `WT_SESSION`, `TERM`); coloured text-art otherwise (the
-  desktop app, 256-colour terminals). The `sprites:` button cycles
-  auto → pixel → text. Pixel sprites animate in place with `$.ui.blit` while
-  the pane is open.
-- **Layout:** two desks a row from 124 columns; one compact card per room
-  (status glyph, report, bar, warning, short buttons) under 72 columns or with
-  5+ rooms.
 - **Console:** the output of the last command run, with Copy and Clear.
 
 ## What each button runs
@@ -257,15 +205,14 @@ it's free. State lives in `$.state` (`office.*`, typed in `types/index.d.ts`).
 .claude-plugin/plugin.json   manifest (types: ./types/index.d.ts)
 hooks/hooks.json             { "modules": ["./register.tsx"] }
 hooks/register.tsx           events, refresh, handlers and drawing
-hooks/office/parse.ts        bin/rooms → OfficeDoc, band text, spend bar, layout (pure)
+hooks/office/parse.ts        bin/rooms → OfficeDoc (tasks, stages), headline, band text (pure)
 hooks/office/decisions.ts    sticky note (DECISION) parsing, ANSWER text and argv, nudge (pure)
-hooks/office/roles.ts        role desk text, bars, batch parsing, settle argv, diff and failure text (pure)
+hooks/office/roles.ts        memory-review batch parsing, settle argv, diff and failure text (pure)
 hooks/office/commands.ts     button → command mapping, start form → lead-start argv (pure)
-hooks/office/sprites.ts      pixel scenes, Raster packing, text-art, graphics detection (pure)
 types/index.d.ts             the $.state contract
-tests/logic.test.ts          pure modules: parsing, sticky notes, mapping, sprites
+tests/logic.test.ts          pure modules: parsing, tracker, sticky notes, mapping
 tests/office.test.ts         through the engine, with gh/claude mocked beneath the mod
-tests/fixture.ts             a made-up bin/rooms document (issues 9001-9003, roles scribe/auditor/retired)
+tests/fixture.ts             a made-up bin/rooms document (issues 9001-9004, roles scribe/auditor/retired)
 ```
 
 The tests mock every host command beneath the mod: nothing real runs, and no
