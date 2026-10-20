@@ -46,7 +46,7 @@ change; most should not.
 3. **It quotes its evidence, with a link.** The owner's words, or a run or command that showed
    the better way.
 
-A lesson for the whole team is a proposed skill edit, not memory. A technique you use in your own
+A lesson for the whole team is a proposed skill edit, not memory. A lesson about one repo (a convention, a command, a trap in that codebase) is not role memory either: write `repo: <name>` in the lesson text and the controller turns it into a CLAUDE.md PR to that repo. A technique you use in your own
 recurring work may be memory.
 
 Never store card, PR, release or deploy state, versions, counts or metric values — those are
@@ -63,7 +63,7 @@ derived (the `status` tool, GitHub, the tracker, the metric command).
 
 **Line formats** (a date and a verbatim quote with a link on every line; link, don't paste; no
 secrets, hostnames, account IDs or customer data):
-- `MEMORY.md`: `- m<N> <YYYY-MM-DD>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction]`
+- `MEMORY.md`: `- m<N> <YYYY-MM-DD>: <line>. Changes: <the question/recommendation/action>. "<verbatim quote>" (<url>)[ (<url2>)][ 1-link|correction|answer]`
 - `candidates.md`: `- c<N> <YYYY-MM-DD>: <line>. Changes: <...>. "<quote>" (<url>)`
 - Ids are never reused. This overrides Claude Code's default memory format (separate files,
   frontmatter, Why/How lines), which the pre-commit guard rejects.
@@ -71,7 +71,8 @@ secrets, hostnames, account IDs or customer data):
 **Promotion.** A candidate becomes a `MEMORY.md` line only on evidence: two *different* owner
 comments (two links), or one link whose quote has a generality word (always, never, by default,
 unless said otherwise, from now on, every time) marked `1-link`, or the owner correcting a
-recommendation a line drove (`correction`, naming the corrected id). The
+recommendation a line drove (`correction`, naming the corrected id), or a single link to an owner `ANSWER` that quotes the candidate
+(`answer`: `role triage` checks that the ANSWER is on the pass's issue, follows your `DECISION` and holds your quote, then promotes it with no further step). The
 controller promotes it (`role promote`). The `MEMORY.md` line must be exactly its candidate's text plus ` (url2)` and a marker. Over the 15-line cap the least-cited line is archived inside that same item.
 
 **Contradiction.** If the owner contradicts a `MEMORY.md` line, run `role archive` at once
