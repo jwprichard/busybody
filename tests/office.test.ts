@@ -114,7 +114,8 @@ test('pane draws the tracker on terminal and desktop at every width', async ($, 
       const ui = await $.ui.mount({ plugin: 'busybody', surface, component: 'Pane', requestId: 'office', props: paneProps(cols) })
       expect(await ui.find({ type: 'Link', label: /\(9001-issue\)/ })).toBeDefined()
       expect(await ui.find({ key: `stop-${ID('room-alpha')}` })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: /room-alpha \(working\)/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /^STAGE +⚑ +INITIATIVE/ })).toBeDefined()   // the table's header
+      expect(await ui.find({ type: 'Text', text: /room-.*●/ })).toBeDefined()
       if (surface === 'desktop') expect(await ui.find({ type: 'Raster' })).toBeUndefined()
       await ui.unmount()
     }
