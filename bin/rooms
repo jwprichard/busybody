@@ -26,7 +26,7 @@ Top level `stages` = the stage table, most complete first (`parked` last), and `
 (with or without a Room block; a closed one is gone, `stage:complete` is a label on an open one). Role passes are not rows.
 Each row: number, name (`Friendly name (N-issue)`), url, stage (the issue's one `stage:<name>` label, none = idea; `stage_warning` when
 it has several or an unknown one), needs_you + reason (an unanswered DECISION/BLOCKED, a capped room, a PR waiting on the owner:
-a flag, not a stage), worker (its room, if any) and working, age_s (since the last comment, or the close). Sorted by stage, most
+a flag, not a stage), worker (its room, if any) and working, age_s (since the last comment). Sorted by stage, most
 complete first, then most recently updated first.
 Top level `roles[]` = every standing role from `bin/role status --json` (reshaped, no model calls);
 `roles_error` says why it is empty when `bin/role` failed. Never breaks the rest of the document.
@@ -52,7 +52,7 @@ VERBS = tuple(TYPES.split("|"))
 # New minute: first line `**TYPE** · who · where`, then a one-line summary. Old: `TYPE:` / `TYPE (…):` prefix.
 HEADER_RE = re.compile(rf"^\s*\*\*({TYPES})\*\*\s*·\s*([^·\n]*?)\s*(?:·\s*(.*?))?\s*$", re.I)
 VERB_RE = re.compile(rf"^\s*({TYPES})\b[^:\n]*:", re.I)
-ANSWER_WRITERS = ("controller", "office")
+ANSWER_WRITERS = ("controller", "office", "owner")   # the office posts the owner's answers as `owner`
 # Rooms' reply types: a controller NOTE/RECORD/ANSWER is not the room speaking.
 CONTROL_TYPES = ("NOTE", "RECORD", "ANSWER")
 
@@ -170,10 +170,15 @@ def status_lines(text):
 DECISION_RECORD_RE = re.compile(r"^\s*DECISION\s*\(", re.I)
 
 
+URL_RE = re.compile(r"https?://[^\s)>\]]+")
+
+
 def open_decisions(comments, now):
     """DECISION comments with no later ANSWER comment. An attributed `DECISION (user|MAD|…):`
     (old) or a `RECORD` records a decision already made, so it is not a sticky note for the owner.
-    An ANSWER from anyone but the controller or the office is flagged and does not close anything."""
+    A later ANSWER closes every earlier open DECISION, unless it links (a url) a DECISION comment on the issue:
+    then it closes only the ones it links. An ANSWER from anyone but the controller or the office is flagged and closes nothing."""
+    decisions = [c.get("url") for c in comments if (parse_minute(c.get("body")) or {}).get("type") == "DECISION" and c.get("url")]
     pending = []
     for c in comments:
         p = parse_minute(c.get("body")) or {}
@@ -181,7 +186,8 @@ def open_decisions(comments, now):
         if v == "DECISION" and not DECISION_RECORD_RE.match(c.get("body") or ""):
             pending.append(c)
         elif v == "ANSWER" and not p["flags"]:
-            pending = []
+            linked = {u.rstrip(".,;:") for u in URL_RE.findall(c.get("body") or "")} & set(decisions)
+            pending = [d for d in pending if d.get("url") not in linked] if linked else []
     return [report(c, now) for c in pending]
 
 
@@ -370,10 +376,10 @@ def role_inbox(role_issues, agents, now, pass_issues=None):
 
 
 # ---- the task tracker: one row per task -------------------------------------------------------
-NAME_MAX = 40
+NAME_MAX = 60
 # The ONE table of stages, most complete first, `parked` always last. An issue carries exactly one `stage:<name>` label; the
 # document sends this list as `stages` and the office band reads it from there.
-STAGES = ("complete", "ci-deploy", "review", "development", "planning", "design", "research", "idea", "parked")
+STAGES = ("complete", "ci-deploy", "review", "development", "design", "planning", "research", "idea", "parked")
 STAGE_PREFIX = "stage:"
 PREFIX_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*|[\w-]+(?:\([^)]*\))?!?:\s+)+")
 
@@ -382,8 +388,8 @@ def friendly_name(title, number):
     """`Friendly name (N-issue)`: the title without `role:` / `type(scope):` / `[tag]` prefixes, trimmed and capped, first letter up."""
     t = PREFIX_RE.sub("", title or "").strip() or (title or "").strip() or "Untitled"
     t = t[0].upper() + t[1:]
-    if len(t) > NAME_MAX:
-        t = t[:NAME_MAX - 1].rstrip() + "…"
+    if len(t) > NAME_MAX:    # cut at a word boundary so it still reads as a name
+        t = t[:NAME_MAX - 1].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…" if " " in t[:NAME_MAX - 1] else t[:NAME_MAX - 1] + "…"
     return f"{t} ({number}-issue)"
 
 
@@ -408,8 +414,11 @@ def owner_reason(open_decisions, room_state_, lead, last_own, pr, busy=False):
         return "blocked, needs input"
     if room_state_ == "capped":
         return "over its spend cap"
-    if room_state_ == "done" and pr and pr.get("state") == "OPEN":
-        return "draft PR to review" if pr.get("isDraft") else "PR ready to merge"
+    if pr and pr.get("state") == "OPEN":
+        if not pr.get("isDraft"):
+            return "PR ready to merge"
+        if room_state_ in ("done", "waiting"):
+            return "draft PR to review"
     return ""
 
 
@@ -430,14 +439,13 @@ def age_of(comments, now, field="createdAt"):
 def build_tasks(doc, issues, now):
     """The tracker rows: every open initiative issue (with or without a Room block); a closed one is simply gone. Role passes are not rows. Sorted by stage, most complete first, then most recently updated first."""
     rooms = {r["issue"]: r for r in doc["rooms"]}
-    rows, seen = [], set()
+    rows = []
     for iss in issues:
         n, comments = iss["number"], iss.get("comments", [])
         labels = [l["name"] if isinstance(l, dict) else l for l in iss.get("labels", [])]
         r = rooms.get(n) or {}
         stage, warn = stage_of(labels)
-        why = owner_reason(r.get("open_decisions", 0), r.get("state"), r.get("lead", {}).get("status"), last_own_verb(comments), r.get("pr"))
-        seen.add(n)
+        why = owner_reason(len(open_decisions(comments, now)), r.get("state"), r.get("lead", {}).get("status"), last_own_verb(comments), r.get("pr"))
         rows.append({"number": n, "name": friendly_name(iss.get("title"), n), "url": iss.get("url", ""), "stage": stage, "stage_warning": warn,
                      "needs_you": bool(why), "reason": why, "worker": r.get("name"), "working": r.get("lead", {}).get("status") == "busy",
                      "age_s": age_of(comments, now)})
@@ -769,7 +777,30 @@ def self_test():
          and sorted(["parked", "idea", "complete"], key=STAGES.index) == ["complete", "idea", "parked"]),
         ("friendly name strips prefixes, trims, caps and never goes bare",
          friendly_name("role: analyst pass", 5) == "Analyst pass (5-issue)" and friendly_name("feat(web)!: [x] add thing", 6) == "Add thing (6-issue)"
-         and friendly_name("", 7) == "Untitled (7-issue)" and len(friendly_name("a" * 90, 8)) == NAME_MAX + len(" (8-issue)")),
+         and friendly_name("", 7) == "Untitled (7-issue)" and len(friendly_name("a" * 90, 8)) == NAME_MAX + len(" (8-issue)")
+         and friendly_name("Contracting tools for the orchard managers and their growers across every region of the country", 9)
+         == "Contracting tools for the orchard managers and their… (9-issue)"),
+        ("owner reason also flags a ready PR in any room state, and a draft PR only when the room is done or waiting",
+         owner_reason(0, "working", "busy", None, {"state": "OPEN", "isDraft": False}) == "PR ready to merge"
+         and owner_reason(0, "waiting", "idle", "WAITING", {"state": "OPEN", "isDraft": True}) == "draft PR to review"
+         and owner_reason(0, "working", "busy", None, {"state": "OPEN", "isDraft": True}) == ""
+         and owner_reason(0, "done", "idle", "DONE", {"state": "MERGED", "isDraft": False}) == ""),
+        ("a room-less initiative's own open DECISION makes the row need you",
+         [(t["needs_you"], t["reason"]) for t in build_tasks({"rooms": []}, [{"number": 3, "title": "t", "labels": [], "comments": [
+             {"body": "**DECISION** · x · #3\nwhich?", "url": "https://github.com/acme-co/acme-office/issues/3#c1", "createdAt": "2026-10-06T01:00:00Z"}]}], now)]
+         == [(True, "1 decision to answer")]),
+        ("an ANSWER by the controller or office closes the earlier DECISIONs, whatever its header shape",
+         all(not open_decisions([{"body": "**DECISION** · r · #1\nq?", "url": "https://github.com/acme-co/acme-office/issues/1#c1"},
+                                 {"body": ans, "url": "https://github.com/acme-co/acme-office/issues/1#c2"}], now)
+             for ans in ("**ANSWER** · owner · control room\n(to https://github.com/acme-co/acme-office/issues/1#c1) go with A",
+                         "**ANSWER** · office · #1\ngo with A", "**ANSWER** · controller · #1\n(to https://github.com/acme-co/acme-office/issues/1#c1)"))),
+        ("an ANSWER linking a DIFFERENT decision leaves this one open; a stranger's ANSWER closes nothing",
+         [d["url"] for d in open_decisions([
+             {"body": "**DECISION** · r · #1\nfirst?", "url": "https://github.com/acme-co/acme-office/issues/1#c1"},
+             {"body": "**DECISION** · r · #1\nsecond?", "url": "https://github.com/acme-co/acme-office/issues/1#c2"},
+             {"body": "**ANSWER** · owner · control room\n(to https://github.com/acme-co/acme-office/issues/1#c2) B", "url": "https://github.com/acme-co/acme-office/issues/1#c3"}], now)]
+         == ["https://github.com/acme-co/acme-office/issues/1#c1"]
+         and len(open_decisions([{"body": "**DECISION** · r · #1\nq?", "url": "u1"}, {"body": "**ANSWER** · stranger · #1\nok", "url": "u2"}], now)) == 1),
         ("owner reason: a decision, blocked, capped, a PR waiting on the owner; otherwise none",
          owner_reason(1, "working", "busy", None, None) == "1 decision to answer"
          and owner_reason(0, "done", "idle", "DONE", {"state": "OPEN", "isDraft": True}) == "draft PR to review"

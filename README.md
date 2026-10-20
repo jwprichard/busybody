@@ -100,12 +100,12 @@ tsc -p .   # needs .claude-plugin/types/, which the engine lays at load (gitigno
   marker, the project room on it (`(working)` while its lead is mid-turn) and the age since the last comment. A closed issue is gone.
   Role passes are not rows.
   - **Stage** is the issue's one `stage:<name>` label, read as is: `complete`, `ci-deploy`, `review`,
-    `development`, `planning`, `design`, `research`, `idea`, `parked`, most complete first, `parked` always last;
+    `development`, `design`, `planning`, `research`, `idea`, `parked`, most complete first, `parked` always last;
     unlabelled is `idea`. The table lives once, in `bin/rooms` (`STAGES`), and comes to the pane as `stages`. Two or more
     stage labels, or an unknown `stage:*` one, show a `⚠` warning on the row (the most complete known stage is used).
   - **Order:** by stage, then most recently updated first.
   - **Needs you** is a flag, not a stage and not a sort key: an unanswered DECISION or BLOCKED, a room over its cap,
-    or a PR waiting on you (the room reported DONE and its PR is open). The header and the pane top say `N need you`.
+    or a PR waiting on you (any open ready PR, or a draft one once the room is done or waiting). The header and the pane top say `N need you`.
   - **Row buttons** (rows with a room): stop, resume, attach, `#issue`, `pr` (the commands below); a row without a room links to its issue.
 - **Band above the prompt:** `🏢 N tasks · M need you`, then `📝 N memory to review` when any role has a pending
   memory diff, and a GitHub-budget warning when the hour's GraphQL estimate passes 70%. Hidden when there are no
