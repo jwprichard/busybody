@@ -13,7 +13,8 @@
   bin/team resolve <initiative> [--check NAME] [--room NAME] [--close] [--no-close]
                             run the recipe's done check (or NAME) against the issue: PASS / FAIL with the evidence it found.
                             --room NAME is needed for an issue with no Room block (a staff pass): only a DONE minute whose who is
-                            exactly that name counts, and an old-style `DONE:` never does. Exit 0 pass, 1 fail, 2 cannot decide.
+                            exactly that name counts, and an old-style `DONE:` never does. A `--room role-…` (a role pass on the initiative) is used even when the issue
+                            has a Room block, and its resolve never closes the initiative. Exit 0 pass, 1 fail, 2 cannot decide.
                             After a PASS it posts a `**RECORD**` minute (the check and its evidence) and closes the issue as completed, through
                             `gh issue close` and, if that errors (Projects classic), `gh api`. It never closes on FAIL/UNDECIDED, an issue
                             labelled `project`, or one with open sub-issues (it says why); an already-closed issue passes with no second minute.
@@ -639,6 +640,11 @@ def self_test():
     expect("verdict fail (not a DONE)", resolve(36), 1, "no DONE minute")
     issue(37, team="mad", comments=["DONE: Verdict: old style"])
     expect("verdict fail (old DONE: prefix is never trusted)", resolve(37), 1, "no DONE minute from the room")
+    issue(80, team="mad", comments=["**DONE** · WHO · #80\nVerdict: pass on an initiative with a room\n"], who="role-x-pass")
+    expect("a role pass resolves with its own DONE although the issue has a Room block, and leaves the initiative open",
+           resolve(80, "--check", "verdict-posted", "--room", "role-x-pass"), 0, "stays open")
+    if "issue close 80 " in open(glog).read() or "state=closed" in open(glog).read().split("issue view 80")[-1]:
+        bad.append("resolve of a role pass closed the initiative")
     issue(49, team="mad", room=False, comments=["**DONE** · WHO · #49\nVerdict: pass session\n"])
     expect("no Room block: DONE not trusted without --room", resolve(49, "--check", "verdict-posted"), 2, "pass --room NAME")
     expect("no Room block: --room names the session", resolve(49, "--check", "verdict-posted", "--room", "room-r"), 0, "PASS verdict-posted")
@@ -1247,14 +1253,18 @@ def cmd_resolve(argv, root=None):
                 raise Undecided(f"recipe {team} cannot be read ({'; '.join(errs)}): name a check with --check")
             check = effective_check(t, room.get("repo"))
         comments = issue.get("comments") or []
-        name = room.get("room") or room_opt   # the Room block wins: --room only names a pass session when there is no block
+        # a role pass (`--room role-…`) resolves the pass, not the initiative: its DONE is found even when the issue has a Room block
+        is_pass = bool(room_opt and room_opt.startswith("role-"))
+        name = room_opt if is_pass else (room.get("room") or room_opt)   # otherwise the Room block wins: --room only names a pass session when there is no block
         ctx = {"room": room, "room_name": name, "done": done_minute(comments, name), "comments": comments}
         ok, evidence = RESOLVERS[check](ctx)
     except Undecided as e:
         print(f"UNDECIDED {check or '?'} on #{n}: {e}")
         return 2
     print(f"{'PASS' if ok else 'FAIL'} {check} on #{n}: {evidence}")
-    if ok and not no_close and not close_issue(n, issue, check, evidence):
+    if ok and is_pass:
+        print(f"#{n} stays open: {name} is a pass on this initiative, not the initiative's room")
+    elif ok and not no_close and not close_issue(n, issue, check, evidence):
         return 3   # the check passed but the issue could not be closed: fail loudly
     if ok and close and name and not close_session(name):
         return 3   # the check passed but the session is still running: fail loudly
