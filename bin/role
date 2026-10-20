@@ -7,9 +7,9 @@
                                     lines confirmed/contradicted, memory kill criterion (>20% of cited lines contradicted, or none
                                     confirmed over the pilot), candidates, flags
   bin/role diff <role>              the pending memory diff (stat + changed lines, <= 30 lines)
-  bin/role commit-candidates <role> commit candidates.md changes that need no owner review, as `role(<role>): candidates` (not a use);
+  bin/role commit-candidates <role> commit candidates.md changes that need no review, as `role(<role>): candidates` (not a use);
                                     `run` and `promote` do it first, and a candidates-only diff never counts as "waiting"
-  bin/role batch <role>             the pending diff as numbered yes/no items for the owner: PROMOTE / ARCHIVE / RESTORE
+  bin/role batch <role>             the pending diff as numbered yes/no items for the controller: PROMOTE / ARCHIVE / RESTORE
                                     (max 5 shown; the rest stay on disk for the next DONE), a `batch: <hash>` line and the accept command
                                     per item; `accept|reject --expect <hash>` refuses if the pending items changed since
   bin/role accept <role> [--expect HASH] [--items 1,3] [--rating-draft R] [--rating-memory R] [--drafts approved=N,unedited=M]
@@ -24,10 +24,18 @@
                                     drop the whole proposal and record the use as `(memory rejected)`; candidates.md changes still
                                     commit. --redo: restore without recording a use, because the redo stays inside this use.
                                     Refuses with no diff, so it can't follow an accept unnoticed. R = saved-time|useful|no-value
-  bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction]
+  bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction|answer]
                                     move candidate cN into MEMORY.md as the next mN, on disk, uncommitted (one batch item). The
                                     trigger is inferred (--link = 2-links; a generality word in the quote = 1-link; `corrects m<N>` =
-                                    correction); over the 15-line cap the least-cited line is archived in the same batch
+                                    correction; `answer` only via `triage`, which checks the link); over the 15-line cap the least-cited
+                                    line is archived in the same batch
+  bin/role triage <role> [--accept cN [--link URL2] | --drop cN]
+                                    the controller's memory triage (no owner review). For each candidate: (a) its evidence link is a recorded
+                                    `**ANSWER** ·` minute: promoted to MEMORY.md at once, one use; (b) `repo: <name>` in the line: it is a
+                                    repo lesson, not role memory: prints a "propose a CLAUDE.md PR to <name>" item and promotes nothing;
+                                    (c) otherwise prints the item with the four-point checklist (non-derivable, checkable, cites its
+                                    source, small). `--accept cN` promotes it as one use (needs the guard's trigger: --link URL2, a
+                                    generality word, or `corrects m<N>`); `--drop cN` removes it (a `role(<role>): candidates` commit)
   bin/role archive <role> <mN> --because <comment-url> [--reason TEXT]
                                     move mN to archive.md and commit at once `role(<role>): archive mN` (no owner wait)
   bin/role restore <role> <mN>      archive.md -> MEMORY.md as a proposed, uncommitted item (batch/accept like a promotion)
@@ -205,7 +213,7 @@ def memory(name):
 
 def pending(name):
     r = git("status", "--porcelain", "--untracked-files=all", "--", f"{MEM}/{name}/", check=False)
-    # candidates.md commits without owner review, so a diff in it alone is not "waiting" (commit_candidates)
+    # candidates.md commits without review, so a diff in it alone is not "waiting" (commit_candidates)
     return [l for l in r.stdout.splitlines() if l.strip() and not l.rstrip().endswith("/candidates.md")]
 
 
@@ -359,9 +367,9 @@ def flags(name, cfg, st):
     if m["index_bytes"] > CAP_INDEX or m["total_bytes"] > CAP_ROLE:
         out.append("memory over cap")
     if m["candidate_lines"] >= G.CAP_CANDIDATES - 5:
-        out.append(f"candidates.md near its cap ({m['candidate_lines']}/{G.CAP_CANDIDATES}): promote or drop some")
+        out.append(f"candidates.md near its cap ({m['candidate_lines']}/{G.CAP_CANDIDATES}): triage some: bin/role triage {name}")
     if m["candidates_expired"]:
-        out.append(f"{m['candidates_expired']} candidate(s) older than {G.CANDIDATE_DAYS} days: promote or drop")
+        out.append(f"{m['candidates_expired']} candidate(s) older than {G.CANDIDATE_DAYS} days: triage them (bin/role triage {name})")
     if m["memory_lines"] > G.CAP_MEMORY_LINES:
         out.append(f"MEMORY.md has {m['memory_lines']} lines (cap {G.CAP_MEMORY_LINES})")
     ck = st["cites"]
@@ -370,7 +378,7 @@ def flags(name, cfg, st):
     elif ck["records"] and not ck["confirmed"] and st["pilot_over"]:
         out.append("memory kill criterion: no cited memory line was confirmed over the pilot")
     if st["pending"]:
-        out.append(f"memory diff waiting for review ({len(st['pending'])} file(s))")
+        out.append(f"memory diff waiting for controller triage ({len(st['pending'])} file(s)): bin/role batch {name}")
     if st["enabled"] and not st["hook"]:
         out.append("memory guard not installed: run bin/role install-hook")
     return out
@@ -469,7 +477,7 @@ def cmd_review(argv):
               f"unrated {s['use_count'] - sum(r.values())}; memory rejected {s['memory_rejected']}x")
         mr = s["memory_ratings"]
         print(f"   memory value  saved-time {mr['saved-time']}, useful {mr['useful']}, no-value {mr['no-value']}, "
-              f"unrated {s['use_count'] - sum(mr.values())} (the owner rates the memory diff apart from the drafts)")
+              f"unrated {s['use_count'] - sum(mr.values())} (the memory diff is rated apart from the drafts)")
         print(f"   memory    {s['memory']['dated_lines']} dated lines, {s['memory']['stale_lines']} stale; "
               f"{s['memory']['index_bytes']}B index, {s['memory']['total_bytes']}B total")
         ck = s["cites"]
@@ -558,8 +566,8 @@ def _lines_diff(a, b):
 
 
 def pending_items(name):
-    """(items, auto, H): the pending memory diff as owner yes/no items. `auto` = candidates.md
-    changes not tied to an item (they commit without owner review). H = the committed lines."""
+    """(items, auto, H): the pending memory diff as yes/no items. `auto` = candidates.md
+    changes not tied to an item (they commit without review). H = the committed lines."""
     H = {f: read_head(name, f) for f in G.FILES}
     D = {f: read_disk(name, f) for f in G.FILES}
     add = {f: _lines_diff(D[f], H[f]) for f in G.FILES}
@@ -698,7 +706,7 @@ def _record_cites(name, rec):
 
 
 def batch_hash(items):
-    """Short fingerprint of the pending items: `accept/reject --expect <hash>` refuses if the batch changed since the owner saw it."""
+    """Short fingerprint of the pending items: `accept/reject --expect <hash>` refuses if the batch changed since the controller saw it."""
     import hashlib
     return hashlib.sha1(json.dumps([[it["label"], it["ops"]] for it in items], sort_keys=True).encode()).hexdigest()[:8]
 
@@ -794,7 +802,7 @@ def cmd_batch(argv):
         print("guard: " + ("ok" if not err else "REFUSES\n" + err))
         return
     shown, over = items[:MAX_ITEMS], items[MAX_ITEMS:]
-    print(f"{name}: {len(items)} memory item(s) for the owner, showing {len(shown)} (yes/no each)")
+    print(f"{name}: {len(items)} memory item(s) for the controller, showing {len(shown)} (yes/no each)")
     for i, it in enumerate(shown, 1):
         print(f" [{i}] {it['label']}")
     n_auto = len(auto["candidates.md"]["add"]) + len(auto["candidates.md"]["del"])
@@ -886,6 +894,82 @@ def cmd_apply(argv):
             except SystemExit as e:
                 write_lines(name, "candidates.md", cands, existed_in_head=bool(read_head(name, "candidates.md")))
                 print(f"skipped (guard refused): {ln[:100]}\n  {str(e.code).replace(chr(10), ' ')[:300]}")
+
+
+# ---- triage: the controller settles candidates; the owner is not asked ---------------------------
+
+ANSWER_HEAD = re.compile(r"^(\*\*ANSWER\*\* ·|ANSWER \(from the user\))")
+CHECKLIST = "non-derivable? checkable? cites its source? small?"
+
+
+def _answer_evidence(line):
+    """The first evidence URL of the line that resolves to a recorded ANSWER minute, else None (a failed gh read counts as no)."""
+    for u in dict.fromkeys(x.rstrip(".,;") for x in G.URL.findall(line)):
+        m = re.fullmatch(r"https://github\.com/([^/\s]+/[^/\s]+)/issues/\d+#issuecomment-(\d+)", u)
+        if not m or m.group(1) != REPO:
+            continue
+        r = subprocess.run(["gh", "api", f"repos/{REPO}/issues/comments/{m.group(2)}", "--jq", ".body"], capture_output=True, text=True)
+        if r.returncode == 0 and ANSWER_HEAD.match(r.stdout):
+            return u
+    return None
+
+
+def _promote_and_settle(name, cid, extra):
+    """Promote candidate cN and commit it as ONE use; on any refusal put the memory files back. Returns (ok, why)."""
+    snap = _snapshot(name)
+    try:
+        cmd_promote([name, f"c{cid}", *extra])
+        _settle(name, [], False)
+    except SystemExit as e:
+        git("reset", "-q", "--", f"{MEM}/{name}/", check=False)
+        _rollback(name, snap)
+        return False, str(e.code).replace("\n", " ")[:300]
+    return True, ""
+
+
+def cmd_triage(argv):
+    name = argv[0] if argv else None
+    need_role(name)
+    acc, drop, link = _opt(argv, "--accept"), _opt(argv, "--drop"), _opt(argv, "--link")
+    for flag, v in (("--accept", acc), ("--drop", drop)):
+        if v is not None and not re.fullmatch(r"c\d+", v):
+            die(f"usage: bin/role triage <role> [--accept cN [--link URL2] | --drop cN]  ({flag} takes a candidate id like c3)")
+    if acc and drop:
+        die("--accept and --drop are one candidate at a time")
+    if not hook_installed():
+        die("memory guard not installed: bin/role install-hook")
+    _guard_index(name)
+    if pending(name):
+        die(f"{name} has a memory diff waiting: settle it first (bin/role batch {name})")
+    commit_candidates(name)
+    cands = [l for l in read_disk(name, "candidates.md") if G.CAND_LINE.match(l)]
+    if acc or drop:
+        cid = int((acc or drop)[1:])
+        src = next((l for l in cands if line_id(l, "c") == cid), None)
+        if not src:
+            die(f"no candidate c{cid} in {MEM}/{name}/candidates.md")
+        if drop:
+            write_lines(name, "candidates.md", [l for l in read_disk(name, "candidates.md") if l != src])
+            commit_candidates(name)
+            return
+        ok, why = _promote_and_settle(name, cid, ["--link", link] if link else [])
+        if not ok:
+            die(f"c{cid} not accepted: {why}")
+        return
+    if not cands:
+        print(f"{name}: no candidates to triage")
+    for l in cands:
+        cid = line_id(l, "c")
+        repo = re.search(r"\brepo: ([A-Za-z0-9._-]+)", l)
+        if repo:  # a repo lesson belongs in that repo's CLAUDE.md, not in a role's memory (checked before the ANSWER rule)
+            print(f"[c{cid}] propose a CLAUDE.md PR to {repo.group(1)}: {l}\n      (not promoted; --drop c{cid} once the PR is open)")
+            continue
+        ans = _answer_evidence(l)
+        if ans:
+            ok, why = _promote_and_settle(name, cid, ["--trigger", "answer"])
+            print(f"[c{cid}] auto-accepted: its evidence is the recorded ANSWER {ans}" if ok else f"[c{cid}] quotes the ANSWER {ans} but was not promoted: {why}")
+            continue
+        print(f"[c{cid}] {l}\n      checklist: {CHECKLIST}\n      bin/role triage {name} --accept c{cid} [--link URL2]    bin/role triage {name} --drop c{cid}")
 
 
 # ---- memory lifecycle: promote, archive, restore -------------------------------------------
@@ -1002,7 +1086,7 @@ def cmd_promote(argv):
     need_role(name)
     pos = [a for i, a in enumerate(argv[1:], 1) if not a.startswith("--") and argv[i - 1] not in ("--link", "--trigger")]
     if len(pos) != 1 or not re.fullmatch(r"c?\d+", pos[0]):
-        die("usage: bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction]")
+        die("usage: bin/role promote <role> <cid> [--link URL2] [--trigger 2-links|1-link|correction|answer]")
     cid = int(pos[0].lstrip("c"))
     if commit_candidates(name):  # the candidate must be in HEAD, or the guard cannot see where the line came from
         pass
@@ -1020,7 +1104,7 @@ def cmd_promote(argv):
     if trig is None:
         trig = "2-links" if (link or len(urls) >= 2) else ("1-link" if any(G.GENERAL.search(q) for q in quotes) else
                                        "correction" if G.CORRECTS.search(text) else None)
-    if trig not in ("2-links", "1-link", "correction"):
+    if trig not in ("2-links", "1-link", "correction", "answer"):
         die("no trigger: pass --link URL2 (2 links), or the quote needs a generality word (1-link), or the line a `corrects m<N>` (correction)")
     if trig == "2-links" and len(urls) < 2:
         die("--trigger 2-links needs --link URL2: a second, different comment URL")
@@ -1863,6 +1947,46 @@ def self_test():
                role("apply", "test-role", murl(557)).returncode != 0 and role("apply", "test-role", murl(558)).returncode != 0
                and role("apply", "test-role", "https://example.com/x").returncode != 0 and "Lesson O1" not in open(cpath).read())
         sh("git", "checkout", "--", MEM)
+        # triage: (a) a line whose evidence is a recorded ANSWER is promoted at once, (b) a repo lesson becomes a CLAUDE.md item,
+        # (c) the rest is printed with the checklist for --accept / --drop
+        for n, head in ((601, "**ANSWER** · office · #42\nthe owner's answer\n"), (602, "**NOTE** · controller · #42\nnot an answer\n"),
+                        (603, "**ANSWER** · office · #42\nanother answer\n")):
+            with open(os.path.join(bodies, str(n)), "w") as f:
+                f.write(head)
+        tl = lambda i, tag, extra="", url=None: (f'- c{i} {today().isoformat()}: Lesson {tag}{extra}. Changes: ask {tag} first. "the owner said so" ({url or murl(602)})')
+        set_cands(tl(71, "T1", url=murl(601)), tl(72, "T2", " (repo: acme-api)", url=murl(601)), tl(73, "T3"), tl(74, "T4"))
+        n0 = n_uses()
+        r = role("triage", "test-role")
+        expect(f"triage (a): a line quoting a recorded ANSWER is promoted as one use (rc {r.returncode})",
+               r.returncode == 0 and "[c71] auto-accepted" in r.stdout and n_uses() == n0 + 1
+               and any("Lesson T1" in l and l.endswith(" answer") for l in head_mem().splitlines()) and "- c71 " not in head_cands())
+        expect("triage (b): a repo lesson is not promoted and becomes a CLAUDE.md PR item",
+               "[c72] propose a CLAUDE.md PR to acme-api" in r.stdout and "- c72 " in head_cands() and "Lesson T2" not in head_mem())
+        expect("triage (c): anything else is printed with the four-point checklist and left alone",
+               "[c73]" in r.stdout and "non-derivable? checkable? cites its source? small?" in r.stdout and "--accept c73" in r.stdout
+               and "- c73 " in head_cands() and "Lesson T3" not in head_mem())
+        expect("triage never asks the owner: it leaves no memory diff behind", sh("git", "status", "--porcelain").stdout.strip() == "" and n_uses() == n0 + 1)
+        r = role("triage", "test-role", "--accept", "c73")
+        expect("--accept needs the guard's trigger (a single link with no generality word is refused, nothing changes)",
+               r.returncode != 0 and n_uses() == n0 + 1 and "- c73 " in head_cands() and sh("git", "status", "--porcelain").stdout.strip() == "")
+        r = role("triage", "test-role", "--accept", "c73", "--link", murl(603))
+        expect(f"--accept cN --link URL2 promotes it as one use (rc {r.returncode})",
+               r.returncode == 0 and n_uses() == n0 + 2 and "Lesson T3" in head_mem() and "- c73 " not in head_cands())
+        n1 = n_uses()
+        c_before = sh("git", "rev-list", "--count", "HEAD").stdout.strip()
+        r = role("triage", "test-role", "--drop", "c74")
+        expect("--drop cN removes it with a `role(<role>): candidates` commit, not a use",
+               r.returncode == 0 and "- c74 " not in head_cands() and n_uses() == n1
+               and sh("git", "log", "-1", "--format=%s").stdout.strip() == "role(test-role): candidates"
+               and int(sh("git", "rev-list", "--count", "HEAD").stdout.strip()) == int(c_before) + 1)
+        expect("--accept/--drop of a missing candidate is refused", role("triage", "test-role", "--drop", "c999").returncode != 0
+               and role("triage", "test-role", "--accept", "x1").returncode != 0)
+        set_cands(tl(75, "T5"))
+        role("promote", "test-role", "c75", "--link", murl(603))
+        fl = " ".join(json.loads(role("status", "--json").stdout)["roles"][0]["flags"])
+        expect("status says a waiting diff waits for the controller, never the owner", "waiting for controller triage" in fl and "owner" not in fl)
+        role("reject", "test-role", "--redo")
+        sh("git", "checkout", "--", MEM)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("self-test: " + ("PASS" if ok else "FAIL"))
@@ -1871,7 +1995,7 @@ def self_test():
 
 COMMANDS = {"status": cmd_status, "list": cmd_status, "cost": cmd_cost, "review": cmd_review, "diff": cmd_diff,
             "accept": cmd_accept, "batch": cmd_batch, "reject": cmd_reject, "new": cmd_new, "keep": cmd_keep, "disable": cmd_disable,
-            "enable": cmd_enable, "promote": cmd_promote, "commit-candidates": cmd_commit_candidates, "archive": cmd_archive, "restore": cmd_restore, "apply": cmd_apply, "run": cmd_run, "check": cmd_check, "install-hook": cmd_install_hook}
+            "enable": cmd_enable, "promote": cmd_promote, "commit-candidates": cmd_commit_candidates, "archive": cmd_archive, "restore": cmd_restore, "apply": cmd_apply, "triage": cmd_triage, "run": cmd_run, "check": cmd_check, "install-hook": cmd_install_hook}
 
 
 def main(argv):

@@ -1,6 +1,6 @@
 ---
 name: standing-role
-description: "Standing roles: memory-backed subagents that own an area over time (backlog owner, sprint owner, test lead, later non-dev roles). Covers consulting a role (guard check, spawn, relay, the owner's memory-diff review and value rating), building one (the interview: owned metric, budget, authority), the cost-vs-value review and culling, disabling and enabling. Use when the owner asks about an area a role owns, asks to build/hire, review, cull, disable or enable a role, or `role status --brief` prints a flag."
+description: "Standing roles: memory-backed subagents that own an area over time (backlog owner, sprint owner, test lead, later non-dev roles). Covers consulting a role (guard check, spawn, relay, the controller's memory triage and value rating), building one (the interview: owned metric, budget, authority), the cost-vs-value review and culling, disabling and enabling. Use when the owner asks about an area a role owns, asks to build/hire, review, cull, disable or enable a role, or `role status --brief` prints a flag."
 ---
 
 # Standing roles
@@ -48,9 +48,11 @@ Do this when the owner asks about the role's area, or the role is due (its `cade
    - At authority level 0, the owner applies edits. Don't apply them yourself unless the owner
      asks for that specific edit.
    - Never write to the tracker, email or messaging on the role's behalf without the owner's ask.
-5. **Review.** Run `role commit-candidates <role>` first if candidates changed (not a use; `run` and `promote` also do it). Show the output of `role batch <role>` verbatim (numbered yes/no items: promote,
-   archive, restore; a cap archive is merged into its promote or restore item; the rest wait for the next pass). It prints `batch: <hash>`: pass it as `--expect <hash>` to accept or reject, which refuses if the items changed since. Then ask with AskUserQuestion: which items to
-   accept, the **draft** rating and the **memory** rating, each `saved-time` / `useful` / `no-value`.
+5. **Triage** (yours, the controller's; the owner does not review memory, owner 2026-10-20). Apply the pass's `MEMORY` minute with `role apply <role> <minute-url>`, then run `role triage <role>`:
+   a candidate whose evidence is a recorded `ANSWER` minute is promoted at once (one use); a line marked `repo: <name>` is a repo lesson, so open a CLAUDE.md PR to that repo (nothing is promoted);
+   every other candidate prints with the four-point checklist (non-derivable, checkable, cites its source, small): `role triage <role> --accept cN [--link URL2]` (one use) or `--drop cN`.
+   For a promotion, archive or restore proposed by hand, `role batch <role>` shows the numbered yes/no items (a cap archive is merged into its promote or restore item; the rest wait for the next pass),
+   with `batch: <hash>`: pass it as `--expect <hash>` to accept or reject, which refuses if the items changed since. You decide the items, the **draft** rating and the **memory** rating, each `saved-time` / `useful` / `no-value`.
    Then run one of:
    - `role accept <role> --expect HASH [--items 1,3] --rating-draft R --rating-memory R` (refuses if there is no memory diff — e.g. the owner already accepted it in the office; a use that learned nothing needs `--no-memory`). Add `--confirmed m1,m2 --contradicted m3` for the memory lines the pass cited: the role lists them in its `DONE:`. `role review` flags uses with no such record.
    - `role reject <role> --expect HASH [--redo] --rating-draft R --rating-memory R` (`--redo` restores without recording a use, when the role redoes the pass; plain `reject` keeps held-over items for the next `DONE:`)
@@ -62,10 +64,10 @@ Do this when the owner asks about the role's area, or the role is due (its `cade
 
    Then `git push`. Every use ends in exactly one `role(<role>): use N` commit, even when
    nothing was learned (the commit is empty then). That's how uses are counted.
-   - **Only the owner** accepts a memory diff. Auto mode, another agent or a peer session
-     can't, and you never edit a role's memory yourself.
-   - If you notice a diff line that's derivable (card, PR or release state, versions,
-     counts), point it out before the owner answers. That check is the owner's job, and the
+   - **Only the controller** settles a memory diff (`apply`, `triage`, `accept`). A role session, another agent or a peer session
+     can't, and you never edit a role's memory by hand.
+   - If you notice a candidate that's derivable (card, PR or release state, versions,
+     counts), drop it. That check is the checklist's "non-derivable", and the
      hook doesn't do it.
    - Diffs over 30 lines get truncated. Suggest reject: a use should change little.
 6. **Narrative:** the role's issue (`role.json` `issue`) is its **personnel file**: hiring, a
@@ -99,8 +101,7 @@ is done. `--dry-run --show-brief` previews it and launches nothing.
 - **Workers**: the role spawns its own, named `<role>-c-<task>`. Don't hire for it.
 - **Cost**: billed by session name to the role's line (`role cost <role>`); its `<role>-c-*`
   workers to its worker line.
-- **Memory review**: the diff shows in the office's "memory to review" sticky notes (a memory review is a sticky note on the owner's whiteboard); the owner accepts
-  there, or you run steps 5 as for a subagent. The role session never commits, accepts or applies.
+- **Memory triage**: the role's `MEMORY` minute is applied and triaged by you, step 5 as for a subagent. The role session never commits, accepts, applies or triages.
 - **Authority** is still level 0. The session's settings deny git writes, `role accept`/`apply`, tracker
   writes and edits to the repo's own files, but only its charter stops a shell redirect: see the workspace's
   `limitations/` on role-session containment.
@@ -178,7 +179,7 @@ Then:
 - Cost leaves out the controller's own tokens and transcripts from other machines, so treat it as
   a floor: the workspace's `limitations/` on role cost.
 - The memory guard covers git only, and `--no-verify` bypasses it. The real guard is the
-  owner's attention: the workspace's `limitations/` on memory review.
+  controller's triage: the workspace's `limitations/` on memory review.
 - Only the controller starts a role (a subagent or `role run`). Room leads run in child-repo worktrees and don't load
   the workspace's agents.
 

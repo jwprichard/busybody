@@ -19,6 +19,7 @@
     "Bash(*bin/role accept*)",
     "Bash(*bin/role reject*)",
     "Bash(*bin/role apply*)",
+    "Bash(*bin/role triage*)",
     "Bash(*bin/role promote*)",
     "Bash(*bin/role commit-candidates*)",
     "Bash(*bin/role run*)",
