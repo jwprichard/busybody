@@ -30,8 +30,8 @@ Measured by: `{{metric_command}}` (the controller runs it; it is derived, never 
 - Never, at any level: add or cut scope, speak for the user to people, touch prod.
 
 ## Where things are recorded
-- **Your role issue** is your personnel file: hiring, authority grants, review verdicts, and one `RECORD` line per pass linking that pass's issue. Nothing else goes there, and you don't summarise a pass back into it.
-- **Each pass has its own issue** (`<role>: <task>`), created by `role run`. Its minutes (`DECISION`, `ANSWER`, `DONE`, in the `**TYPE** · who · where` format) are evidence: an archive that memory lines, approvals and metrics link to. A link to a comment on any pass issue counts as evidence, as old role-issue links do.
+- **Your role issue** is your personnel file: hiring, authority grants, review verdicts, and one `RECORD` line per pass linking the initiative issue it ran on. Nothing else goes there, and you don't summarise a pass back into it.
+- **A pass runs on the initiative's own issue** (`role run <role> --issue N`); it opens no issue of its own. Its minutes (`DECISION`, `ANSWER`, `DONE`, in the `**TYPE** · who · where` format) are evidence: an archive that memory lines, approvals and metrics link to. A link to a comment on any issue counts as evidence.
 
 ## Memory — what you keep
 Memory is **about the owner, the system, or how you do your recurring work**. It is never a fact

@@ -7,7 +7,7 @@
   bin/team brief <recipe> commit|prs|prlimit [--land]
                             the recipe-dependent lines of the room lead's brief (@BRANCH@ stands for the room's branch)
   bin/team start <recipe> <initiative|"task"> [--repo R] [--base REF] [--controller NAME] [--dry-run]
-                            open the room: a project room through the lead launcher, a staff room through the role launcher
+                            open the room: a project room through the lead launcher, a staff room through the role launcher (`role run <role> --issue N`, so it needs an initiative)
                             (initiative = N, #N or an issue URL of the workspace repo; anything else is a free-text task)
                             TEAM_LEAD_START and TEAM_ROLE_RUN name the launchers (default: the real scripts), TEAM_GH the gh command
   bin/team resolve <initiative> [--check NAME] [--room NAME] [--close] [--no-close]
@@ -499,10 +499,10 @@ def self_test():
     if not (rc == 0 and "--land" not in argv):
         bad.append(f"start of a no-PR recipe never lands: {argv}")
     rc, o, e, argv = start("st", "tidy the inbox", "--controller", "ctl")
-    if not (rc == 0 and argv == ["run", "analyst", "tidy the inbox", "--controller", "ctl", "--team", "st"]):
-        bad.append(f"start staff: rc={rc} argv={argv} {e}")
+    if not (rc != 0 and argv is None and "initiative issue" in e):
+        bad.append(f"start staff with a task and no initiative must refuse: rc={rc} argv={argv} {e}")
     rc, o, e, argv = start("st", "21", "--controller", "ctl")
-    if not (rc == 0 and argv[:3] == ["run", "analyst", "Issue 21: Sort the Tree (initiative #21)"]):
+    if not (rc == 0 and argv == ["run", "analyst", "Issue 21: Sort the Tree", "--issue", "21", "--controller", "ctl", "--team", "st"]):
         bad.append(f"start staff from an initiative: {argv}")
     rc, o, e, argv = start("nope", "21", "--controller", "ctl")
     if not (rc != 0 and argv is None and "no such recipe" in e):
@@ -931,8 +931,9 @@ def cmd_start(argv, root=None):
     head = t["head"]
     if t["room"] == "staff":
         launcher = os.environ.get("TEAM_ROLE_RUN") or os.path.join(ENGINE_ROOT, "bin", "role")
-        task = f"{title} (initiative #{issue})" if issue else title   # the pass issue is new; this is its link back
-        argv_out = [launcher, "run", head["role"], task, "--controller", controller, "--team", t["name"]]
+        if not issue:
+            die("a staff-room pass runs on an initiative issue: pass its number, not a task")
+        argv_out = [launcher, "run", head["role"], title, "--issue", str(issue), "--controller", controller, "--team", t["name"]]
         repo = None
     else:
         repo = opt.get("--repo") or room_repo(body)

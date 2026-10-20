@@ -224,8 +224,8 @@ answer is still posted and the result line says no nudge was sent.
 `$.tool.call({ tool: 'SendMessage' })` would reach the same delivery but also
 goes through the permission check and its dialog, so the mod doesn't use it.
 
-**Staff-room passes.** A pass (`bin/role run`) has its own issue, titled `<role>: <task>` with
-the role's pass label, and posts its DECISION there. `bin/rooms` lists those issues'
+**Staff-room passes.** A pass (`bin/role run <role> --issue N`) runs on initiative issue N and posts its
+DECISION there (passes before this change had an issue of their own, titled `<role>: <task>` with the role's pass label). `bin/rooms` lists those issues'
 open DECISIONs (`decisions[]`, with `role`, `issue` = the pass issue, `room` =
 `role-<role>-<slug of task>`) and the running session (`role_sessions[]`, `issue` = the pass
 issue). The office posts the ANSWER to `decisions[].issue` and nudges the room by name, so

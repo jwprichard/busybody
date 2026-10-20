@@ -46,9 +46,11 @@ Memory files (.claude/agent-memory/<role>/, only .md; contract enforced by bin/l
   bin/role keep <role>              end probation (the pilot said keep)
   bin/role disable <role> <reason>  stop loading the role; memory stays in git, frozen
   bin/role enable <role>            load it again (back on probation)
-  bin/role run <role> <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]
-                                    start ONE on-demand background session (role-<role>-<slug>) for a pass: it imports its
-                                    charter and memory, asks the owner on its issue, hears the answers, hires <role>-c-*
+  bin/role run <role> --issue N <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]
+                                    start ONE on-demand background session (role-<role>-<slug>) for a pass on initiative issue N
+                                    (required; the pass has no issue of its own: its minutes and cost line land on N, and the role
+                                    issue gets one RECORD line linking N and the session). It imports its
+                                    charter and memory, asks the owner on N, hears the answers, hires <role>-c-*
                                     workers, proposes a memory diff and ends. Passes of one role run in parallel (each has its own session name; cost is
                                     attributed by that name).
   bin/role check                    exit 1 unless the memory pre-commit guard is installed
@@ -1241,28 +1243,11 @@ def _role_settings(session, authority=0, team="", tracker=None):
     return {"env": env, "permissions": perms}
 
 
-def _pass_label(name):
-    return "refine" if name == "analyst" else f"{name}-pass"
-
-
-def _open_pass_issue(name, task, session, role_issue):
-    """One issue per pass: its minutes are the pass's evidence. Returns (number, url) or dies."""
-    label = _pass_label(name)
-    subprocess.run(["gh", "label", "create", label, "-R", REPO, "--color", "BFD4F2",
-                    "--description", f"A {name} staff-room pass: its minutes are the evidence"], capture_output=True)
-    body = (f"**NOTE** · bin/role · #{role_issue}\n{name} pass: {task}\n\n"
-            f"- Task: {task}\n- Session: `{session}`\n"
-            f"- Role issue (personnel file): https://github.com/{REPO}/issues/{role_issue}\n\n"
-            "The pass posts its `DECISION` / `ANSWER` / `DONE` minutes here. Resolve closes it.")
-    r = subprocess.run(["gh", "issue", "create", "-R", REPO, "--label", label, "--assignee", "@me",
-                        "--title", f"{name}: {task}", "--body", body], capture_output=True, text=True)
-    url = (r.stdout or "").strip().splitlines()[-1] if r.returncode == 0 and (r.stdout or "").strip() else ""
-    if not url.rsplit("/", 1)[-1].isdigit():
-        die(f"could not open the pass issue: {(r.stderr or r.stdout).strip()[:200]}")
-    num = int(url.rsplit("/", 1)[-1])
-    subprocess.run(["gh", "issue", "comment", str(role_issue), "-R", REPO, "--body",
-                    f"**RECORD** · bin/role · #{role_issue}\n{name} pass opened: {url}"], capture_output=True)
-    return num, url
+def _record_pass(role_issue, name, issue_url, session):
+    """The personnel-file line on the role issue: which pass started, on which initiative issue."""
+    if role_issue:
+        subprocess.run(["gh", "issue", "comment", str(role_issue), "-R", REPO, "--body",
+                        f"**RECORD** · bin/role · #{role_issue}\n{name} pass started on {issue_url}: session `{session}`"], capture_output=True)
 
 
 def cmd_run(argv):
@@ -1270,11 +1255,13 @@ def cmd_run(argv):
     dry, show = "--dry-run" in argv, "--show-brief" in argv
     liaison = _opt(argv, "--controller" if "--controller" in argv else "--liaison", bb_env(None, "CONTROLLER", "SCH_LIAISON_SESSION"))
     team = _opt(argv, "--team", "")
-    valued = ("--liaison", "--controller", "--team")
+    valued = ("--liaison", "--controller", "--team", "--issue")
     skip = {i for i, a in enumerate(argv) if a in valued} | {i + 1 for i, a in enumerate(argv) if a in valued}
     pos = [a for i, a in enumerate(argv) if i not in skip and not a.startswith("--")]
-    if len(pos) < 2:
-        die("usage: bin/role run <role> <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]")
+    usage = "usage: bin/role run <role> --issue N <task…> [--controller NAME] [--team NAME] [--dry-run [--show-brief]]"
+    issue = _opt(argv, "--issue", "")
+    if len(pos) < 2 or not issue.isdigit():
+        die(usage + " (N = the initiative issue the pass works on)")
     name, task = pos[0], " ".join(pos[1:])
     cfg = need_role(name)
     if not os.path.exists(p(AGENTS, name + ".md")):
@@ -1285,9 +1272,8 @@ def cmd_run(argv):
         die("the memory guard is not installed: run bin/role install-hook")
     if not dry:
         commit_candidates(name)
-    issue = cfg.get("issue")
-    if not issue and not dry:
-        die(f"{name} has no issue in role.json: its sticky notes need an issue")
+    role_issue, issue = cfg.get("issue"), int(issue)
+    issue_url = f"https://github.com/{REPO}/issues/{issue}"
     team_powers = ""
     if team:  # the recipe's powers go into the brief itself, like a room lead's
         r = subprocess.run([e("bin", "team"), "powers", team], capture_output=True, text=True, env=dict(os.environ, BUSYBODY_WORKSPACE=WS))
@@ -1295,15 +1281,9 @@ def cmd_run(argv):
             die(f"cannot render the powers of recipe {team}: {(r.stderr or r.stdout).strip()[:200]}")
         team_powers = "\n" + r.stdout.rstrip("\n")
     session = _session_name(name, task)
-    role_issue = issue
-    if dry:
-        issue, issue_url = None, f"(pass issue \"{name}: {task}\", label {_pass_label(name)}: opened at launch, one per pass)"
-    else:
-        issue, issue_url = _open_pass_issue(name, task, session, role_issue)
-        print(f"pass issue #{issue}: {issue_url}")
     brief = _fill(open(e("templates", "role-brief.md")).read(), {
         "ROLE": name, "SESSION": session, "TASK": task, "TODAY": today().isoformat(), "ISSUE_URL": issue_url,
-        "ISSUE_NUM": issue or "N", "ROLE_ISSUE": role_issue or "N", "ISSUE_REPO": REPO, "LIAISON": liaison, "WS": WS, "ENGINE": ENGINE_ROOT,
+        "ISSUE_NUM": issue, "ROLE_ISSUE": role_issue or "N", "ISSUE_REPO": REPO, "LIAISON": liaison, "WS": WS, "ENGINE": ENGINE_ROOT,
         "AUTHORITY": f"level {cfg.get('authority', 0)}", "BUDGET": f"{cfg.get('budget_usd_month') or 0:g}",
         "CBUDGET": f"{cfg.get('contractor_budget_usd_month') or 0:g}",
         "TEAM_POWERS": team_powers, "CHARTER": _charter_body(name), "MEMORY": _memory_text(name)})
@@ -1327,10 +1307,11 @@ def cmd_run(argv):
     stamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     r = subprocess.run(cmd, cwd=WS, capture_output=True, text=True)
     if r.returncode:
-        subprocess.run(["gh", "issue", "close", str(issue), "-R", REPO, "--comment",
-                        f"**BLOCKED** · bin/role · #{issue}\nlaunch failed; pass not started"], capture_output=True)
+        subprocess.run(["gh", "issue", "comment", str(issue), "-R", REPO, "--body",
+                        f"**BLOCKED** · bin/role · #{issue}\nlaunch of {session} failed; pass not started"], capture_output=True)
         die(f"claude --bg failed: {(r.stderr or r.stdout).strip()[:300]}")
     print(f"launched {session}")
+    _record_pass(role_issue, name, issue_url, session)
     import time
     for _ in range(36):
         time.sleep(5)
@@ -1453,7 +1434,7 @@ def self_test():
         expect("enable restores it on probation", role("enable", "test-role").returncode == 0
                and json.loads(role("status", "--json").stdout)["roles"][0]["status"] == "probation")
         # role sessions: bin/role run
-        r = role("run", "test-role", "refine", "card", "#42!", "--controller", "controller-x", "--dry-run", "--show-brief")
+        r = role("run", "test-role", "--issue", "42", "refine", "card", "#42!", "--controller", "controller-x", "--dry-run", "--show-brief")
         out = r.stdout
         expect(f"run --dry-run names the session by role and task (rc {r.returncode})", r.returncode == 0 and "session:   role-test-role-refine-card-42" in out)
         expect("brief imports the charter without its frontmatter", "keep the test backlog healthy" in out and "\nmodel: sonnet\nmemory: project" not in out and "description:" not in out.split("# Your charter")[1])
@@ -1467,7 +1448,7 @@ def self_test():
         os.makedirs(os.path.join(ws, "teams"))
         shutil.copy2(os.path.join(HERE, "bin", "team"), os.path.join(ws, "engine", "bin", "team"))
         shutil.copytree(os.path.join(HERE, "fixtures", "teams", "dev-team"), os.path.join(ws, "teams", "dev-team"))
-        rt = role("run", "test-role", "refine", "card", "--controller", "controller-x", "--team", "dev-team", "--dry-run", "--show-brief")
+        rt = role("run", "test-role", "--issue", "42", "refine", "card", "--controller", "controller-x", "--team", "dev-team", "--dry-run", "--show-brief")
         expect("--team puts the recipe's powers in the brief, and its value is not read as the task",
                rt.returncode == 0 and "**Team: dev-team**" in rt.stdout and "gh pr create --draft" in rt.stdout
                and "session:   role-test-role-refine-card\n" in rt.stdout and "{{" not in rt.stdout)
@@ -1476,35 +1457,33 @@ def self_test():
             expect(f"--team {tm}: settings deny what the recipe withholds",
                    ("Bash(gh pr create*)" in dn) == (not has_draft) and ("Bash(*bin/land*)" in dn) == (not has_land))
         expect("no --team leaves the settings as they were", "Bash(*bin/land*)" not in _role_settings("s", 0)["permissions"]["deny"])
-        expect("--team with an unknown recipe is refused", role("run", "test-role", "x", "--controller", "c", "--team", "nope", "--dry-run").returncode != 0)
+        expect("--team with an unknown recipe is refused", role("run", "test-role", "--issue", "42", "x", "--controller", "c", "--team", "nope", "--dry-run").returncode != 0)
         expect("dry run writes no settings", not os.path.exists(os.path.join(ws, ".claude", "role-sessions")))
-        expect("dry run says the pass issue opens at launch", "opened at launch" in out and "label refine" not in out and "label test-role-pass" in out)
+        expect("dry run shows the initiative issue and opens nothing", "issue:     https://github.com/acme-co/acme-office/issues/42" in out and "pass issue" not in out)
+        expect("run needs --issue N", role("run", "test-role", "x", "--controller", "c", "--dry-run").returncode != 0
+               and "--issue N" in role("run", "test-role", "x", "--controller", "c", "--dry-run").stderr
+               and role("run", "test-role", "x", "--issue", "abc", "--controller", "c", "--dry-run").returncode != 0)
+        expect("the brief puts minutes and the PROGRESS check on the initiative issue",
+               "gh issue comment 42 -R acme-co/acme-office --body \"PROGRESS:" in out and "pass issue" not in out and "**DECISION** · role-test-role-refine-card-42 · #42" in out)
         stub = os.path.join(tmp, "stubbin")
         os.makedirs(stub)
         glog = os.path.join(tmp, "gh.log")
         with open(os.path.join(stub, "gh"), "w") as f:
-            f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$GH_LOG"\n'
-                    'case "$1 $2" in "issue create") echo https://github.com/acme-co/acme-office/issues/321;; esac\n')
+            f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$GH_LOG"\n')
         os.chmod(os.path.join(stub, "gh"), 0o755)
         saved = {k: os.environ.get(k) for k in ("PATH", "GH_LOG")}
         os.environ.update(PATH=stub + os.pathsep + os.environ["PATH"], GH_LOG=glog)
         try:
-            num, url = _open_pass_issue("analyst", "refine #758", "role-analyst-refine-758", 9)
-            num2, _ = _open_pass_issue("test-role", "x", "role-test-role-x", 7)
+            _record_pass(9, "analyst", "https://github.com/acme-co/acme-office/issues/42", "role-analyst-refine-42")
         finally:
             for k, v in saved.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        calls = open(glog).read().splitlines()
-        expect("pass issue: one per pass, returns number and url", num == 321 and url.endswith("/issues/321") and num2 == 321)
-        expect("pass issue: titled '<role>: <task>', label refine for the analyst, <role>-pass otherwise",
-               any(c.startswith("issue create") and "--title analyst: refine #758" in c and "--label refine" in c for c in calls)
-               and any("--label test-role-pass" in c for c in calls) and any(c.startswith("label create refine") for c in calls))
-        expect("pass issue: body uses the minute header", any("**NOTE** · bin/role · #9" in c for c in calls))
-        expect("pass issue: one RECORD line on the role issue linking it",
-               open(glog).read().count("issue comment 9 -R acme-co/acme-office --body **RECORD** · bin/role · #9\nanalyst pass opened: https://github.com/acme-co/acme-office/issues/321") == 1)
+        expect("one RECORD line on the role issue links the initiative issue and the session",
+               open(glog).read().count("issue comment 9 -R acme-co/acme-office --body **RECORD** · bin/role · #9\nanalyst pass started on https://github.com/acme-co/acme-office/issues/42: session `role-analyst-refine-42`") == 1
+               and "issue create" not in open(glog).read() and "label create" not in open(glog).read())
         write(f"- m2 2026-10-07: pending line (#7) {u1}")
         two = os.path.join(tmp, "two.json")
         json.dump([{"name": "role-test-role-old", "sessionId": "s", "cwd": "/fixture/ws", "state": "busy", "pid": 7001},
@@ -1512,16 +1491,16 @@ def self_test():
         ps = os.path.join(tmp, "ps.jsonl")
         with open(ps, "w") as f:
             f.write(json.dumps({"pid": 7001, "argv": ["claude", "bg-spare", "--bg-spare", "/tmp/x.sock"]}) + "\n")
-        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "x", "--liaison", "l", "--dry-run"], cwd=ws,
+        r = subprocess.run([os.path.join(ws, "engine", "bin", "role"), "run", "test-role", "--issue", "42", "x", "--liaison", "l", "--dry-run"], cwd=ws,
                            env=dict(env, BUSYBODY_ROLE_AGENTS_JSON=two, BUSYBODY_PS_FILE=ps), capture_output=True, text=True)
         expect("a second pass launches while one runs, and with a memory diff waiting (parallel passes)", r.returncode == 0 and "session:   role-test-role-x" in r.stdout)
         globals()["_AGENTS"] = [{"name": "role-test-role-x"}]
         expect("a second pass with the same task gets its own session name", _session_name("test-role", "x") == "role-test-role-x-2")
         globals()["_AGENTS"] = None
         sh("git", "checkout", "--", MEM)
-        expect("run needs a controller", role("run", "test-role", "x", "--dry-run").returncode != 0)
+        expect("run needs a controller", role("run", "test-role", "--issue", "42", "x", "--dry-run").returncode != 0)
         expect("run refuses a disabled role", (role("disable", "test-role", "t").returncode == 0
-               and role("run", "test-role", "x", "--liaison", "l", "--dry-run").returncode != 0
+               and role("run", "test-role", "--issue", "42", "x", "--liaison", "l", "--dry-run").returncode != 0
                and role("enable", "test-role").returncode == 0))
         deny = json.load(open(os.path.join(HERE, "templates", "role-settings.json")))["deny"]
         expect("role settings deny git writes and accepting memory", "Bash(git commit*)" in deny and "Bash(*bin/role accept*)" in deny)
@@ -1668,8 +1647,8 @@ def self_test():
         expect("a candidates-only diff is not a waiting diff", "memory diff waiting" not in " ".join(json.loads(role("status", "--json").stdout)["roles"][0]["flags"])
                and "0 memory item" not in role("batch", "test-role").stdout and "no memory items" in role("batch", "test-role").stdout)
         expect("run does not refuse on a candidates-only diff and commits it first",
-               role("run", "test-role", "x", "--controller", "l", "--dry-run").returncode == 0)
-        r = role("run", "test-role", "x", "--controller", "l", "--dry-run")
+               role("run", "test-role", "--issue", "42", "x", "--controller", "l", "--dry-run").returncode == 0)
+        r = role("run", "test-role", "--issue", "42", "x", "--controller", "l", "--dry-run")
         sh("git", "checkout", "--", MEM)
         with open(cpath, "a") as f:
             f.write(cline(51) + "\n")

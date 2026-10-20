@@ -69,8 +69,8 @@ Do this when the owner asks about the role's area, or the role is due (its `cade
      hook doesn't do it.
    - Diffs over 30 lines get truncated. Suggest reject: a use should change little.
 6. **Narrative:** the role's issue (`role.json` `issue`) is its **personnel file**: hiring, a
-   big call, a reshaped charter, review verdicts, and one `RECORD` line per pass linking that
-   pass's issue. Pass minutes live on the pass issue and are not summarised back here. Use counts and ratings already live in git.
+   big call, a reshaped charter, review verdicts, and one `RECORD` line per pass linking the
+   initiative issue it ran on. Pass minutes live on that issue and are not summarised back here. Use counts and ratings already live in git.
 7. **Workers a role directs (subagent shape only):** a subagent role can't spawn agents, so you hire them, named
    **`<role>-c-<task>`** (e.g. `backlog-c-743`), with `model: "sonnet"`. `role cost`
    bills them to the role's worker line (`contractor_budget_usd_month`) by that name prefix,
@@ -78,20 +78,18 @@ Do this when the owner asks about the role's area, or the role is due (its `cade
    worker is billed to no role.
 
 ### 1a. Role sessions (`role run`)
-`role run <role> "<task>" --liaison <this session's name>` starts **one** background session,
-`role-<role>-<slug>`, in the workspace checkout. It is not a standing process: it ends when the pass
+`role run <role> --issue N "<task>" --controller <this session's name>` starts **one** background session,
+`role-<role>-<slug>`, in the workspace checkout, working on initiative issue N (required). It is not a standing process: it ends when the pass
 is done. `--dry-run --show-brief` previews it and launches nothing.
-- **Guards** (it refuses): memory guard not installed, the role disabled, a memory diff already
-  waiting, or a pass already running for that role. Resolve those first (section 1, steps 1-2, 5).
+- **Guards** (it refuses): memory guard not installed, the role disabled, no `--issue N`. Passes of one role run in parallel.
 - **Brief** (the engine's `templates/role-brief.md`): imports the charter and `MEMORY.md` itself, because
   `memory: project` is ignored for a session's main agent. Never brief a different agent to play the role.
-- **Each pass gets its own issue** as its minutes: `role run` creates "<role>: <task>"
-  (the label is set by the role's config, `<role>-pass` by default). Resolve closes it. When the
-  pass is done, add one `RECORD` line on the role issue linking it. The minutes are evidence (an
+- **A pass has no issue of its own**: its minutes (and cost line) land on the initiative issue N it was given. `role run`
+  adds one `RECORD` line on the role issue linking N and the session. The minutes are evidence (an
   archive that memory lines, approvals and metrics link to), so don't copy them into the role issue.
 - **Questions go to the owner directly.** The role posts one batched `DECISION` minute
-  (`**DECISION** · <session> · #<pass issue>` plus a one-line summary) on its **pass issue** and nudges you with
-  the link. The owner answers in the office (a sticky note from the pass issue, addressed to the
+  (`**DECISION** · <session> · #<initiative issue>` plus a one-line summary) on the **initiative issue** and nudges you with
+  the link. The owner answers in the office (a sticky note from the initiative issue, addressed to the
   `role-<role>-<slug>` session, which nudges it; it posts `**ANSWER** · office · <the DECISION>`) or on GitHub as
   `ANSWER (from the user): "..."` (old form, still read). If the
   office nudge is blocked, nudge the session yourself: `SendMessage(to: "role-<role>-<slug>", message: "ANSWER: <comment URL>")`
