@@ -29,7 +29,7 @@ recipe; the skill can never loosen the config. Lifecycle: `docs/room-lifecycle.m
   "output": "merged-pr",                    // verdict | merged-pr | ready-card | report | landed-branch | approved-design
   "done": { "check": "pr-merged" },         // mechanical check run by `busybody team resolve`
   "worktree": true,                         // the room gets a worktree
-  "draftPr": true,                          // may `gh pr create --draft` (never ready, never merge)
+  "draftPr": true,                          // may open a PR: `gh pr create --draft` (never ready, never merge), or ready too when the workspace sets room.prReady
   "land": false,                            // may `busybody land <branch>` (repos without PRs)
   "caps": { "softUsdPerDay": 15, "hardUsdPerDay": 40 },
   "measures": ["cost", "no-go", "rework", "review-rounds"]
@@ -78,8 +78,8 @@ the room's name counts (an old-style `DONE:` never does); an issue with no Room 
 
 Whatever the recipe lets the room do is written into the launch brief itself, in the session's own
 first user turn, so auto mode sees it there and not only in an issue comment (a block seen only in an issue comment is not enough).
-`busybody team powers <recipe>` renders that text: draft PRs if `draftPr`, `busybody land` if `land`, how many desks
-of which model, whether it has a worktree, the caps, and the standing prohibitions (no `gh pr ready`, no
+`busybody team powers <recipe>` renders that text: draft PRs if `draftPr` (ready-for-review PRs when the workspace sets `room.prReady`), `busybody land` if `land`, how many desks
+of which model, whether it has a worktree, the caps, and the standing prohibitions (no `gh pr ready` unless `room.prReady`, no
 merging, no opening rooms). The same flags decide the room settings' `allow` list.
 
 ## Desks as agent types (`busybody kit`)
