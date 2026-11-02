@@ -30,7 +30,7 @@ office_branch_prefix() { _office_py get "$1" branchPrefix; }   # "" is a valid p
 office_no_push() { _office_py get "$1" noPush; }               # `main` is always first
 office_merge() { _office_py get "$1" merge; }                  # pr | land
 office_done_note() { _office_py get "$1" doneNote; }
-office_room_json() { _office_py room-json; }                   # {env, deny, prodRead, portBase}
+office_room_json() { _office_py room-json; }                   # {env, deny, prodRead, portBase, prReady}
 office_port_base() { office_room_json | jq -r .portBase; }
 office_owner_only() { _office_py owner-only; }
 office_repos() { _office_py repos; }

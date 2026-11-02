@@ -185,6 +185,14 @@ class Office:
             raise ConfigError("room.draftNote: must be a string")
         return v
 
+    @property
+    def pr_ready(self):
+        """room.prReady (default false): a room may open its PR ready for review and promote it, instead of only a draft."""
+        v = self._room().get("prReady", False)
+        if not isinstance(v, bool):
+            raise ConfigError("room.prReady: must be true or false")
+        return v
+
     def protected_branches(self):
         """Every branch some repo protects, `main` first: what the powers text says rooms never push."""
         names = ["main"]
@@ -276,13 +284,14 @@ class Office:
         return "ok"
 
     def room_json(self):
-        return {"env": self.room_env, "deny": self.room_deny, "prodRead": self.room_prod_read, "portBase": self.port_base}
+        return {"env": self.room_env, "deny": self.room_deny, "prodRead": self.room_prod_read, "portBase": self.port_base,
+                "prReady": self.pr_ready}
 
     def validate(self):
         """Every problem in the config, one line each (empty when it is sound)."""
         errs = []
         checks = [(lambda r=r, f=f: f(r)) for r in self._repo_cfgs() for f in (self.branch_prefix, self.no_push, self.merge, self.done_note)]
-        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.display_name, lambda: self.tracker, lambda: self.sources]:
+        for fn in checks + [self.room_json, lambda: self.owner_only, lambda: self.draft_note, lambda: self.pr_ready, lambda: self.display_name, lambda: self.tracker, lambda: self.sources]:
             try:
                 fn()
             except ConfigError as e:
@@ -389,9 +398,11 @@ def self_test():
     eq("fixture noPush: main always, first, once", [acme.no_push(r) for r in ("acme-office", "acme-web", "acme-api")], [["main"], ["main", "release"], ["main"]])
     eq("fixture merge", [acme.merge(r) for r in ("acme-office", "acme-web", "acme-api")], ["land", "pr", "pr"])
     eq("fixture doneNote", [acme.done_note(r) for r in ("acme-web", "acme-api")], ["Done also means the preview deploy is green.", ""])
-    eq("fixture room", acme.room_json(), {"env": {"ACME_ENV": "dev"}, "deny": ["Bash(acme-cli deploy*)"], "prodRead": ["mcp__acme-prod__*"], "portBase": 42000})
+    eq("fixture room", acme.room_json(), {"env": {"ACME_ENV": "dev"}, "deny": ["Bash(acme-cli deploy*)"], "prodRead": ["mcp__acme-prod__*"], "portBase": 42000, "prReady": False})
     eq("fixture protected branches and draftNote", (acme.protected_branches(), acme.draft_note, Office({}, {}).protected_branches()), (["main", "release"], "", ["main"]))
     eq("draftNote", Office({"room": {"draftNote": "x."}}, {}).draft_note, "x.")
+    eq("prReady defaults false, reads true", (Office({}, {}).pr_ready, Office({"room": {"prReady": True}}, {}).pr_ready), (False, True))
+    err("prReady must be a boolean", lambda: Office({"room": {"prReady": "yes"}}, {}).pr_ready, "room.prReady: must be true or false")
     eq("displayName defaults to the workspace repo's name", (Office({"workspaceRepo": "w"}, {}).display_name, Office({"displayName": "Acme", "workspaceRepo": "w"}, {}).display_name), ("w", "Acme"))
     sha = "a" * 40
     src = {"url": "https://example.com/x/y", "ref": "v1.0", "sha": sha, "dir": "sources/y", "licence": "MIT", "vetted": "https://example.com/minutes/1"}
@@ -449,7 +460,7 @@ def self_test():
         eq("source dir that is not a clone", Office({"sources": {"p": dict(src, dir="sources/plain")}}, {}, ws).check_source("p"), "source p: sources/plain is not a git clone")
     eq("fixture ownerOnly", acme.owner_only, ["deploying to acme-prod"])
     eq("room defaults", (Office({}, {}).room_json(), Office({}, {}).owner_only),
-       ({"env": {}, "deny": [], "prodRead": [], "portBase": 41000}, list(DEFAULT_OWNER_ONLY)))
+       ({"env": {}, "deny": [], "prodRead": [], "portBase": 41000, "prReady": False}, list(DEFAULT_OWNER_ONLY)))
 
     def err(label, fn, want):
         try:
@@ -526,7 +537,7 @@ def self_test():
 USAGE = """usage: officeconfig.py [--config FILE] [--workspace DIR] COMMAND
   get REPO branchPrefix|noPush|merge|doneNote|github|path|evidence   one value (noPush: one branch per line)
   repos                  the repo names, one per line
-  room-json              {env, deny, prodRead, portBase} as JSON
+  room-json              {env, deny, prodRead, portBase, prReady} as JSON
   sources                the pinned source names, one per line
   source NAME url|ref|sha|dir|licence|vetted   one field of a source (a null ref prints nothing)
   source-check NAME      "ok", or the one line that is wrong with the clone (exit 1): missing, not a clone, HEAD moved, dirty
