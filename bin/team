@@ -799,6 +799,34 @@ def self_test():
             bad.append(f"brief_part {part} {kw}: {got}")
     if "Open no PR" not in brief_part(_base(), "prs", True):
         bad.append("brief_part prs with --land must forbid PRs")
+    # room.prReady: ready-PR wording when set; with it false (the default) the text is exactly the draft-only text
+    saved_office = globals()["OFFICE"]
+    try:
+        for pr_ready in (False, True):
+            globals()["OFFICE"] = officeconfig.Office({"room": {"prReady": pr_ready}}, {})
+            txt = powers_text(_base())
+            parts = {k: brief_part(_base(), k) for k in ("prs", "prlimit", "watchpr", "watchdecision")}
+            if not pr_ready:
+                want = ("- Draft PRs: you may `gh pr create --draft` for the room's branch. Never open one ready and never run `gh pr ready`: "
+                        "the owner promotes.")
+                if want not in txt or "Never, whatever the recipe says: merge a PR, run `gh pr ready`, push" not in txt or "ready for review" in txt:
+                    bad.append(f"prReady false must leave the powers text as it was: {txt}")
+                if not (parts["watchpr"] == "draft PR" and parts["watchdecision"] == '"draft #N is green; promote when ready"'
+                        and "never mark ready" in parts["prs"] and "not a draft (a dev team's draft" in parts["prlimit"]):
+                    bad.append(f"prReady false must leave the brief parts as they were: {parts}")
+            else:
+                if not ("**ready for review** once the work is built, the reviewer has passed it and CI is green" in txt
+                        and "only while it is visibly unfinished" in txt and "`gh pr ready` is for the room's own PR only" in txt
+                        and "Never merge; never open a PR for another branch" in txt and "Draft PRs:" not in txt
+                        and "merge a PR, push" in txt and "run `gh pr ready`" not in txt):
+                    bad.append(f"prReady true powers text: {txt}")
+                if not (parts["watchpr"] == "PR" and parts["watchdecision"] == '"#N is green and reviewed; merge when ready"'
+                        and "never mark ready" not in parts["prs"] and "merging, ever" in parts["prlimit"]):
+                    bad.append(f"prReady true brief parts: {parts}")
+                if "ready for review" in powers_text(dict(_base(), draftPr=False)) or brief_part(dict(_base(), draftPr=False), "watchpr") != "draft PR":
+                    bad.append("prReady must not widen a recipe that may not open PRs")
+    finally:
+        globals()["OFFICE"] = saved_office
     # roots: the engine is this script's checkout; OFFICE_WORKSPACE moves only the workspace
     if workspace_root(ENGINE_ROOT, {"OFFICE_WORKSPACE": root}, root) != os.path.abspath(root):
         bad.append("OFFICE_WORKSPACE must set the workspace root")
@@ -859,7 +887,11 @@ def powers_text(t, land_override=False, desks=False):
         out.append(f"- Desks: none. You work alone on {head['model']}.")
     out.append("- Worktree: this room has a worktree, and you may edit and commit in it." if t["worktree"] else
                "- Worktree: this team needs none. Do not edit repo files; your output is the minutes.")
-    if draft:
+    if draft and OFFICE.pr_ready:
+        out.append("- PRs: you may open a PR for the room's branch, and only that branch. Open it **ready for review** once the work is built, "
+                   "the reviewer has passed it and CI is green; open it as a draft (`gh pr create --draft`) only while it is visibly unfinished, "
+                   "and then promote it with `gh pr ready` when it is done (`gh pr ready` is for the room's own PR only). Never merge; never open a PR for another branch.")
+    elif draft:
         out.append("- Draft PRs: you may `gh pr create --draft` for the room's branch. Never open one ready and never run `gh pr ready`: "
                    "the owner promotes." + (" " + OFFICE.draft_note if OFFICE.draft_note else ""))
     else:
@@ -870,7 +902,8 @@ def powers_text(t, land_override=False, desks=False):
         out.append("- Landing: you may not land or move `main`.")
     c = t["caps"]
     out.append(f"- Caps: soft ${c['softUsdPerDay']:g} per day, hard ${c['hardUsdPerDay']:g} per day.")
-    out.append(f"- Never, whatever the recipe says: merge a PR, run `gh pr ready`, push {_or_list(OFFICE.protected_branches())}, open a room "
+    ready_ban = "" if draft and OFFICE.pr_ready else "run `gh pr ready`, "
+    out.append(f"- Never, whatever the recipe says: merge a PR, {ready_ban}push {_or_list(OFFICE.protected_branches())}, open a room "
                "(`claude --bg`, `bin/team start`, or the old launchers). Ask with a `DECISION:` sticky note.")
     return "\n".join(out)
 
@@ -1353,18 +1386,30 @@ def brief_part(t, part, land_override=False):
         if t["worktree"]:
             return "- Commit, and push the room's branch `@BRANCH@` (and only branches you created for this room)."
         return "- This team makes no repo changes: do not commit or push. Your output is the minutes."
+    ready = draft and OFFICE.pr_ready
+    if part == "watchpr":
+        return "PR" if ready else "draft PR"
+    if part == "watchdecision":
+        return '"#N is green and reviewed; merge when ready"' if ready else '"draft #N is green; promote when ready"'
     if part == "prs":
+        if ready:
+            return ("- Open any other PR only if the issue says so. If the work splits into several PRs, open them as a **draft\n"
+                    "  stack** up front per `decisions/2026-10-07-stacked-prs.md`: one worker per branch, update by\n"
+                    "  `git merge origin/<parent>` (never rebase or force-push), and promote a child with `gh pr ready` only after its\n"
+                    "  parent has merged and its base shows the default branch.")
         if draft:
             return ("- Open any other PR only if the issue says so. If the work splits into several PRs, open them as a **draft\n"
                     "  stack** up front per `decisions/2026-10-07-stacked-prs.md`: one worker per branch, update by\n"
                     "  `git merge origin/<parent>` (never rebase or force-push), and never mark ready.")
         return "- Open no PR of any kind, not even a draft or a stack. If the work needs one, ask with a `DECISION:` sticky note."
     if part == "prlimit":
+        if ready:
+            return "opening a PR for a branch that is not this room's (a stack branch the issue calls for is fine); merging, ever"
         if draft:
             return ("opening a PR that is not a draft (a dev team's draft, or a stack draft, is allowed; unless the issue says otherwise); "
                     "marking ready; merging, ever")
         return "opening any PR; marking ready; merging, ever"
-    die(f"unknown brief part {part}; one of commit, prs, prlimit")
+    die(f"unknown brief part {part}; one of commit, prs, prlimit, watchpr, watchdecision")
 
 
 def main(argv):

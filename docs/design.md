@@ -106,7 +106,7 @@ Fields the launcher and the briefs read, from the config:
 - `repos.<name>`: `branchPrefix` (required; `""` is allowed), `noPush` (extra protected branches; `main` is always protected),
   `merge` (`"pr"`: draft PRs the owner merges; `"land"`: no PRs, `bin/land` fast-forwards and pushes), optional `doneNote`.
 - `room`: `env` (set in every room, may be empty), `deny` (patterns tied to the workspace's own tools), `prodRead` (lifted only by
-  `--prod-read`), `portBase` (default 41000), optional `draftNote` (closes the powers' draft-PR line).
+  `--prod-read`), `portBase` (default 41000), optional `draftNote` (closes the powers' draft-PR line), optional `prReady` (boolean, default false: rooms may open ready PRs and promote their own).
 - `ownerOnly`: what only the owner may do (default: anything touching prod, merging, spending over the cap).
 - `sources` (optional): third-party repos pinned to a commit, keyed by name (`[a-z0-9][a-z0-9-]*`). Each has `url` (https), `ref` (a tag,
   or `null` for a repo with no tags), `sha` (40 hex), `dir` (a relative path inside the workspace, gitignored, e.g. `sources/<name>`),

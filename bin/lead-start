@@ -8,7 +8,7 @@
 # room.env, room.deny, room.prodRead and room.portBase shape the room settings. A missing field stops the launch with one line.
 # --base REF branches the room from REF (default origin/main; main for a repo with no remote).
 # --team NAME (default dev-team) names the recipe in teams/: its powers go into the brief (bin/team powers), its caps and flags
-# into the room settings (given explicitly: the draft-PR allow follows draftPr, the bin/land allows follow land). A repo whose merge
+# into the room settings (given explicitly: the draft-PR allow follows draftPr (and room.prReady widens it to ready PRs), the bin/land allows follow land). A repo whose merge
 # is "land" has no PRs: its room lands with bin/land instead of opening draft PRs. --land still works and must agree with the config.
 # When <workspace>/desks exists (bin/kit build) the room loads it as the `desks` plugin: `claude --plugin-dir <workspace>/desks`, the
 # desks' agent types (`desks:<team>-<desk>`) named in the brief, and the room may not edit it. Before launch desks/ must hold only
@@ -246,6 +246,9 @@ if team_json:
     if not draft:
         allow = [a for a in allow if not a.startswith("Bash(gh pr create --draft")]
         deny.append("Bash(gh pr create*)")
+    elif cfg.get("prReady"):                   # room.prReady: the room may open its PR ready and promote it; merging stays denied
+        allow = [a for a in allow if not a.startswith("Bash(gh pr create --draft")] + ["Bash(gh pr create*)", "Bash(gh pr ready*)"]
+        deny[:] = [x for x in deny if x != "Bash(gh pr ready*)"]
     if not land:
         allow = [a for a in allow if "bin/land" not in a]
         deny.append("Bash(*bin/land*)")
@@ -264,8 +267,10 @@ TEAM_COMMIT="$("$ENGINE_ROOT/bin/team" brief "$TEAM" commit $LANDFLAG)" || die "
 TEAM_COMMIT="${TEAM_COMMIT//@BRANCH@/$BRANCH}"
 TEAM_PRS="$("$ENGINE_ROOT/bin/team" brief "$TEAM" prs $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
 TEAM_PR_LIMIT="$("$ENGINE_ROOT/bin/team" brief "$TEAM" prlimit $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
+WATCH_PR="$("$ENGINE_ROOT/bin/team" brief "$TEAM" watchpr $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
+WATCH_DECISION="$("$ENGINE_ROOT/bin/team" brief "$TEAM" watchdecision $LANDFLAG)" || die "cannot render the brief of recipe $TEAM"
 OWNER_ONLY_LIST="$(sed 's/^/- /' <<<"$OWNER_ONLY")"
-BRIEF="$(WORKSPACE="$WS" NO_PUSH="$(paste -sd" " <<<"$NO_PUSH")" OWNER_ONLY="$OWNER_ONLY_LIST" CONTROLLER_VAR=BUSYBODY_CONTROLLER TEAM_COMMIT="$TEAM_COMMIT" TEAM_PRS="$TEAM_PRS" TEAM_PR_LIMIT="$TEAM_PR_LIMIT" TEAM_NAME="$TEAM" TEAM_POWERS="$TEAM_POWERS" ROOM="$ROOM" ISSUE_URL="$ISSUE_URL" ISSUE_NUM="$ISSUE" ISSUE_REPO="$WS_REPO" REPO="$REPO" REPO_DIR="$REPO_DIR" \
+BRIEF="$(WORKSPACE="$WS" NO_PUSH="$(paste -sd" " <<<"$NO_PUSH")" OWNER_ONLY="$OWNER_ONLY_LIST" CONTROLLER_VAR=BUSYBODY_CONTROLLER TEAM_COMMIT="$TEAM_COMMIT" TEAM_PRS="$TEAM_PRS" TEAM_PR_LIMIT="$TEAM_PR_LIMIT" WATCH_PR="$WATCH_PR" WATCH_DECISION="$WATCH_DECISION" TEAM_NAME="$TEAM" TEAM_POWERS="$TEAM_POWERS" ROOM="$ROOM" ISSUE_URL="$ISSUE_URL" ISSUE_NUM="$ISSUE" ISSUE_REPO="$WS_REPO" REPO="$REPO" REPO_DIR="$REPO_DIR" \
   WORKTREE="$WORKTREE" BRANCH="$BRANCH" PORTS="$PORTS" PROD_READ="$PROD_READ" LIAISON="$LIAISON" SOFT="$SOFT" HARD="$HARD" \
   DONE_TEXT="$DONE_TEXT" python3 -I -c '
 import os,re,sys

@@ -57,8 +57,8 @@ Post with `gh issue comment {{ISSUE_NUM}} -R {{ISSUE_REPO}} --body "..."`.
 For DECISION, BLOCKED, WAITING and DONE also send the controller a link-only nudge:
 `SendMessage(to: "{{LIAISON}}", message: "DECISION {{ROOM}}: <comment URL>")` (use the type as the word). The nudge is never the record. (The controller's session name is also in `${{CONTROLLER_VAR}}` in the control room's environment.) No timed heartbeats; comment when something changed.
 
-### Watching the draft PR
-Only if you opened one. After you open the draft PR, post a `DECISION` ("draft #N is green; promote when ready", non-blocking), then start the watcher as a **background shell** so no model turns are spent waiting:
+### Watching the {{WATCH_PR}}
+Only if you opened one. After you open the {{WATCH_PR}}, post a `DECISION` ({{WATCH_DECISION}}, non-blocking), then start the watcher as a **background shell** so no model turns are spent waiting:
 `busybody pr-watch <N> -R <owner/repo>` (run it with `run_in_background`).
 It prints one `EVENT: <name> <PR url>` line and exits when something happens: `ready`, `ci-passed`, `ci-failed`, `review`, `comment`, `merged`, `closed` or `cap` (7 days). Post a `WAITING` minute, end your turn and let the exit wake you. On each event:
 - `ci-failed` or `review`: have a worker fix it, push, then start the watcher again. For a review (or a review left as a PR comment), also reply on the PR itself: one comment taking each point in turn, with the fixing commit or the reason it was left as is. A minute on the issue is not a reply.

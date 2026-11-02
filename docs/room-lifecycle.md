@@ -14,7 +14,7 @@ Open → Kickoff (go/no-go) → ────────── the team's own ph
 | Part | Holds | Honoured by |
 | --- | --- | --- |
 | **Skill** (`teams/<name>/SKILL.md`) | **entry criteria**, **middle phases**, **output**, **done condition**, when to escalate, and how to read and record memory | the room's role, by judgement |
-| **Config** (`teams/<name>/team.json`) | model per desk, permissions, caps, spawn depth, whether a worktree is needed, whether it may open a draft PR | the harness (room settings, cap timer, deny rules). The skill can't loosen them |
+| **Config** (`teams/<name>/team.json`) | model per desk, permissions, caps, spawn depth, whether a worktree is needed, whether it may open a PR (a draft, or a ready one when the workspace sets `room.prReady`) | the harness (room settings, cap timer, deny rules). The skill can't loosen them |
 
 ## Generic stages (every room)
 | Stage | Who | What | Minute |
@@ -42,7 +42,7 @@ Open → Kickoff (go/no-go) → ────────── the team's own ph
 ## Teams: middle phases, output, done
 | Team | Entry criteria | Middle phases | Output | Done when |
 | --- | --- | --- | --- | --- |
-| **dev team** | a Ready card (goal, scope, done-when), the target repo | work → draft PR → watch | merged PR | **merged** (deploy evidence tracked separately by `status`; not a close gate for now) |
+| **dev team** | a Ready card (goal, scope, done-when), the target repo | work → PR → watch | merged PR | **merged** (deploy evidence tracked separately by `status`; not a close gate for now) |
 | **MAD** | question, options, what's decided, what the answer changes | brief → rounds (≤3, plus a tie-break) → verdict | verdict, every OBJECT verbatim, ≤3 open items | verdict posted |
 | **research** | question, scope, form of the answer | plan → search → synthesise | report | report posted |
 | **refine** (a backlog role) | a card named by the owner | read → draft → questions → final draft | an approved draft | owner approves |
@@ -50,9 +50,14 @@ Open → Kickoff (go/no-go) → ────────── the team's own ph
 
 ### The dev team in full
 1. **Work.** Workers build and review. Atomic commits, the branch pushed.
-2. **Draft PR.** The role opens a **draft**, which the room config allows. What a draft does or does not
-   trigger is the workspace's `room.draftNote`. It posts a `DECISION`: "draft #N is green; promote
-   when ready."
+2. **PR.** Two modes, set by the workspace's `room.prReady` (default false).
+   - **Draft (default):** the role opens a **draft**, which the room config allows. What a draft does or does not
+     trigger is the workspace's `room.draftNote`. It posts a `DECISION`: "draft #N is green; promote
+     when ready." The owner promotes and merges.
+   - **Ready (`room.prReady: true`):** once the work is built, the reviewer has passed it and CI is green, the role opens the
+     PR **ready for review** (a draft only while visibly unfinished; it may `gh pr ready` its own PR). The room config
+     allows `gh pr create*` and `gh pr ready*`. It posts a `DECISION`: "#N is green and reviewed; merge when ready."
+     The owner merges. In both modes `gh pr merge` stays denied.
 3. **Watch.** The role starts `busybody pr-watch #N` as a **background shell**: no model turns while waiting.
    - It wakes the role **only on an event**: promotion to ready, a CI result, a new review or
      comment, or the merge.
@@ -86,7 +91,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
 | **Approved by the owner** | promoting and merging PRs, prod, schema, spend over the soft cap, scope, every skill change |
 
 ## Delegated to the role
-- **Opens draft PRs** for dev teams by default. The owner promotes them; no PR is opened ready.
+- **Opens PRs** for dev teams: drafts by default (the owner promotes them), or ready for review when the workspace sets `room.prReady`. The owner merges either way.
 - **Watches its PR to merge** and routes CI failures and reviews to workers.
 - **Lands repos without PRs** (this workspace, local POCs) with **`busybody land <branch>`**. The script
   checks the branch sits directly on top of `main`, runs the repo's checks at every commit, stops
@@ -99,7 +104,7 @@ restart or a slept laptop never leaves a room stuck, which is the failure this a
 - `busybody pr-watch` and the `watch.json` marker; the handled-memory (`watch-seen.json`, `pr-watch --ack`) and `busybody review-sweep`.
 - The backstop in the cap timer.
 - `busybody land`.
-- Draft-PR permission in the room config.
+- PR permission in the room config (draft only, or draft and ready with `room.prReady`).
 - Self-close.
 - `busybody status` finding PRs by the room's branch.
 - The minute header format and the `WAITING` / `NOTE` / `RECORD` types in the scripts, briefs and office.

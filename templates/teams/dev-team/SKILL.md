@@ -1,6 +1,6 @@
 ---
 name: dev-team
-description: The dev team recipe for a project room. The room lead (a role) takes a Ready card to a merged PR with workers (implementers on Sonnet, a read-only reviewer on Opus). Entry criteria, middle phases (work, draft PR, watch), output, done condition, escalation, memory and minute formats. Read by the room lead after kickoff. The controller opens the room with the workstream-lead skill.
+description: The dev team recipe for a project room. The room lead (a role) takes a Ready card to a merged PR with workers (implementers on Sonnet, a read-only reviewer on Opus). Entry criteria, middle phases (work, PR, watch), output, done condition, escalation, memory and minute formats. Read by the room lead after kickoff. The controller opens the room with the workstream-lead skill.
 ---
 
 # Dev team
@@ -30,10 +30,16 @@ design from the `design` team), post a `PROGRESS` note saying so and carry on.
    - Atomic commits in the repo's own message style. Each commit builds and passes alone.
    - Push the room's branch. Never push `main`/`nonprod`, force-push, or skip hooks.
    - Same-file edits go to one worker, never parallel.
-2. **Draft PR.** Open a **draft** only (`gh pr create --draft`), never a ready PR. Drafts run CI but
-   don't deploy to nonprod, so rooms don't collide. For a stack, open every PR as a draft up front
-   (`decisions/2026-10-07-stacked-prs.md`). Then post a `DECISION`: "draft #N is green; promote when ready."
-   The owner promotes and merges. Never run `gh pr merge`.
+2. **PR.** Your brief's powers line says which mode the workspace uses (`room.prReady` in `office.json`).
+   - **Draft mode (the default):** open a **draft** only (`gh pr create --draft`), never a ready PR. Drafts run CI but
+     don't deploy to nonprod, so rooms don't collide. For a stack, open every PR as a draft up front
+     (`decisions/2026-10-07-stacked-prs.md`). Then post a `DECISION`: "draft #N is green; promote when ready."
+     The owner promotes and merges.
+   - **Ready mode (`room.prReady`):** once the work is built, the reviewer has passed it and CI is green, open the PR
+     **ready for review** (a draft only while it is visibly unfinished; `gh pr ready` promotes your own PR). A stack
+     is still opened as drafts up front; a child goes ready only after its parent has merged. Then post a
+     `DECISION`: "#N is green and reviewed; merge when ready." The owner merges.
+   Never run `gh pr merge`, in either mode.
 3. **Watch.** Start `busybody pr-watch #N` as a **background shell**: no model turns while waiting.
    - It wakes you only on an event: promotion to ready, a CI result, a new review or comment, the merge.
    - A CI failure or a review goes to a worker to fix (the same worker that wrote it). Order: fix, push, post the marked PR reply, run `--ack`, and only then re-arm the watcher (re-armed earlier, it reports the same review again).
@@ -79,7 +85,7 @@ Every minute is an issue comment: line 1 `**TYPE** · who · where`, line 2 a on
 free body. Link, don't paste (no secrets, hostnames, data or logs).
 ```
 **WAITING** · room-<slug> · #<issue>
-Draft #N is promoted-pending; watching to merge.
+PR #N is open; watching to merge.
 ```
 - `PROGRESS` a milestone; `DECISION` a question with options and a recommendation; `BLOCKED`; `DONE`.
 - `WAITING`: your part is done and you are paused on something external (the owner's merge).

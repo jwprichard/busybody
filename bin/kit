@@ -140,8 +140,8 @@ def lead_start_cases(bad):
                    BUSYBODY_CONFIG=os.path.join(ws, "office.json"))
         env.pop("BUSYBODY_CONTROLLER", None)
 
-        def lead(*a):
-            r = subprocess.run([os.path.join(ENGINE_ROOT, "bin", "lead-start"), "acme-web", "slug-a", "--controller", "ctl", "--issue", "5",
+        def lead(*a, slug="slug-a"):
+            r = subprocess.run([os.path.join(ENGINE_ROOT, "bin", "lead-start"), "acme-web", slug, "--controller", "ctl", "--issue", "5",
                                 "--team", "dev-team"] + list(a), env=env, capture_output=True, text=True, cwd=tmp)
             return r.returncode, r.stdout, r.stderr
 
@@ -186,6 +186,34 @@ def lead_start_cases(bad):
             deny = st["permissions"]["deny"]
             if not (f"Edit(/{desks}/**)" in deny and f"Write(/{desks}/**)" in deny):
                 bad.append("the room settings deny Edit and Write on desks/")
+            # room.prReady unset: the draft-only settings, exactly (allow: the draft create alone; ready and merge denied)
+            allow = st["permissions"]["allow"]
+            if not (allow == ["Bash(gh pr create --draft*)"] and "Bash(gh pr ready*)" in deny and "Bash(gh pr merge*)" in deny
+                    and "Bash(gh pr create*)" not in deny):
+                bad.append(f"prReady unset must leave the room settings draft-only: {allow}")
+            if "draft PR" not in argv[-1] or "Never open one ready" not in argv[-1] or "merge when ready" in argv[-1]:
+                bad.append("prReady unset must leave the brief draft-only")
+            # room.prReady true: create (ready or draft) and ready allowed; merge and the rest still denied
+            cfg = json.load(open(os.path.join(ws, "office.json")))
+            cfg.setdefault("room", {})["prReady"] = True
+            json.dump(cfg, open(os.path.join(ws, "office.json"), "w"))
+            git(ws, "commit", "-q", "-am", "prReady")
+            rc, o, e = lead(slug="slug-b")
+            if rc != 0:
+                bad.append(f"lead-start with room.prReady failed: {rc} {o} {e}")
+            else:
+                argv2 = open(rec).read().split("\0")[:-1]
+                st2 = json.load(open(os.path.join(child, ".claude", "worktrees", "room-slug-b", ".claude", "room-settings.json")))
+                allow2, deny2 = st2["permissions"]["allow"], st2["permissions"]["deny"]
+                if not ("Bash(gh pr create*)" in allow2 and "Bash(gh pr ready*)" in allow2 and "Bash(gh pr create*)" not in deny2
+                        and "Bash(gh pr ready*)" not in deny2):
+                    bad.append(f"room.prReady must allow gh pr create and ready: {allow2} {deny2}")
+                if not ("Bash(gh pr merge*)" in deny2 and "Bash(gh pr * --admin*)" in deny2 and "Bash(git push * main)" in deny2
+                        and sorted(set(deny) - {"Bash(gh pr ready*)"}) == sorted(set(deny2)) and "Bash(*bin/land*)" in deny2):
+                    bad.append(f"room.prReady must change only the pr create and ready rules: {deny2}")
+                if not ("ready for review" in argv2[-1] and "### Watching the PR" in argv2[-1] and "#N is green and reviewed; merge when ready" in argv2[-1]
+                        and "Never open one ready" not in argv2[-1] and "draft PR" not in argv2[-1].split("### Watching the PR")[1][:200]):
+                    bad.append("room.prReady brief wording")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
